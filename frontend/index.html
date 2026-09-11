@@ -839,7 +839,7 @@ function taskCard(t, actionsHtml, opts={}){
         ${t.estimated_arrival ? `<span>ETA: <b>${fmtTime(t.estimated_arrival)}</b></span>` : ""}
       </div>
       ${showRequester ? `<div class="meta-row"><span>ผู้ขอ: <b>${t.requester_name || t.requester_employee_id}</b></span><span>ติดต่อ: <b>${t.requester_contact || '-'}</b></span></div>` : ""}
-      ${t.photo_url ? `<img class="thumb" src="${t.photo_url}" />` : ""}
+      ${t.photo_url ? `<img class="thumb" data-photo-url="${t.photo_url}" />` : ""}
       ${t.rating ? `<div class="meta-row"><span>คะแนน: <b style="color:var(--amber);">${"★".repeat(t.rating)}${"☆".repeat(5-t.rating)}</b></span></div>` : ""}
       ${actionsHtml ? `<div class="card-actions">${actionsHtml}</div>` : ""}
     </div>`;
@@ -2113,6 +2113,26 @@ function bindCardClickToDetail(container){
       openTaskDetailSheet(card.dataset.id);
     });
   });
+  loadAuthenticatedImages(container);
+}
+
+// Task photos are served from an authenticated endpoint now (not a public
+// static file), which a plain <img src="..."> can't attach a Bearer token
+// to. This fetches each photo with the right header and swaps in a blob URL
+// once it arrives, so the auth requirement doesn't just silently break every
+// photo thumbnail.
+async function loadAuthenticatedImages(container){
+  const imgs = container.querySelectorAll("img[data-photo-url]");
+  for(const img of imgs){
+    const url = img.dataset.photoUrl;
+    delete img.dataset.photoUrl; // avoid re-fetching if this runs again on the same container
+    try{
+      const res = await fetch(API + url, {headers: {Authorization: "Bearer " + state.token}});
+      if(!res.ok) continue;
+      const blob = await res.blob();
+      img.src = URL.createObjectURL(blob);
+    }catch(e){ /* leave it blank rather than break the rest of the page */ }
+  }
 }
 
 // Operation = "What is happening now?" — live jobs, people, vehicles, exceptions.
@@ -3108,6 +3128,7 @@ async function openTaskDetailSheet(taskId){
   const holder = overlay.querySelector("#td-card");
   holder.appendChild(el(taskCard(t, buildTaskDetailActions(t), {showRequester: state.role !== "USER"})));
   bindTaskDetailActions(holder);
+  loadAuthenticatedImages(holder);
   // Any card action that mutates state closes this detail sheet on success via refreshAll's
   // normal re-render; simplest is to just close it after a successful mutation.
   holder.querySelectorAll("[data-action],[data-edit],[data-photo],[data-accept],[data-pause],[data-self-assign],[data-take-over],[data-join],[data-leave],[data-assign],[data-reassign],[data-add-driver],[data-admin-complete],[data-priority],[data-chat],[data-rate]").forEach(b=>{

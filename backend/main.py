@@ -27,7 +27,7 @@ from typing import Optional, List
 
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 import openpyxl
@@ -42,14 +42,25 @@ try:
 except ImportError:
     WEB_PUSH_AVAILABLE = False
 
+# Postgres is optional: set DATABASE_URL (e.g. on Vercel, where there is no
+# persistent local disk for a SQLite file) to switch the whole app over to it.
+# Leave it unset for local dev / any platform with a normal persistent
+# filesystem (Replit, Render, Railway, etc.) and SQLite is used exactly as
+# before — nothing else needs to change to run locally.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+IS_POSTGRES = bool(DATABASE_URL)
+if IS_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
+
 log = logging.getLogger("uvicorn.error")
 
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "scdc.db")
 FRONTEND_DIR = os.path.join(BASE_DIR, "..", "frontend")
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-VAPID_PRIVATE_KEY_PATH = os.path.join(BASE_DIR, "vapid_private.pem")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+if not IS_POSTGRES:
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 WAITING_TOO_LONG_MINUTES = 15
 IN_PROGRESS_OVERDUE_MINUTES = 60
@@ -61,21 +72,41 @@ app = FastAPI(title="SCDC Vehicle Handling Task Management (MVP)")
 
 
 # ---------------------------------------------------------------------------
-# Web Push (VAPID key pair generated once on first run and reused after that)
+# Web Push (VAPID key pair generated once, stored in the database — not a
+# file, see app_config table above for why)
 # ---------------------------------------------------------------------------
 
+def _load_vapid_from_db(db):
+    if not WEB_PUSH_AVAILABLE:
+        return None
+    row = db.execute("SELECT value FROM app_config WHERE key='vapid_private_pem'").fetchone()
+    if not row or not row["value"]:
+        return None
+    return Vapid.from_pem(row["value"].encode())
+
+
 def ensure_vapid_keys():
-    if not WEB_PUSH_AVAILABLE or os.path.exists(VAPID_PRIVATE_KEY_PATH):
+    if not WEB_PUSH_AVAILABLE:
         return
-    v = Vapid()
-    v.generate_keys()
-    v.save_key(VAPID_PRIVATE_KEY_PATH)
+    with get_db() as db:
+        if db.execute("SELECT 1 FROM app_config WHERE key='vapid_private_pem'").fetchone():
+            return
+        v = Vapid()
+        v.generate_keys()
+        pem = v.private_pem().decode()
+        db.execute(
+            "INSERT INTO app_config (key, value) VALUES ('vapid_private_pem', ?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (pem,),
+        )
+        log.info("Generated a new VAPID key pair and stored it in the database.")
 
 
 def get_vapid_public_key_b64() -> Optional[str]:
-    if not WEB_PUSH_AVAILABLE or not os.path.exists(VAPID_PRIVATE_KEY_PATH):
+    with get_db() as db:
+        v = _load_vapid_from_db(db)
+    if not v:
         return None
-    v = Vapid.from_file(VAPID_PRIVATE_KEY_PATH)
     raw = v.public_key.public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
@@ -89,9 +120,10 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
     if not WEB_PUSH_AVAILABLE:
         log.info("Web push skipped for user %s: pywebpush not installed", user_id)
         return {"attempted": 0, "sent": 0, "reason": "เซิร์ฟเวอร์ยังไม่ได้ติดตั้งไลบรารี Web Push"}
-    if not os.path.exists(VAPID_PRIVATE_KEY_PATH):
-        log.info("Web push skipped for user %s: no VAPID key file yet (needs HTTPS to be set up)", user_id)
-        return {"attempted": 0, "sent": 0, "reason": "เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า HTTPS/VAPID key"}
+    vapid = _load_vapid_from_db(db)
+    if not vapid:
+        log.info("Web push skipped for user %s: no VAPID key in the database yet", user_id)
+        return {"attempted": 0, "sent": 0, "reason": "เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า VAPID key"}
     subs = db.execute("SELECT * FROM push_subscriptions WHERE user_id=?", (user_id,)).fetchall()
     if not subs:
         log.info("Web push skipped for user %s: no push subscription on file "
@@ -104,7 +136,7 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
             webpush(
                 subscription_info={"endpoint": s["endpoint"], "keys": {"p256dh": s["p256dh"], "auth": s["auth"]}},
                 data=payload,
-                vapid_private_key=VAPID_PRIVATE_KEY_PATH,
+                vapid_private_key=vapid,
                 vapid_claims={"sub": VAPID_CLAIM_SUB},
                 ttl=60,
             )
@@ -115,12 +147,12 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
             if status in (404, 410, 403):
                 # 404/410 = subscription gone. 403 almost always means the
                 # push service rejected our VAPID signature outright (e.g.
-                # "BadJwtToken") — this happens if vapid_private.pem ever got
-                # regenerated after this subscription was created, making it
-                # permanently unusable. None of these are worth retrying, so
-                # clean them up automatically instead of failing silently
-                # forever; the user just needs to re-enable notifications
-                # once in Profile to get a fresh subscription.
+                # "BadJwtToken") — this happens if the VAPID key ever changed
+                # after this subscription was created, making it permanently
+                # unusable. None of these are worth retrying, so clean them up
+                # automatically instead of failing silently forever; the user
+                # just needs to re-enable notifications once in Profile to
+                # get a fresh subscription.
                 db.execute("DELETE FROM push_subscriptions WHERE id=?", (s["id"],))
                 log.info("Web push subscription %s for user %s is invalid (status %s) — removed it. "
                          "They'll need to toggle notifications off/on again in Profile.", s["id"], user_id, status)
@@ -141,16 +173,102 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
 # DB helpers
 # ---------------------------------------------------------------------------
 
+if IS_POSTGRES:
+    IntegrityError = psycopg2.IntegrityError
+
+    def _convert_placeholders(query: str) -> str:
+        """Convert SQLite's `?` placeholders to Postgres's `%s`, but only
+        outside single-quoted string literals. A naive query.replace("?",
+        "%s") also mangles any literal `?` character stored as DATA — e.g.
+        this app's zone code_pattern values are regexes that legitimately
+        contain `?` as an "optional group" marker (`([A-G][12])?`), which a
+        blind replace corrupts and then makes psycopg2 choke on (it sees a
+        phantom placeholder with nothing supplied to fill it). This tracks
+        whether we're inside a '...' string as it scans, and leaves `?`
+        alone whenever it's inside one."""
+        result = []
+        in_string = False
+        i, n = 0, len(query)
+        while i < n:
+            ch = query[i]
+            if ch == "'":
+                if in_string and i + 1 < n and query[i + 1] == "'":
+                    result.append("''")  # escaped '' inside a string literal
+                    i += 2
+                    continue
+                in_string = not in_string
+                result.append(ch)
+            elif ch == "?" and not in_string:
+                result.append("%s")
+            else:
+                result.append(ch)
+            i += 1
+        return "".join(result)
+
+    class _PgCursor:
+        """Wraps a psycopg2 cursor (backed by RealDictCursor, so rows already
+        behave like dicts / support row["col"] the same way sqlite3.Row does)
+        so call sites don't need to know which database is actually running."""
+        def __init__(self, cur):
+            self._cur = cur
+
+        def fetchone(self):
+            return self._cur.fetchone()
+
+        def fetchall(self):
+            return self._cur.fetchall()
+
+        @property
+        def rowcount(self):
+            return self._cur.rowcount
+
+    class _PgConnection:
+        """Wraps a psycopg2 connection so the rest of the app can keep calling
+        db.execute(sql_with_question_marks, params) / db.executescript(sql)
+        exactly as it does today for sqlite3 — only this wrapper needs to know
+        Postgres uses %s placeholders instead of ?."""
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, query, params=()):
+            cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(_convert_placeholders(query), params)
+            return _PgCursor(cur)
+
+        def executescript(self, script):
+            # psycopg2 can run a multi-statement string in one call as long as
+            # it contains no parameters, which is exactly what our DDL scripts are.
+            cur = self._conn.cursor()
+            cur.execute(script)
+
+        def commit(self):
+            self._conn.commit()
+
+        def close(self):
+            self._conn.close()
+else:
+    IntegrityError = sqlite3.IntegrityError
+
+
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    if IS_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        wrapped = _PgConnection(conn)
+        try:
+            yield wrapped
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -189,7 +307,7 @@ def generate_task_code(db) -> str:
     date_key = (datetime.utcnow() + timedelta(hours=7)).strftime("%y%m%d")
     row = db.execute(
         "INSERT INTO task_code_counters (date_key, next_seq) VALUES (?, 1) "
-        "ON CONFLICT(date_key) DO UPDATE SET next_seq = next_seq + 1 "
+        "ON CONFLICT(date_key) DO UPDATE SET next_seq = task_code_counters.next_seq + 1 "
         "RETURNING next_seq",
         (date_key,),
     ).fetchone()
@@ -221,6 +339,14 @@ def validate_and_normalize_email(db, email: Optional[str], exclude_user_id: Opti
 # ---------------------------------------------------------------------------
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS vehicles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL,
+    vehicle_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Available',
+    battery_level INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     employee_id TEXT UNIQUE NOT NULL,
@@ -236,6 +362,10 @@ CREATE TABLE IF NOT EXISTS users (
     deleted_at TEXT
 );
 
+-- Only enforces uniqueness among rows that actually have an email set, so
+-- accounts without one (the common case) never collide with each other.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS vehicle_types (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type_key TEXT UNIQUE NOT NULL,
@@ -249,14 +379,6 @@ CREATE TABLE IF NOT EXISTS driver_licenses (
     vehicle_type TEXT NOT NULL,
     expiry_date TEXT,
     UNIQUE(driver_id, vehicle_type)
-);
-
-CREATE TABLE IF NOT EXISTS vehicles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT UNIQUE NOT NULL,
-    vehicle_type TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'Available',
-    battery_level INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS zones (
@@ -415,10 +537,45 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     auth TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Small key/value table for server-wide settings that used to be stored as
+-- files (the VAPID private key, notably) — a database row survives exactly
+-- as long as the rest of the app's data does, unlike a file on disk, which
+-- can vanish on any redeploy/container restart depending on the hosting
+-- platform (guaranteed on Vercel; common on other serverless/autoscale setups).
+CREATE TABLE IF NOT EXISTS app_config (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- Task photos live in the database now too, for the same reason as the VAPID
+-- key above: no dependency on a local disk that may not persist. Old
+-- photo_url values pointing at /uploads/... (from before this change) keep
+-- working via the static file mount further down for backward compatibility.
+CREATE TABLE IF NOT EXISTS task_photos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    content_type TEXT NOT NULL,
+    data BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
 def init_db():
+    if IS_POSTGRES:
+        with get_db() as db:
+            existing = db.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name='users'"
+            ).fetchone()
+            fresh = not existing
+            db.executescript(_postgres_schema())
+            if fresh:
+                seed(db)
+        # No migrate_db() here: a Postgres database always starts from today's
+        # schema, so there's never an older SQLite-era shape to evolve away from.
+        return
+
     fresh = not os.path.exists(DB_PATH)
     with get_db() as db:
         db.executescript(SCHEMA)
@@ -426,19 +583,26 @@ def init_db():
             seed(db)
     if not fresh:
         migrate_db()
-    # Runs unconditionally, after both the fresh-install CREATE TABLE (which
-    # already has the email column) and migrate_db (which adds it to older
-    # databases) — so the column is always guaranteed to exist by this point.
-    with get_db() as db:
-        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL")
+
+
+def _postgres_schema() -> str:
+    """The same schema, translated for Postgres: AUTOINCREMENT -> SERIAL,
+    BLOB -> BYTEA. GROUP_CONCAT-style aggregation isn't touched here since
+    that's a query-time function handled separately in list_drivers()."""
+    return (
+        SCHEMA
+        .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+        .replace("BLOB", "BYTEA")
+    )
 
 
 def migrate_db():
-    """Best-effort auto-migration for databases created by an older version of
-    this app, so a schema change doesn't force deleting existing data every
-    time. New installs never hit this — CREATE TABLE already matches SCHEMA.
-    Requires SQLite 3.35+ (2021) for DROP COLUMN; if unavailable, logs a clear
-    message instead of crashing on the first request that touches it."""
+    """Best-effort auto-migration for SQLite databases created by an older
+    version of this app, so a schema change doesn't force deleting existing
+    data every time. New installs never hit this — CREATE TABLE already
+    matches SCHEMA. Requires SQLite 3.35+ (2021) for DROP COLUMN; if
+    unavailable, logs a clear message instead of crashing on first use.
+    Postgres never calls this — see init_db()."""
     with get_db() as db:
         for table, old_columns in (
             ("tasks", ["max_rack_level"]),
@@ -475,11 +639,11 @@ def seed(db):
     def add_user(employee_id, password, role, full_name=None, cost_center=None, contact=None, pending=False):
         cur = db.execute(
             "INSERT INTO users (employee_id, full_name, password_hash, role, cost_center, contact, "
-            "driver_status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            "driver_status, created_at) VALUES (?,?,?,?,?,?,?,?) RETURNING id",
             (employee_id, full_name, PENDING_PASSWORD if pending else hash_password(password), role,
              cost_center, contact, "Not Checked-in" if role == "DRIVER" else None, ts),
         )
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
     # First-run bootstrap only: create exactly one admin account with a
     # securely random password (never hardcoded), so there's a way to log in
@@ -852,13 +1016,14 @@ def create_driver(body: NewDriverBody, user=Depends(require_role("ADMIN"))):
         email = validate_and_normalize_email(db, body.email)
         cur = db.execute(
             "INSERT INTO users (employee_id, email, full_name, password_hash, role, driver_status, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?) RETURNING id",
             (body.employee_id, email, body.full_name, PENDING_PASSWORD, "DRIVER", "Not Checked-in", now_iso()),
         )
-        driver_id = cur.lastrowid
+        driver_id = cur.fetchone()["id"]
         for vt in body.initial_vehicle_types:
             db.execute(
-                "INSERT OR IGNORE INTO driver_licenses (driver_id, vehicle_type, expiry_date) VALUES (?,?,NULL)",
+                "INSERT INTO driver_licenses (driver_id, vehicle_type, expiry_date) VALUES (?,?,NULL) "
+                "ON CONFLICT DO NOTHING",
                 (driver_id, vt),
             )
         audit(db, user["id"], "create_driver", body.employee_id)
@@ -1067,7 +1232,8 @@ def set_vehicle_type_zone(body: VehicleTypeZoneBody, user=Depends(require_role("
     with get_db() as db:
         if body.allowed:
             db.execute(
-                "INSERT OR IGNORE INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?)",
+                "INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) "
+                "ON CONFLICT DO NOTHING",
                 (body.vehicle_type, body.zone_key),
             )
         else:
@@ -1192,12 +1358,12 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER"))):
         cur = db.execute(
             "INSERT INTO tasks (task_code, request_type, scheduled_at, from_zone, from_location, to_zone, "
             "to_location, task_type, pallet_qty, priority, remark, barcode_pallet_id, "
-            "requester_id, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "requester_id, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
             (code, body.request_type, body.scheduled_at, body.from_zone, from_location, body.to_zone,
              to_location, task_type, body.pallet_qty, body.priority, body.remark,
              body.barcode_pallet_id, user["id"], "Waiting", now_iso()),
         )
-        task_id = cur.lastrowid
+        task_id = cur.fetchone()["id"]
         db.execute(
             "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
             "VALUES (?,?,?,?,?)", (task_id, None, "Waiting", user["id"], now_iso()),
@@ -1243,14 +1409,27 @@ def upload_task_photo(task_id: int, file: UploadFile = File(...), user=Depends(r
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row or row["requester_id"] != user["id"]:
             raise HTTPException(404, "Task not found")
-        ext = os.path.splitext(file.filename or "")[1] or ".jpg"
-        fname = f"{uuid.uuid4().hex}{ext}"
-        dest = os.path.join(UPLOAD_DIR, fname)
-        with open(dest, "wb") as f:
-            f.write(file.file.read())
-        url = f"/uploads/{fname}"
+        content = file.file.read()
+        content_type = file.content_type or "image/jpeg"
+        cur = db.execute(
+            "INSERT INTO task_photos (task_id, content_type, data, created_at) VALUES (?,?,?,?) RETURNING id",
+            (task_id, content_type, content, now_iso()),
+        )
+        photo_id = cur.fetchone()["id"]
+        url = f"/tasks/{task_id}/photo-data/{photo_id}"
         db.execute("UPDATE tasks SET photo_url=? WHERE id=?", (url, task_id))
         return {"ok": True, "photo_url": url}
+
+
+@app.get("/tasks/{task_id}/photo-data/{photo_id}")
+def get_task_photo(task_id: int, photo_id: int, user=Depends(current_user)):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM task_photos WHERE id=? AND task_id=?", (photo_id, task_id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Photo not found")
+        return Response(content=bytes(row["data"]), media_type=row["content_type"])
 
 
 @app.post("/tasks/{task_id}/priority")
@@ -1436,7 +1615,7 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
             "assignment_status, reason) VALUES (?,?,?,?,?,?,?)",
             (task_row["id"], driver["id"], vehicle["id"], assigned_by_id, now_iso(), "Active", reason),
         )
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise HTTPException(409, "คนขับคนนี้มีการมอบหมายที่ Active อยู่กับงานนี้อยู่แล้ว (อาจเกิดจากกดซ้ำ หรือมีคนอื่นทำพร้อมกัน)")
     eta = add_minutes_iso(estimated_minutes) if estimated_minutes else task_row["estimated_arrival"]
     db.execute(
@@ -1728,7 +1907,7 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_role("DRIVE
                 "assignment_status, reason) VALUES (?,?,?,?,?,?,?)",
                 (task_id, driver["id"], vehicle["id"], user["id"], now_iso(), "Active", "Joined by driver"),
             )
-        except sqlite3.IntegrityError:
+        except IntegrityError:
             raise HTTPException(409, "คุณเพิ่งเข้าร่วมงานนี้ไปแล้ว (อาจเกิดจากกดซ้ำ)")
         db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
         db.execute("UPDATE vehicles SET status='Busy', battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
@@ -1771,7 +1950,7 @@ def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_rol
                 "assignment_status, reason) VALUES (?,?,?,?,?,?,?)",
                 (task_id, driver["id"], vehicle["id"], user["id"], now_iso(), "Active", "Added by admin"),
             )
-        except sqlite3.IntegrityError:
+        except IntegrityError:
             raise HTTPException(409, "คนขับคนนี้เพิ่งถูกเพิ่มเข้างานนี้ไปแล้ว (อาจเกิดจากกดซ้ำ)")
         db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
         db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
@@ -2049,10 +2228,12 @@ def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN"
 @app.get("/drivers")
 def list_drivers(user=Depends(require_role("ADMIN"))):
     with get_db() as db:
+        concat_fn = "STRING_AGG(driver_licenses.vehicle_type, ',')" if IS_POSTGRES else "GROUP_CONCAT(driver_licenses.vehicle_type)"
+        today_fn = "CURRENT_DATE" if IS_POSTGRES else "date('now')"
         rows = db.execute(
             "SELECT users.id, users.employee_id, users.full_name, users.driver_status, users.checked_in_vehicle_id, "
-            "GROUP_CONCAT(driver_licenses.vehicle_type) AS license_types, "
-            "SUM(CASE WHEN driver_licenses.expiry_date IS NOT NULL AND driver_licenses.expiry_date < date('now') "
+            f"{concat_fn} AS license_types, "
+            f"SUM(CASE WHEN driver_licenses.expiry_date IS NOT NULL AND driver_licenses.expiry_date < {today_fn} "
             "THEN 1 ELSE 0 END) AS expired_count "
             "FROM users LEFT JOIN driver_licenses ON driver_licenses.driver_id = users.id "
             "WHERE users.role='DRIVER' AND users.deleted_at IS NULL GROUP BY users.id"
@@ -2866,7 +3047,12 @@ def export_tasks(period: str = "all", user=Depends(require_role("ADMIN"))):
 init_db()
 ensure_vapid_keys()
 
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+if not IS_POSTGRES:
+    # Only relevant for disk-backed deployments — serves photos uploaded
+    # before the DB-storage change above, or during local/Replit-style dev.
+    # Skipped entirely on Postgres/Vercel, where UPLOAD_DIR is never created
+    # and every task photo goes through /tasks/{id}/photo-data/{photo_id} instead.
+    app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 
