@@ -388,7 +388,8 @@ CREATE TABLE IF NOT EXISTS zones (
     code_pattern TEXT NOT NULL,
     allow_multiple INTEGER NOT NULL DEFAULT 0,
     example_code TEXT,
-    sort_order INTEGER NOT NULL DEFAULT 0
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    free_text INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS vehicle_type_zones (
@@ -419,6 +420,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_code TEXT UNIQUE NOT NULL,
     request_type TEXT NOT NULL,
     scheduled_at TEXT,
+    bu TEXT,
     from_zone TEXT NOT NULL,
     from_location TEXT NOT NULL,
     to_zone TEXT NOT NULL,
@@ -625,12 +627,26 @@ def migrate_db():
         for table, new_columns in (
             ("users", [("deleted_at", "TEXT"), ("email", "TEXT")]),
             ("breakdowns", [("resolution_note", "TEXT")]),
+            ("tasks", [("bu", "TEXT")]),
+            ("zones", [("free_text", "INTEGER NOT NULL DEFAULT 0")]),
         ):
             existing = [r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
             for col, coltype in new_columns:
                 if col not in existing:
                     db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
                     log.info(f"Migrated database: added new column {table}.{col}")
+
+        # Data fixes for databases that existed before this round: GATE now
+        # allows multiple locations, and there's a new EMPTY_PALLET zone for
+        # requisitioning empty pallets. Fresh installs already get both via
+        # seed() — this only matters for upgrading an existing database.
+        db.execute("UPDATE zones SET allow_multiple=1 WHERE zone_key='GATE'")
+        if not db.execute("SELECT 1 FROM zones WHERE zone_key='EMPTY_PALLET'").fetchone():
+            db.execute(
+                "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) "
+                "VALUES ('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า-จุดจ่าย',7,1)"
+            )
+            log.info("Migrated database: added EMPTY_PALLET zone")
 
 
 def seed(db):
@@ -670,13 +686,14 @@ def seed(db):
     )
 
     db.execute(
-        "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order) VALUES "
-        "('CONCRETE_YARD','ลานปูน','^ลานปูน-[1-7]$',0,'ลานปูน-3',1),"
-        "('GATE','ประตู','^ประตู-([1-9]|[1-7][0-9]|8[0-5])$',0,'ประตู-12',2),"
-        "('SORT_YARD','ลาน Sort','^ลาน Sort$',0,'ลาน Sort',3),"
-        "('MEZZANINE','Mezzanine','^Mezzanine-[1-4]-(ซ้าย \\(Cross dock\\)|ขวา \\(Double Deep\\))$',0,'Mezzanine-2-ซ้าย (Cross dock)',4),"
-        "('SELECTIVE_RACK','Selective Rack','^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$',1,'BAA01A1',5),"
-        "('DOUBLE_DEEP','Double Deep','^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$',1,'AAA01G1',6)"
+        "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) VALUES "
+        "('CONCRETE_YARD','ลานปูน','^ลานปูน-[1-7]$',0,'ลานปูน-3',1,0),"
+        "('GATE','ประตู','^ประตู-([1-9]|[1-7][0-9]|8[0-5])$',1,'ประตู-12',2,0),"
+        "('SORT_YARD','ลาน Sort','^ลาน Sort$',0,'ลาน Sort',3,0),"
+        "('MEZZANINE','Mezzanine','^Mezzanine-[1-4]-(ซ้าย \\(Cross dock\\)|ขวา \\(Double Deep\\))$',0,'Mezzanine-2-ซ้าย (Cross dock)',4,0),"
+        "('SELECTIVE_RACK','Selective Rack','^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$',1,'BAA01A1',5,0),"
+        "('DOUBLE_DEEP','Double Deep','^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$',1,'AAA01G1',6,0),"
+        "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า-จุดจ่าย',7,1)"
     )
 
     # Default: every vehicle type can work every zone. Admin narrows this
@@ -726,6 +743,8 @@ def validate_location_string(db, zone_key: str, value: str) -> str:
             parts.append(p)
     if not zone["allow_multiple"] and len(parts) > 1:
         raise HTTPException(400, f"โซน {zone['zone_name_th']} เลือกได้จุดเดียวเท่านั้น")
+    if zone["free_text"]:
+        return ",".join(parts)
     pattern = re.compile(zone["code_pattern"], re.IGNORECASE)
     for p in parts:
         if not pattern.match(p):
@@ -1162,6 +1181,7 @@ class ZoneBody(BaseModel):
     code_pattern: str
     allow_multiple: bool = False
     example_code: Optional[str] = None
+    free_text: bool = False
 
 
 @app.get("/zones")
@@ -1181,10 +1201,10 @@ def add_zone(body: ZoneBody, user=Depends(require_role("ADMIN"))):
             raise HTTPException(400, f"รูปแบบ pattern ไม่ถูกต้อง: {e}")
         max_order = db.execute("SELECT COALESCE(MAX(sort_order),0) m FROM zones").fetchone()["m"]
         db.execute(
-            "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) "
+            "VALUES (?,?,?,?,?,?,?)",
             (body.zone_key, body.zone_name_th, body.code_pattern, int(body.allow_multiple),
-             body.example_code, max_order + 1),
+             body.example_code, max_order + 1, int(body.free_text)),
         )
         audit(db, user["id"], "add_zone", body.zone_key)
         return {"ok": True}
@@ -1281,9 +1301,13 @@ def delete_task_rule(rule_id: int, user=Depends(require_role("ADMIN"))):
 # Tasks
 # ---------------------------------------------------------------------------
 
+BU_LIST = ["CDS", "MUJI", "PGE", "RBS", "SSP", "GG", "B2S", "OFM", "CMG", "KMNY"]
+
+
 class TaskCreate(BaseModel):
     request_type: str = "Request Now"
     scheduled_at: Optional[str] = None
+    bu: str
     from_zone: str
     from_location: str
     to_zone: str
@@ -1310,8 +1334,16 @@ class PriorityBody(BaseModel):
     priority: str
 
 
-def task_to_dict(row, db) -> dict:
+def task_to_dict(row, db, viewer_role: Optional[str] = None) -> dict:
     d = dict(row)
+    # Rating/comment are hidden from Drivers specifically (so they don't see
+    # how they were scored) — but not from the User who submitted it, since
+    # they need `rating` to tell "already reviewed" from "awaiting review"
+    # (hiding it from them too broke that tracking: the rate button would
+    # never disappear). Admin always sees everything.
+    if viewer_role == "DRIVER":
+        d["rating"] = None
+        d["rating_comment"] = None
     d["driver_employee_id"] = None
     d["driver_name"] = None
     d["vehicle_code"] = None
@@ -1350,16 +1382,18 @@ def task_to_dict(row, db) -> dict:
 def create_task(body: TaskCreate, user=Depends(require_role("USER"))):
     if body.request_type == "Booking" and not body.scheduled_at:
         raise HTTPException(400, "การจองล่วงหน้าต้องระบุวันเวลา")
+    if body.bu not in BU_LIST:
+        raise HTTPException(400, f"BU ไม่ถูกต้อง ต้องเป็นหนึ่งใน: {', '.join(BU_LIST)}")
     with get_db() as db:
         from_location = validate_location_string(db, body.from_zone, body.from_location)
         to_location = validate_location_string(db, body.to_zone, body.to_location)
         task_type = infer_task_type(db, body.from_zone, body.to_zone)
         code = generate_task_code(db)
         cur = db.execute(
-            "INSERT INTO tasks (task_code, request_type, scheduled_at, from_zone, from_location, to_zone, "
+            "INSERT INTO tasks (task_code, request_type, scheduled_at, bu, from_zone, from_location, to_zone, "
             "to_location, task_type, pallet_qty, priority, remark, barcode_pallet_id, "
-            "requester_id, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
-            (code, body.request_type, body.scheduled_at, body.from_zone, from_location, body.to_zone,
+            "requester_id, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+            (code, body.request_type, body.scheduled_at, body.bu, body.from_zone, from_location, body.to_zone,
              to_location, task_type, body.pallet_qty, body.priority, body.remark,
              body.barcode_pallet_id, user["id"], "Waiting", now_iso()),
         )
@@ -1370,7 +1404,13 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER"))):
         )
         notify_admins(db, f"New task {code} created by {user['employee_id']}", task_id)
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-        return task_to_dict(row, db)
+        result = task_to_dict(row, db, viewer_role=user["role"])
+        available = db.execute(
+            "SELECT COUNT(*) n FROM users WHERE role='DRIVER' AND driver_status='Available' AND deleted_at IS NULL"
+        ).fetchone()["n"]
+        if available == 0:
+            result["warning"] = "ตอนนี้ยังไม่มีคนขับว่าง งานอาจต้องใช้เวลาสักหน่อยกว่าจะมีคนขับรับงาน"
+        return result
 
 
 @app.put("/tasks/{task_id}")
@@ -1385,7 +1425,7 @@ def update_task(task_id: int, body: TaskUpdate, user=Depends(require_role("USER"
             raise HTTPException(400, "Task can only be modified before work starts (status=Waiting)")
         fields = body.dict(exclude_unset=True)
         if not fields:
-            return task_to_dict(row, db)
+            return task_to_dict(row, db, viewer_role=user["role"])
         from_zone = fields.get("from_zone", row["from_zone"])
         to_zone = fields.get("to_zone", row["to_zone"])
         if "from_location" in fields or "from_zone" in fields:
@@ -1400,7 +1440,7 @@ def update_task(task_id: int, body: TaskUpdate, user=Depends(require_role("USER"
         db.execute(f"UPDATE tasks SET {set_clause}, task_type=? WHERE id=?", params)
         audit(db, user["id"], "modify_task", f"task {row['task_code']}: {fields}")
         fresh = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-        return task_to_dict(fresh, db)
+        return task_to_dict(fresh, db, viewer_role=user["role"])
 
 
 @app.post("/tasks/{task_id}/photo")
@@ -1471,7 +1511,7 @@ def list_tasks(status_filter: Optional[str] = None, user=Depends(current_user)):
             params.append(status_filter)
         q += " ORDER BY created_at DESC"
         rows = db.execute(q, params).fetchall()
-        return [task_to_dict(r, db) for r in rows]
+        return [task_to_dict(r, db, viewer_role=user["role"]) for r in rows]
 
 
 @app.get("/tasks/{task_id}")
@@ -1486,7 +1526,7 @@ def get_task(task_id: int, user=Depends(current_user)):
         status_hist = db.execute(
             "SELECT * FROM task_status_history WHERE task_id=? ORDER BY changed_at", (task_id,)
         ).fetchall()
-        d = task_to_dict(row, db)
+        d = task_to_dict(row, db, viewer_role=user["role"])
         d["assignment_history"] = [dict(h) for h in history]
         d["status_history"] = [dict(h) for h in status_hist]
         return d
@@ -2224,6 +2264,28 @@ def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN"
 # ---------------------------------------------------------------------------
 # Drivers / Vehicles / Check-in / Dispatch suggestion
 # ---------------------------------------------------------------------------
+
+@app.get("/drivers/availability-summary")
+def drivers_availability_summary(user=Depends(current_user)):
+    """Aggregate counts only (no names/details) — safe to expose to USER and
+    DRIVER, not just ADMIN, so a requester can see at a glance whether a
+    driver is likely to pick up their task soon."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT driver_status, COUNT(*) n FROM users "
+            "WHERE role='DRIVER' AND deleted_at IS NULL GROUP BY driver_status"
+        ).fetchall()
+        counts = {r["driver_status"]: r["n"] for r in rows}
+        available = counts.get("Available", 0)
+        busy = counts.get("Busy", 0)
+        breakdown = counts.get("Breakdown", 0)
+        not_checked_in = counts.get("Not Checked-in", 0)
+        return {
+            "available": available, "busy": busy, "breakdown": breakdown,
+            "not_checked_in": not_checked_in,
+            "total": available + busy + breakdown + not_checked_in,
+        }
+
 
 @app.get("/drivers")
 def list_drivers(user=Depends(require_role("ADMIN"))):

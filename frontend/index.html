@@ -846,6 +846,15 @@ function taskCard(t, actionsHtml, opts={}){
 }
 
 function bindCardActions(container){
+  container.querySelectorAll("[data-duplicate]").forEach(b=> b.onclick = async (e)=>{
+    e.stopPropagation();
+    try{
+      const t = await api(`/tasks/${b.dataset.duplicate}`);
+      const sheetOverlay = b.closest(".sheet-overlay");
+      if(sheetOverlay) closeSheet(sheetOverlay);
+      openCreateTask(t);
+    }catch(err){ toast(err.message); }
+  });
   container.querySelectorAll("[data-action]").forEach(btn=>{
     btn.onclick = async (e)=>{
       e.stopPropagation();
@@ -956,8 +965,7 @@ function openRatingSheet(taskId){
   const commentWrap = overlay.querySelector("#rt-comment-wrap");
   function drawStars(){
     starsEl.textContent = "★".repeat(selected) + "☆".repeat(5-selected);
-    // Comment is only offered for low ratings, so we can find out what went wrong.
-    commentWrap.style.display = (selected > 0 && selected < 3) ? "block" : "none";
+    commentWrap.style.display = selected > 0 ? "block" : "none";
   }
   starsEl.onclick = (e)=>{
     const rect = starsEl.getBoundingClientRect();
@@ -1021,18 +1029,35 @@ function buildLocationPicker(container, zones, initial){
       sel.onchange = upd; upd();
       body.appendChild(sel);
     } else if(zk === "GATE"){
-      const inp = el(`<input type="number" min="1" max="85" placeholder="1-85" />`);
+      // Multiple gates allowed now — same numeric-entry UX as before (with the
+      // ขาเข้า/ขาออก hint), just building up a list of chips instead of one value.
+      const row = el(`<div style="display:flex;gap:8px;"><input type="number" min="1" max="85" placeholder="1-85" /><button type="button" class="btn amber">เพิ่ม</button></div>`);
       const hint = el(`<div class="field-note"></div>`);
-      const m = singleValue.match(/-(\d+)$/);
-      if(m) inp.value = m[1];
-      const upd = ()=>{
-        const n = parseInt(inp.value||0);
-        if(n<1||n>85){ hint.textContent = "กรอกเลข 1-85"; singleValue=""; return; }
-        hint.textContent = n<=58 ? "ขาเข้า (In)" : "ขาออก (Out)";
-        singleValue = "ประตู-"+n;
+      const chipRow = el(`<div class="chip-row" style="margin-top:8px;"></div>`);
+      function drawChips(){
+        chipRow.innerHTML = "";
+        chips.forEach((c,i)=>{
+          const chip = el(`<span class="chip active" style="cursor:default;">${c} <span style="cursor:pointer;margin-left:4px;">✕</span></span>`);
+          chip.querySelector("span").onclick = ()=>{ chips.splice(i,1); drawChips(); };
+          chipRow.appendChild(chip);
+        });
+      }
+      row.querySelector("input").oninput = (e)=>{
+        const n = parseInt(e.target.value||0);
+        hint.textContent = (n>=1 && n<=85) ? (n<=58 ? "ขาเข้า (In)" : "ขาออก (Out)") : "กรอกเลข 1-85";
       };
-      inp.oninput = upd; upd();
-      body.appendChild(inp); body.appendChild(hint);
+      row.querySelector("button").onclick = ()=>{
+        const inp = row.querySelector("input");
+        const n = parseInt(inp.value||0);
+        if(n<1||n>85){ wrap.querySelector(".zp-err").textContent = "กรอกเลข 1-85"; return; }
+        const v = "ประตู-"+n;
+        if(chips.includes(v)){ wrap.querySelector(".zp-err").textContent = "ประตูนี้ถูกเพิ่มไปแล้ว"; return; }
+        chips.push(v);
+        wrap.querySelector(".zp-err").textContent = "";
+        inp.value = ""; hint.textContent = ""; drawChips();
+      };
+      drawChips();
+      body.appendChild(row); body.appendChild(hint); body.appendChild(chipRow);
     } else if(zk === "SORT_YARD"){
       singleValue = "ลาน Sort";
       body.appendChild(el(`<div class="field-note">จุดเดียว ไม่ต้องเลือกเพิ่ม</div>`));
@@ -1045,6 +1070,36 @@ function buildLocationPicker(container, zones, initial){
       const upd = ()=>{ singleValue = "Mezzanine-"+s1.value+"-"+s2.value; };
       s1.onchange = upd; s2.onchange = upd; upd();
       body.appendChild(s1); body.appendChild(s2);
+    } else if(currentZone.free_text){
+      // Free-text zones (e.g. "พาเลทเปล่า") skip pattern validation entirely —
+      // any non-empty description is accepted, so no ✕/toUpperCase gymnastics.
+      if(currentZone.allow_multiple){
+        const row = el(`<div style="display:flex;gap:8px;"><input placeholder="พิมพ์รายละเอียด แล้วกดเพิ่ม" /><button type="button" class="btn amber">เพิ่ม</button></div>`);
+        const chipRow = el(`<div class="chip-row" style="margin-top:8px;"></div>`);
+        function drawChips(){
+          chipRow.innerHTML = "";
+          chips.forEach((c,i)=>{
+            const chip = el(`<span class="chip active" style="cursor:default;">${c} <span style="cursor:pointer;margin-left:4px;">✕</span></span>`);
+            chip.querySelector("span").onclick = ()=>{ chips.splice(i,1); drawChips(); };
+            chipRow.appendChild(chip);
+          });
+        }
+        row.querySelector("button").onclick = ()=>{
+          const inp = row.querySelector("input");
+          const v = inp.value.trim();
+          if(!v) return;
+          if(chips.includes(v)){ wrap.querySelector(".zp-err").textContent = "รายการนี้ถูกเพิ่มไปแล้ว"; return; }
+          chips.push(v);
+          wrap.querySelector(".zp-err").textContent = "";
+          inp.value = ""; drawChips();
+        };
+        drawChips();
+        body.appendChild(row); body.appendChild(chipRow);
+      } else {
+        const inp = el(`<textarea rows="2" placeholder="${currentZone.example_code||'พิมพ์รายละเอียด'}">${singleValue}</textarea>`);
+        inp.oninput = ()=>{ singleValue = inp.value.trim(); };
+        body.appendChild(inp);
+      }
     } else if(currentZone.allow_multiple){
       const row = el(`<div style="display:flex;gap:8px;"><input placeholder="${currentZone.example_code||''} (วางจาก Excel ได้)" /><button type="button" class="btn amber">เพิ่ม</button></div>`);
       const chipRow = el(`<div class="chip-row"></div>`);
@@ -1136,7 +1191,7 @@ function openLocationPickerPopup(title, zones, initial, onConfirm){
   };
 }
 
-function openCreateTask(){
+function openCreateTask(prefill){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
@@ -1147,6 +1202,9 @@ function openCreateTask(){
           <label>วันเวลาที่ต้องการ</label>
           <input id="ct-scheduled" type="datetime-local" />
         </div>
+        <label>BU</label>
+        <select id="ct-bu">${BU_LIST.map(b=>`<option value="${b}">${b}</option>`).join("")}</select>
+        <div id="ct-driver-avail" class="field-note" style="margin-top:8px;">กำลังเช็คจำนวนคนขับว่าง...</div>
         <div class="grid2">
           <div>
             <label>จุดต้นทาง</label>
@@ -1175,6 +1233,16 @@ function openCreateTask(){
     overlay.querySelector("#ct-booking-wrap").style.display = e.target.value === "Booking" ? "block" : "none";
   };
 
+  // Let a User see at a glance whether a driver is likely free before they
+  // even submit — the actual "might take a while" warning still comes back
+  // from the server after creating, since driver status can change in the
+  // few seconds it takes to fill out the rest of the form.
+  api("/drivers/availability-summary").then(s=>{
+    const box = overlay.querySelector("#ct-driver-avail");
+    box.textContent = `คนขับว่างตอนนี้ ${s.available} คน (ไม่ว่าง ${s.busy} · ทั้งหมด ${s.total} คน)`;
+    if(s.available === 0) box.style.color = "var(--warn)";
+  }).catch(()=>{ overlay.querySelector("#ct-driver-avail").textContent = ""; });
+
   let fromValue = null, toValue = null, zonesCache = null;
   async function ensureZones(){ if(!zonesCache) zonesCache = await api("/zones"); return zonesCache; }
   const fromBtn = overlay.querySelector("#ct-from-btn");
@@ -1194,6 +1262,23 @@ function openCreateTask(){
     });
   };
 
+  // Pre-fill from an earlier task ("create from a previous task") — same
+  // sheet, just seeded with that task's values so the person only has to
+  // change what's different this time.
+  if(prefill){
+    overlay.querySelector("#ct-bu").value = prefill.bu || BU_LIST[0];
+    overlay.querySelector("#ct-priority").value = prefill.priority || "Normal";
+    overlay.querySelector("#ct-remark").value = prefill.remark || "";
+    document.getElementById("ct-pallet").value = prefill.pallet_qty || 1;
+    document.getElementById("ct-pallet-num").value = prefill.pallet_qty || 1;
+    ensureZones().then(zones=>{
+      fromValue = {zone: prefill.from_zone, value: prefill.from_location};
+      toValue = {zone: prefill.to_zone, value: prefill.to_location};
+      fromBtn.textContent = displayZoneValue(zones, fromValue);
+      toBtn.textContent = displayZoneValue(zones, toValue);
+    });
+  }
+
   overlay.querySelector("#ct-submit").onclick = async ()=>{
     const reqType = overlay.querySelector("#ct-type").value;
     const scheduled = overlay.querySelector("#ct-scheduled").value;
@@ -1201,9 +1286,10 @@ function openCreateTask(){
     if(!fromValue || !fromValue.value){ toast("กรุณาเลือกจุดต้นทาง"); return; }
     if(!toValue || !toValue.value){ toast("กรุณาเลือกจุดปลายทาง"); return; }
     try{
-      await api("/tasks", {method:"POST", body: JSON.stringify({
+      const result = await api("/tasks", {method:"POST", body: JSON.stringify({
         request_type: reqType,
         scheduled_at: reqType === "Booking" ? scheduled : null,
+        bu: overlay.querySelector("#ct-bu").value,
         from_zone: fromValue.zone, from_location: fromValue.value,
         to_zone: toValue.zone, to_location: toValue.value,
         pallet_qty: parseInt(overlay.querySelector("#ct-pallet").value || "1"),
@@ -1211,7 +1297,7 @@ function openCreateTask(){
         remark: overlay.querySelector("#ct-remark").value,
       })});
       closeSheet(overlay);
-      toast("สร้างงานสำเร็จ");
+      toast(result.warning ? `สร้างงานสำเร็จ — ${result.warning}` : "สร้างงานสำเร็จ");
       await refreshAll();
     }catch(e){ toast(e.message); }
   };
@@ -1967,6 +2053,7 @@ const CHART_COLORS = {
   "Waiting":"#64748b","Assigned":"#0d9488","In Progress":"#2563eb","Pause":"#7c3aed",
   "Completed":"#15803d","Cancelled":"#dc2626",
 };
+const BU_LIST = ["CDS","MUJI","PGE","RBS","SSP","GG","B2S","OFM","CMG","KMNY"];
 const KPI_LABEL = {
   total_jobs: "งานทั้งหมด", completed: "เสร็จสิ้น", in_progress: "กำลังทำ", overdue: "ค้างนาน (Overdue)",
   completion_rate: "อัตราสำเร็จ (%)", avg_process_time_minutes: "เวลาเฉลี่ย/งาน (นาที)",
@@ -3052,11 +3139,12 @@ function renderAdminSettings(main){
 
 function buildTaskDetailActions(t){
   const isChat = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
+  const dupBtn = `<button class="btn" data-duplicate="${t.id}">สร้างงานจากงานนี้</button>`;
   if(state.role === "USER"){
-    if(t.status === "Waiting") return `<button class="btn" data-edit="${t.id}">แก้ไข</button><button class="btn" data-photo="${t.id}">เพิ่มรูป</button>${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>`;
-    if(t.status === "Assigned") return `${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>`;
-    if(t.status === "Completed" && !t.rating) return `<button class="btn amber" data-rate="${t.id}">ให้คะแนน</button>${isChat}`;
-    return isChat;
+    if(t.status === "Waiting") return `<button class="btn" data-edit="${t.id}">แก้ไข</button><button class="btn" data-photo="${t.id}">เพิ่มรูป</button>${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
+    if(t.status === "Assigned") return `${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
+    if(t.status === "Completed" && !t.rating) return `<button class="btn amber" data-rate="${t.id}">ให้คะแนน</button>${isChat}${dupBtn}`;
+    return isChat + dupBtn;
   }
   if(state.role === "DRIVER"){
     const mine = (t.drivers||[]).some(d=> d.employee_id === state.employee_id);
