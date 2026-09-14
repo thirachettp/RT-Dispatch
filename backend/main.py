@@ -3161,6 +3161,41 @@ def healthz():
         "web_push": WEB_PUSH_AVAILABLE,
     }
 
+
+class AdminResetBody(BaseModel):
+    secret: str
+    new_password: str
+
+
+@app.post("/admin/emergency-reset-password")
+def emergency_reset_admin_password(body: AdminResetBody):
+    """Recovery hatch for when the one-time bootstrap admin password was
+    missed (e.g. it scrolled out of the deploy logs). Gated by a secret set
+    as the ADMIN_RESET_SECRET environment variable — if that variable isn't
+    set, this endpoint is disabled entirely, so it can't be abused on a
+    normal running system. Resets the password of the earliest-created admin
+    account. Set the env var, call this once, then delete the env var (or
+    leave it — it's still safe, but removing it closes the hatch)."""
+    reset_secret = os.environ.get("ADMIN_RESET_SECRET")
+    if not reset_secret:
+        raise HTTPException(404, "Not found")
+    if not hmac.compare_digest(body.secret, reset_secret):
+        raise HTTPException(403, "Invalid secret")
+    if len(body.new_password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(400, f"รหัสผ่านต้องมีอย่างน้อย {MIN_PASSWORD_LENGTH} ตัวอักษร")
+    with get_db() as db:
+        admin = db.execute(
+            "SELECT id, employee_id FROM users WHERE role='ADMIN' AND deleted_at IS NULL "
+            "ORDER BY id LIMIT 1"
+        ).fetchone()
+        if not admin:
+            raise HTTPException(404, "ไม่พบบัญชี admin")
+        db.execute("UPDATE users SET password_hash=? WHERE id=?",
+                   (hash_password(body.new_password), admin["id"]))
+        db.execute("DELETE FROM sessions WHERE user_id=?", (admin["id"],))
+        return {"ok": True, "employee_id": admin["employee_id"],
+                "message": "ตั้งรหัสผ่านใหม่แล้ว ล็อกอินได้เลย และอย่าลืมลบ ADMIN_RESET_SECRET ออกจาก environment variables"}
+
 if not IS_POSTGRES:
     # Only relevant for disk-backed deployments — serves photos uploaded
     # before the DB-storage change above, or during local/Replit-style dev.
