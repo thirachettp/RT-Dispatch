@@ -3114,8 +3114,20 @@ if not IS_POSTGRES:
     # before the DB-storage change above, or during local/Replit-style dev.
     # Skipped entirely on Postgres/Vercel, where UPLOAD_DIR is never created
     # and every task photo goes through /tasks/{id}/photo-data/{photo_id} instead.
-    app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
-app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+    try:
+        app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+    except RuntimeError as e:
+        log.warning("Could not mount /uploads (%s) — skipping, old photo links won't resolve", e)
+
+try:
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+except RuntimeError as e:
+    # A missing frontend/ directory here (e.g. if a deployment platform's
+    # bundler didn't include it) used to crash the entire app at import time
+    # — every request would fail with FUNCTION_INVOCATION_FAILED, not just
+    # the ones for static files. Log it and keep going so the API routes
+    # (and any other static route below) still work even if this one can't.
+    log.warning("Could not mount /static (%s) — the SPA frontend won't be served, but the API will still respond", e)
 
 
 @app.get("/")
