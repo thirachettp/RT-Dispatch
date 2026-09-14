@@ -49,9 +49,19 @@ except ImportError:
 # before — nothing else needs to change to run locally.
 DATABASE_URL = os.environ.get("DATABASE_URL")
 IS_POSTGRES = bool(DATABASE_URL)
+_IMPORT_ERROR = None
 if IS_POSTGRES:
-    import psycopg2
-    import psycopg2.extras
+    try:
+        import psycopg2
+        import psycopg2.extras
+    except Exception as e:
+        # If the Postgres driver can't even be imported (a known failure mode
+        # for psycopg2-binary on some serverless runtimes), don't let it kill
+        # the whole module at load time — that produces an opaque
+        # FUNCTION_INVOCATION_FAILED on EVERY route, including /healthz.
+        # Record it and let the app finish importing so /healthz can report it.
+        _IMPORT_ERROR = f"{type(e).__name__}: {e}"
+        IS_POSTGRES = False
 
 log = logging.getLogger("uvicorn.error")
 
@@ -3106,8 +3116,42 @@ def export_tasks(period: str = "all", user=Depends(require_role("ADMIN"))):
 # Static frontend + uploads
 # ---------------------------------------------------------------------------
 
-init_db()
-ensure_vapid_keys()
+try:
+    if _IMPORT_ERROR:
+        # The Postgres driver failed to import. Don't fall through to init_db()
+        # here — on Vercel that would try to create a SQLite file on a
+        # read-only filesystem and crash again. Skip init entirely and let
+        # /healthz report the import error as the root cause.
+        raise RuntimeError(f"Postgres driver import failed: {_IMPORT_ERROR}")
+    init_db()
+    ensure_vapid_keys()
+except Exception as e:
+    # On a normal server (Replit, a VM) this runs once at startup and any DB
+    # problem should surface loudly. But on Vercel this module is imported to
+    # handle a request, and a raised exception here means EVERY request dies
+    # with FUNCTION_INVOCATION_FAILED and no useful message. Log the real
+    # error so it shows up in Runtime Logs, and let the app finish importing;
+    # the health/diagnostics route below can then report what went wrong
+    # instead of the whole function being dead on arrival.
+    log.error("Startup init failed: %r", e)
+    _STARTUP_ERROR = repr(e)
+else:
+    _STARTUP_ERROR = None
+
+
+@app.get("/healthz")
+def healthz():
+    """Plain diagnostics endpoint that never touches the DB at import time —
+    so even if startup init failed, this still answers and tells you WHY,
+    turning an opaque 500 into a readable message."""
+    return {
+        "ok": _STARTUP_ERROR is None and _IMPORT_ERROR is None,
+        "startup_error": _STARTUP_ERROR,
+        "import_error": _IMPORT_ERROR,
+        "database": "postgres" if IS_POSTGRES else "sqlite",
+        "database_url_set": bool(DATABASE_URL),
+        "web_push": WEB_PUSH_AVAILABLE,
+    }
 
 if not IS_POSTGRES:
     # Only relevant for disk-backed deployments — serves photos uploaded
