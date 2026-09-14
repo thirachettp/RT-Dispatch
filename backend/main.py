@@ -577,12 +577,20 @@ CREATE TABLE IF NOT EXISTS task_photos (
 def init_db():
     if IS_POSTGRES:
         with get_db() as db:
+            # Vercel (and any serverless platform) can spin up several instances
+            # that all hit init_db() at once on the first requests. Without
+            # coordination they race to CREATE the same tables and one loses
+            # with a "duplicate key ... pg_type" error, which then crashed
+            # startup. A transaction-scoped advisory lock serializes this:
+            # whichever instance grabs the lock first does the setup, the
+            # others wait, then find the tables already there and do nothing.
+            db.execute("SELECT pg_advisory_xact_lock(913472001)")
             existing = db.execute(
                 "SELECT 1 FROM information_schema.tables WHERE table_name='users'"
             ).fetchone()
             fresh = not existing
-            db.executescript(_postgres_schema())
             if fresh:
+                db.executescript(_postgres_schema())
                 seed(db)
         # No migrate_db() here: a Postgres database always starts from today's
         # schema, so there's never an older SQLite-era shape to evolve away from.
