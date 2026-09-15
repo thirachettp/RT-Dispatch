@@ -26,6 +26,22 @@
     background:var(--bg); position:relative; border-left:1px solid var(--line); border-right:1px solid var(--line);}
   header.topbar{position:sticky;top:0;z-index:5;background:var(--bg);
     border-bottom:1px solid var(--line); padding:14px 16px; display:flex; align-items:center; justify-content:space-between;}
+  /* Manual refresh strip. Sticks directly under the header so "how fresh is
+     this?" and "refresh it" are always one glance / one tap away, which is
+     what makes a 30s poll interval acceptable. */
+  #refresh-bar{position:sticky;top:57px;z-index:4;background:var(--panel);
+    border-bottom:1px solid var(--line); padding:7px 16px; cursor:pointer;
+    display:flex;align-items:center;justify-content:center;gap:8px;
+    font-size:12px;color:var(--ink-dim);user-select:none;
+    -webkit-tap-highlight-color:transparent;}
+  #refresh-bar:active{background:var(--panel-2);}
+  #refresh-bar-icon{font-size:13px;line-height:1;display:inline-block;}
+  #refresh-bar-icon.spin{animation:scdc-spin .8s linear infinite;}
+  @keyframes scdc-spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion: reduce){
+    #refresh-bar-icon.spin{animation:none;opacity:.5;}
+  }
+
   .brand{display:flex;align-items:center;gap:10px;}
   .logo-mark{width:28px;height:28px;border-radius:8px;background:var(--amber);display:flex;
     align-items:center;justify-content:center;flex:none;}
@@ -454,6 +470,31 @@ function wirePullToRefresh(container, indicatorEl, onRefresh){
     pulling = false; startY = null;
   });
 }
+// Thin strip under the header: shows when the data was last refreshed and
+// doubles as the manual refresh control now that polling is far less frequent.
+function refreshBarHTML(){
+  return `<div id="refresh-bar" role="button" tabindex="0">
+    <span id="refresh-bar-text">กำลังโหลด...</span>
+    <span id="refresh-bar-icon">↻</span>
+  </div>`;
+}
+
+function updateRefreshBar(){
+  const txt = document.getElementById("refresh-bar-text");
+  if(!txt) return;
+  if(state.consecutiveFailures){
+    txt.textContent = "เชื่อมต่อไม่ได้ · แตะเพื่อลองใหม่";
+    return;
+  }
+  if(!state.lastUpdated){ txt.textContent = "กำลังโหลด..."; return; }
+  const secs = Math.round((Date.now() - state.lastUpdated.getTime()) / 1000);
+  const ago = secs < 10 ? "เมื่อสักครู่"
+    : secs < 60 ? `${secs} วินาทีที่แล้ว`
+    : secs < 3600 ? `${Math.floor(secs/60)} นาทีที่แล้ว`
+    : fmtClock(state.lastUpdated);
+  txt.textContent = "อัปเดต " + ago;
+}
+
 function statusClass(s){ return {
   "Waiting":"st-waiting","Assigned":"st-assigned","In Progress":"st-progress",
   "Pause":"st-pause","Completed":"st-completed","Cancelled":"st-cancelled"
@@ -491,11 +532,30 @@ async function api(path, opts={}){
   try{
     const res = await fetch(API + path, {...opts, headers});
     if(res.status === 401){ logout(); throw new Error("เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่"); }
+    if(res.status === 304){ const e = new Error("not modified"); e.notModified = true; throw e; }
     const data = await res.json().catch(()=>({}));
     if(!res.ok){ const e = new Error(data.detail || "การเชื่อมต่อผิดพลาด"); e.status = res.status; throw e; }
     return data;
   } finally {
     if(!silent) hideLoader();
+  }
+}
+
+// Manual refresh: same data path as the poll, but visible — the icon spins and
+// the loader bar is allowed to appear, so a deliberate tap always shows that
+// something happened even when the data comes back unchanged.
+let _refreshing = false;
+async function refreshNow(){
+  if(_refreshing) return;
+  _refreshing = true;
+  const icon = document.getElementById("refresh-bar-icon");
+  if(icon) icon.classList.add("spin");
+  try{
+    await refreshAll({visible:true});
+  } finally {
+    _refreshing = false;
+    if(icon) icon.classList.remove("spin");
+    updateRefreshBar();
   }
 }
 
@@ -808,8 +868,18 @@ function renderShell(){
   }
   app.appendChild(header);
 
+  // Manual refresh lives here rather than as another header icon — the header
+  // is already crowded on a phone, and a full-width strip is a bigger tap
+  // target for someone wearing gloves.
+  const bar = el(refreshBarHTML());
+  const doManualRefresh = ()=> refreshNow();
+  bar.onclick = doManualRefresh;
+  bar.addEventListener("keydown", (e)=>{ if(e.key === "Enter" || e.key === " ") doManualRefresh(); });
+  app.appendChild(bar);
+
   const main = el(`<main id="main"></main>`);
   app.appendChild(main);
+  updateRefreshBar();
 
   const tabsDef = {
     USER: [["tasks","งานของฉัน"], ["history","ประวัติ"], ["profile","โปรไฟล์"]],
@@ -900,6 +970,87 @@ function taskCard(t, actionsHtml, opts={}){
     </div>`;
 }
 
+// ---------------- Optimistic task actions ----------------
+// Applies the expected result to local state and re-renders BEFORE the request
+// completes, then reconciles against the server. On a warehouse mobile
+// connection this is the difference between a button that feels instant and
+// one that feels broken.
+const _inFlightActions = new Set();
+
+function findTask(id){ return (state.tasks || []).find(t => String(t.id) === String(id)); }
+
+// Server-side rejections that mean "someone else got there first". These are
+// normal in a shared queue, not errors the driver did anything wrong — so they
+// get a plain explanation rather than a scary failure message.
+function isRaceLoss(err){
+  return err && (err.status === 409 || err.status === 400);
+}
+
+async function taskAction({id, key, run, patch, successMsg, btn}){
+  const lock = `${id}:${key}`;
+  if(_inFlightActions.has(lock)) return;   // double-tap / impatient re-tap guard
+  _inFlightActions.add(lock);
+
+  const target = findTask(id);
+  // Shallow snapshot for rollback. Patches must return NEW arrays rather than
+  // mutating in place, or this snapshot would be rolled back into itself.
+  const snapshot = target ? {...target} : null;
+  let btnLabel = null;
+  if(target && patch){
+    Object.assign(target, patch(target));
+    renderContent();
+  } else if(btn){
+    // No safe prediction for this action's outcome, so give feedback on the
+    // button itself instead of guessing at the card's new state.
+    btnLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "กำลังส่ง...";
+  }
+
+  try{
+    await run();
+    toast(successMsg || "สำเร็จ");
+    await refreshAll();
+  }catch(err){
+    if(snapshot){
+      const current = findTask(id);
+      if(current) Object.assign(current, snapshot);
+      renderContent();
+    }
+    toast(isRaceLoss(err) ? (err.message || "ทำรายการไม่สำเร็จ")
+                          : (err.message || "เชื่อมต่อไม่ได้ กรุณาลองใหม่"));
+    // Whatever went wrong, our picture of this task is now suspect — the usual
+    // cause is that someone else changed it. Pull the truth back down.
+    await refreshAll();
+  }finally{
+    _inFlightActions.delete(lock);
+    if(btn && btnLabel !== null){ btn.disabled = false; btn.textContent = btnLabel; }
+  }
+}
+
+// What each action is expected to do, so the UI can show it immediately.
+// Deliberately only covers actions whose result is unambiguous; join and
+// take-over depend on server-side eligibility checks, so they show button-level
+// feedback instead of a predicted card state.
+const OPTIMISTIC_PATCH = {
+  "start":    () => ({status: "In Progress"}),
+  "complete": () => ({status: "Completed"}),
+  "resume":   () => ({status: "In Progress"}),
+  "cancel":   () => ({status: "Cancelled"}),
+  "accept":   () => ({accepted_at: new Date().toISOString()}),
+  "self-assign": (t) => ({
+    status: "Assigned",
+    accepted_at: new Date().toISOString(),
+    driver_employee_id: state.employee_id,
+    driver_name: (state.me && state.me.full_name) || state.employee_id,
+    drivers: [...(t.drivers || []), {
+      employee_id: state.employee_id,
+      full_name: (state.me && state.me.full_name) || state.employee_id,
+      vehicle_code: null,
+    }],
+  }),
+};
+
 function bindCardActions(container){
   container.querySelectorAll("[data-duplicate]").forEach(b=> b.onclick = async (e)=>{
     e.stopPropagation();
@@ -915,18 +1066,19 @@ function bindCardActions(container){
       e.stopPropagation();
       const id = btn.closest(".card").dataset.id;
       const action = btn.dataset.action;
-      try{
-        if(action === "cancel"){
-          if(!confirm("ยืนยันยกเลิกงานนี้ใช่หรือไม่? การกระทำนี้ย้อนกลับไม่ได้")) return;
-          const reason = prompt("เหตุผลในการยกเลิก (ถ้ามี):");
-          if(reason === null) return; // user pressed Cancel on the prompt itself
-          await api(`/tasks/${id}/cancel?reason=${encodeURIComponent(reason)}`, {method:"POST"});
-        } else {
-          await api(`/tasks/${id}/${action}`, {method:"POST"});
-        }
-        toast("อัปเดตแล้ว");
-        await refreshAll();
-      }catch(err){ toast(err.message); }
+      let url = `/tasks/${id}/${action}`;
+      if(action === "cancel"){
+        if(!confirm("ยืนยันยกเลิกงานนี้ใช่หรือไม่? การกระทำนี้ย้อนกลับไม่ได้")) return;
+        const reason = prompt("เหตุผลในการยกเลิก (ถ้ามี):");
+        if(reason === null) return; // user pressed Cancel on the prompt itself
+        url = `/tasks/${id}/cancel?reason=${encodeURIComponent(reason)}`;
+      }
+      await taskAction({
+        id, key: action, btn,
+        patch: OPTIMISTIC_PATCH[action],
+        run: ()=> api(url, {method:"POST"}),
+        successMsg: "อัปเดตแล้ว",
+      });
     };
   });
   container.querySelectorAll("[data-chat]").forEach(btn=>{
@@ -1667,8 +1819,11 @@ function renderDriverTab(main){
       main.querySelectorAll("[data-leave]").forEach(b=>{
         b.onclick = async ()=>{
           if(!confirm("ยืนยันออกจากงานนี้ใช่หรือไม่?")) return;
-          try{ await api(`/tasks/${b.dataset.leave}/leave`, {method:"POST"}); toast("ออกจากงานแล้ว"); await refreshAll(); }
-          catch(e){ toast(e.message); }
+          await taskAction({
+            id: b.dataset.leave, key: "leave", btn: b,
+            run: ()=> api(`/tasks/${b.dataset.leave}/leave`, {method:"POST"}),
+            successMsg: "ออกจากงานแล้ว",
+          });
         };
       });
     } else {
@@ -2020,15 +2175,21 @@ function openBatterySheet(taskId, mode){
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#bt-submit").onclick = async ()=>{
     const battery_level = parseInt(overlay.querySelector("#bt-battery").value || "0");
-    try{
-      const endpoint = mode === "self-assign" ? `/tasks/${taskId}/self-assign`
-        : mode === "take-over" ? `/tasks/${taskId}/take-over`
-        : mode === "join" ? `/tasks/${taskId}/join` : `/tasks/${taskId}/accept`;
-      await api(endpoint, {method:"POST", body: JSON.stringify({battery_level})});
-      closeSheet(overlay);
-      toast("สำเร็จ");
-      await refreshAll();
-    }catch(e){ toast(e.message); }
+    const endpoint = mode === "self-assign" ? `/tasks/${taskId}/self-assign`
+      : mode === "take-over" ? `/tasks/${taskId}/take-over`
+      : mode === "join" ? `/tasks/${taskId}/join` : `/tasks/${taskId}/accept`;
+    // Close the sheet first: the driver has committed, and leaving it up while
+    // the network call runs is what made this feel slow. taskAction then shows
+    // the result on the card underneath, and rolls it back if the server says
+    // no (most often because another driver claimed it a moment earlier).
+    closeSheet(overlay);
+    await taskAction({
+      id: taskId,
+      key: mode,
+      patch: OPTIMISTIC_PATCH[mode],
+      run: ()=> api(endpoint, {method:"POST", body: JSON.stringify({battery_level})}),
+      successMsg: mode === "self-assign" ? "รับงานแล้ว" : "สำเร็จ",
+    });
   };
 }
 
@@ -3488,7 +3649,8 @@ function renderTeamChat(main){
 }
 
 // ---------------- Data refresh (simple polling = "real-time enough") ----------------
-async function refreshAll(){
+let _refreshAbort = null;
+async function refreshAll(opts={}){
   // One combined request instead of ~14 separate ones. The scope tells the
   // server exactly how much to send based on which tab is open (#4: don't
   // fetch admin operation data while sitting on the dashboard, etc.), and it
@@ -3499,18 +3661,32 @@ async function refreshAll(){
   else if(state.role === "ADMIN"){
     scope = (state.tab === "dashboard") ? "admin_dash" : "admin_ops";
   }
+  // Only one refresh in flight at a time. A manual tap, a push-triggered
+  // refresh and the background timer can all fire close together; without
+  // this, a slow earlier response could land after a newer one and overwrite
+  // fresh data with stale data.
+  if(_refreshAbort) _refreshAbort.abort();
+  const ctrl = new AbortController();
+  _refreshAbort = ctrl;
   try{
-    const d = await api("/app-data?scope=" + scope, {background:true});
+    const d = await api("/app-data?scope=" + scope, {background: !opts.visible, signal: ctrl.signal});
     // Merge returned keys into state (only overwrites what the scope included,
     // so data from another tab stays cached until you go back to it).
     Object.assign(state, d);
     state.consecutiveFailures = 0;
+    state.lastUpdated = new Date();
     hideConnBanner();
   }catch(e){
+    // Superseded by a newer refresh — not a failure, and the newer one owns
+    // the outcome. Must not count towards the failure/backoff counter.
+    if(e.name === "AbortError" || ctrl.signal.aborted) return;
     state.consecutiveFailures = (state.consecutiveFailures || 0) + 1;
     if(state.consecutiveFailures >= 2) showConnBanner();
+    updateRefreshBar();
     // don't re-render on a failed poll — keep showing the last good data
     return;
+  }finally{
+    if(_refreshAbort === ctrl) _refreshAbort = null;
   }
   try{
     // Bug fix: skip re-rendering the tab body while the user is typing into a
@@ -3530,6 +3706,7 @@ async function refreshAll(){
       bell.innerHTML = `🔔${unread ? '<span class="bell-dot"></span>' : ''}`;
     }
     updateHeaderFromState();
+    updateRefreshBar();
   }catch(e){ /* render error shouldn't break the poll loop */ }
 }
 
@@ -3589,21 +3766,69 @@ async function bootstrap(){
   maybeAutoPromptNotifications(); // fire-and-forget; never blocks app usage
 }
 
+// Refresh strategy.
+//
+// Push is the primary signal now: the service worker forwards every push to
+// the open page, which refreshes immediately, so new work still lands within
+// seconds of being created. The timer below is a SAFETY NET, not the main
+// mechanism — it exists because Web Push is not guaranteed (iOS only delivers
+// to a home-screen-installed PWA, Android battery saver can delay or drop
+// messages, and a driver may simply have declined the permission). Going
+// push-only would mean a missed push is a missed job, which is not an
+// acceptable trade for a dispatch system.
+//
+// Net effect vs the old fixed 5s poll: roughly 6x fewer requests while the
+// app is open, and zero while it is in the background.
+const POLL_INTERVAL_MS = 30000;
+// On repeated failure, back off instead of hammering a struggling server.
+const POLL_BACKOFF_MS = [30000, 60000, 120000];
+
+function nextPollDelay(){
+  const fails = state.consecutiveFailures || 0;
+  if(!fails) return POLL_INTERVAL_MS;
+  return POLL_BACKOFF_MS[Math.min(fails - 1, POLL_BACKOFF_MS.length - 1)];
+}
+
 // Self-scheduling poll instead of setInterval: each cycle only schedules the
 // next one AFTER it finishes, so slow cycles (serverless latency) never pile
-// up on top of each other the way a fixed 3s interval would. 5s spacing is
-// plenty for warehouse dispatch and roughly halves the request load vs 3s.
-const POLL_INTERVAL_MS = 5000;
+// up on top of each other the way a fixed interval would.
 function startPolling(){
   stopPolling();
   const tick = async ()=>{
-    await refreshAll();
-    if(state.token) pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+    if(!state.token) return;
+    // Never poll a backgrounded tab. A driver leaves this app open all shift;
+    // polling behind a locked screen burns their battery and our quota for a
+    // screen nobody is looking at. visibilitychange re-syncs on return.
+    if(!document.hidden) await refreshAll();
+    if(state.token) pollTimer = setTimeout(tick, nextPollDelay());
   };
-  pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+  pollTimer = setTimeout(tick, nextPollDelay());
 }
 function stopPolling(){
   if(pollTimer){ clearTimeout(pollTimer); pollTimer = null; }
+}
+
+// Keep the "อัปเดต N นาทีที่แล้ว" label honest between refreshes. This is a
+// local clock tick only — it never touches the network.
+setInterval(updateRefreshBar, 10000);
+
+// Coming back to the app is the moment stale data is most likely and most
+// visible, so always re-sync straight away rather than waiting for the timer.
+document.addEventListener("visibilitychange", ()=>{
+  if(document.hidden) return;
+  if(state.token){ refreshAll(); startPolling(); }
+});
+window.addEventListener("online", ()=>{
+  if(state.token){ refreshAll(); startPolling(); }
+});
+
+// A push means something actually changed — refresh immediately instead of
+// waiting up to 30s for the next tick. This is what lets the poll interval be
+// as long as it is.
+if("serviceWorker" in navigator){
+  navigator.serviceWorker.addEventListener("message", (e)=>{
+    if(e.data && e.data.type === "scdc-refresh" && state.token) refreshAll();
+  });
 }
 
 function render(){

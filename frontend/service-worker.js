@@ -10,6 +10,23 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(self.clients.claim());
 });
 
+// Tell every open copy of the app that something changed, so it can pull fresh
+// data immediately. This is what lets the page poll on a 30s timer instead of
+// every few seconds: the timer is only a safety net, and a push is the real
+// signal that there is something new to show.
+async function notifyClientsToRefresh() {
+  try {
+    const clientList = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    for (const client of clientList) {
+      client.postMessage({ type: "scdc-refresh" });
+    }
+  } catch (e) {
+    // A refresh hint failing must never stop the notification itself from
+    // being shown — that notification may be the only thing telling a driver
+    // there is a job waiting.
+  }
+}
+
 self.addEventListener("push", (event) => {
   let data = { title: "SCDC", body: "มีการแจ้งเตือนใหม่", url: "/" };
   try {
@@ -25,7 +42,12 @@ self.addEventListener("push", (event) => {
     tag: "scdc-notification",
     renotify: true,
   };
-  event.waitUntil(self.registration.showNotification(data.title, options));
+  event.waitUntil(
+    Promise.all([
+      self.registration.showNotification(data.title, options),
+      notifyClientsToRefresh(),
+    ])
+  );
 });
 
 self.addEventListener("notificationclick", (event) => {
@@ -37,6 +59,10 @@ self.addEventListener("notificationclick", (event) => {
         if ("focus" in client) {
           client.focus();
           if ("navigate" in client) client.navigate(url);
+          // Focusing an existing window does not reload it, so ask it to pull
+          // fresh data — otherwise tapping a "new task" notification could
+          // land the driver on a list that does not show that task yet.
+          client.postMessage({ type: "scdc-refresh" });
           return;
         }
       }
