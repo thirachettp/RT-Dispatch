@@ -2334,11 +2334,15 @@ def drivers_availability_summary(user=Depends(current_user)):
 def list_drivers(user=Depends(require_role("ADMIN"))):
     with get_db() as db:
         concat_fn = "STRING_AGG(driver_licenses.vehicle_type, ',')" if IS_POSTGRES else "GROUP_CONCAT(driver_licenses.vehicle_type)"
-        today_fn = "CURRENT_DATE" if IS_POSTGRES else "date('now')"
+        # expiry_date is stored as YYYY-MM-DD TEXT. SQLite compares it fine with
+        # date('now'), but Postgres refuses text-vs-date ("operator does not
+        # exist: text < date"). Since ISO YYYY-MM-DD sorts correctly as plain
+        # strings, compare against today's date rendered AS TEXT on Postgres.
+        today_expr = "to_char(CURRENT_DATE,'YYYY-MM-DD')" if IS_POSTGRES else "date('now')"
         rows = db.execute(
             "SELECT users.id, users.employee_id, users.full_name, users.driver_status, users.checked_in_vehicle_id, "
             f"{concat_fn} AS license_types, "
-            f"SUM(CASE WHEN driver_licenses.expiry_date IS NOT NULL AND driver_licenses.expiry_date < {today_fn} "
+            f"SUM(CASE WHEN driver_licenses.expiry_date IS NOT NULL AND driver_licenses.expiry_date < {today_expr} "
             "THEN 1 ELSE 0 END) AS expired_count "
             "FROM users LEFT JOIN driver_licenses ON driver_licenses.driver_id = users.id "
             "WHERE users.role='DRIVER' AND users.deleted_at IS NULL GROUP BY users.id"
