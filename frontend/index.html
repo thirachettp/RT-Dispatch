@@ -3484,28 +3484,37 @@ function renderTeamChat(main){
 
 // ---------------- Data refresh (simple polling = "real-time enough") ----------------
 async function refreshAll(){
+  // Load each endpoint independently: one failing request must not stop the
+  // others (previously they were chained in one try, so an early failure —
+  // e.g. /drivers erroring — left later state like allUsers empty, showing
+  // "พนักงาน (0/0)" even though those endpoints were fine). loadInto keeps
+  // the previous value on failure and tracks whether anything failed.
+  let anyFailed = false;
+  async function loadInto(key, path){
+    try{ state[key] = await api(path, {background:true}); }
+    catch(e){ anyFailed = true; }
+  }
+  await loadInto("tasks", "/tasks");
+  await loadInto("notifications", "/notifications");
+  try{ state.me = await api("/me", {background:true}); }catch(e){ anyFailed = true; }
+  if(state.role === "ADMIN"){
+    await loadInto("dashboard", "/dashboard");
+    await loadInto("drivers", "/drivers");
+    await loadInto("vehicles", "/vehicles");
+    await loadInto("breakdowns", "/breakdowns");
+    await loadInto("zones", "/zones");
+    await loadInto("taskRules", "/task-rules");
+    await loadInto("auditLogs", "/audit-logs");
+    await loadInto("allUsers", "/admin/users");
+    await loadInto("vehicleTypes", "/vehicle-types");
+    await loadInto("teamChatMessages", "/team-chat/messages");
+    await loadInto("teamChatParticipants", "/team-chat/participants");
+  } else if(state.role === "DRIVER"){
+    await loadInto("vehicles", "/vehicles");
+    await loadInto("teamChatMessages", "/team-chat/messages");
+    await loadInto("teamChatParticipants", "/team-chat/participants");
+  }
   try{
-    const bg = {background:true};
-    state.tasks = await api("/tasks", bg);
-    state.notifications = await api("/notifications", bg);
-    state.me = await api("/me", bg);
-    if(state.role === "ADMIN"){
-      state.dashboard = await api("/dashboard", bg);
-      state.drivers = await api("/drivers", bg);
-      state.vehicles = await api("/vehicles", bg);
-      state.breakdowns = await api("/breakdowns", bg);
-      state.zones = await api("/zones", bg);
-      state.taskRules = await api("/task-rules", bg);
-      state.auditLogs = await api("/audit-logs", bg);
-      state.allUsers = await api("/admin/users", bg);
-      state.vehicleTypes = await api("/vehicle-types", bg);
-      state.teamChatMessages = await api("/team-chat/messages", bg);
-      state.teamChatParticipants = await api("/team-chat/participants", bg);
-    } else if(state.role === "DRIVER"){
-      state.vehicles = await api("/vehicles", bg);
-      state.teamChatMessages = await api("/team-chat/messages", bg);
-      state.teamChatParticipants = await api("/team-chat/participants", bg);
-    }
     // Bug fix: skip re-rendering the tab body while the user is typing into a
     // form inside it, so a 3-second poll never blanks out unsaved input. Also
     // skip it for the Admin dashboard specifically — its KPI/chart cards load
@@ -3523,8 +3532,13 @@ async function refreshAll(){
       bell.innerHTML = `🔔${unread ? '<span class="bell-dot"></span>' : ''}`;
     }
     updateHeaderFromState();
-    state.consecutiveFailures = 0;
-    hideConnBanner();
+    if(anyFailed){
+      state.consecutiveFailures = (state.consecutiveFailures || 0) + 1;
+      if(state.consecutiveFailures >= 2) showConnBanner();
+    } else {
+      state.consecutiveFailures = 0;
+      hideConnBanner();
+    }
   }catch(e){
     state.consecutiveFailures = (state.consecutiveFailures || 0) + 1;
     if(state.consecutiveFailures >= 2) showConnBanner();
