@@ -829,7 +829,12 @@ function renderShell(){
   tabs.querySelectorAll("button").forEach(b=>{
     b.onclick = ()=>{
       if(b.dataset.tab === "logout"){ logout(); return; }
-      state.tab = b.dataset.tab; state.subtab = ""; renderContent();
+      state.tab = b.dataset.tab; state.subtab = "";
+      renderContent();
+      // Switching tabs may need a different data scope (e.g. dashboard vs
+      // operation) — refresh right away so the new tab isn't stuck showing
+      // stale/empty data until the next poll tick.
+      refreshAll();
     };
   });
   app.appendChild(tabs);
@@ -3484,52 +3489,37 @@ function renderTeamChat(main){
 
 // ---------------- Data refresh (simple polling = "real-time enough") ----------------
 async function refreshAll(){
-  // Load endpoints in PARALLEL, not one-after-another. On serverless (Vercel +
-  // Neon) each call is a separate round-trip; doing ~14 of them sequentially
-  // took 2+ seconds every cycle and made the app feel perpetually busy/slow.
-  // Promise.all fires them together so a refresh finishes in about the time of
-  // the single slowest call. Each still fails independently (settled, not all)
-  // so one error never blanks the others — the "พนักงาน (0/0)" class of bug.
-  let anyFailed = false;
-  async function loadInto(key, path){
-    try{ state[key] = await api(path, {background:true}); }
-    catch(e){ anyFailed = true; }
+  // One combined request instead of ~14 separate ones. The scope tells the
+  // server exactly how much to send based on which tab is open (#4: don't
+  // fetch admin operation data while sitting on the dashboard, etc.), and it
+  // all comes back in a single round-trip (#2), so a refresh is one network
+  // hit instead of fourteen.
+  let scope = "core";
+  if(state.role === "DRIVER") scope = "driver";
+  else if(state.role === "ADMIN"){
+    scope = (state.tab === "dashboard") ? "admin_dash" : "admin_ops";
   }
-  const jobs = [
-    loadInto("tasks", "/tasks"),
-    loadInto("notifications", "/notifications"),
-    (async ()=>{ try{ state.me = await api("/me", {background:true}); }catch(e){ anyFailed = true; } })(),
-  ];
-  if(state.role === "ADMIN"){
-    jobs.push(
-      loadInto("dashboard", "/dashboard"),
-      loadInto("drivers", "/drivers"),
-      loadInto("vehicles", "/vehicles"),
-      loadInto("breakdowns", "/breakdowns"),
-      loadInto("zones", "/zones"),
-      loadInto("taskRules", "/task-rules"),
-      loadInto("auditLogs", "/audit-logs"),
-      loadInto("allUsers", "/admin/users"),
-      loadInto("vehicleTypes", "/vehicle-types"),
-      loadInto("teamChatMessages", "/team-chat/messages"),
-      loadInto("teamChatParticipants", "/team-chat/participants"),
-    );
-  } else if(state.role === "DRIVER"){
-    jobs.push(
-      loadInto("vehicles", "/vehicles"),
-      loadInto("teamChatMessages", "/team-chat/messages"),
-      loadInto("teamChatParticipants", "/team-chat/participants"),
-    );
+  try{
+    const d = await api("/app-data?scope=" + scope, {background:true});
+    // Merge returned keys into state (only overwrites what the scope included,
+    // so data from another tab stays cached until you go back to it).
+    Object.assign(state, d);
+    state.consecutiveFailures = 0;
+    hideConnBanner();
+  }catch(e){
+    state.consecutiveFailures = (state.consecutiveFailures || 0) + 1;
+    if(state.consecutiveFailures >= 2) showConnBanner();
+    // don't re-render on a failed poll — keep showing the last good data
+    return;
   }
-  await Promise.all(jobs);
   try{
     // Bug fix: skip re-rendering the tab body while the user is typing into a
-    // form inside it, so a 3-second poll never blanks out unsaved input. Also
-    // skip it for the Admin dashboard specifically — its KPI/chart cards load
-    // asynchronously and rebuilding them every 3s caused a visible flicker
-    // (momentary "กำลังโหลด..." flash) even though the underlying numbers
-    // rarely change that often. The dashboard now only reloads when opened,
-    // when the period changes, or via its own manual/pull-to-refresh.
+    // form inside it, so a poll never blanks out unsaved input. Also skip it
+    // for the Admin dashboard specifically — its KPI/chart cards load
+    // asynchronously and rebuilding them every cycle caused a visible flicker
+    // even though the underlying numbers rarely change that often. The
+    // dashboard reloads when opened, when the period changes, or via its own
+    // manual/pull-to-refresh.
     const onAdminDashboard = state.role === "ADMIN" && state.tab === "dashboard";
     if(!userIsTypingInMain() && !onAdminDashboard){
       renderContent();
@@ -3540,17 +3530,7 @@ async function refreshAll(){
       bell.innerHTML = `🔔${unread ? '<span class="bell-dot"></span>' : ''}`;
     }
     updateHeaderFromState();
-    if(anyFailed){
-      state.consecutiveFailures = (state.consecutiveFailures || 0) + 1;
-      if(state.consecutiveFailures >= 2) showConnBanner();
-    } else {
-      state.consecutiveFailures = 0;
-      hideConnBanner();
-    }
-  }catch(e){
-    state.consecutiveFailures = (state.consecutiveFailures || 0) + 1;
-    if(state.consecutiveFailures >= 2) showConnBanner();
-  }
+  }catch(e){ /* render error shouldn't break the poll loop */ }
 }
 
 function updateHeaderFromState(){
