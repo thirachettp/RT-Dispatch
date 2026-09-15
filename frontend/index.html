@@ -177,6 +177,20 @@
     border:1px solid var(--line);color:var(--ink);padding:10px 16px;border-radius:8px;font-size:12.5px;
     z-index:50;box-shadow:0 6px 20px rgba(0,0,0,.15);max-width:90%;text-align:center;}
 
+  /* Global loading bar — thin animated strip pinned to the very top */
+  #global-loader{position:fixed;top:0;left:0;right:0;height:3px;z-index:70;background:var(--amber-dim);overflow:hidden;}
+  #global-loader .global-loader-fill{position:absolute;top:0;left:0;height:100%;width:40%;
+    background:var(--amber);border-radius:0 2px 2px 0;animation:loaderslide 1.1s ease-in-out infinite;}
+  @keyframes loaderslide{
+    0%{left:-40%;width:40%;}
+    50%{width:55%;}
+    100%{left:100%;width:40%;}
+  }
+  /* Inline spinner for buttons/sections */
+  .spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--line);
+    border-top-color:var(--amber);border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
   .subtabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;}
   .subtabs button{background:var(--panel-2);border:1px solid var(--line);color:var(--ink-dim);
     padding:7px 12px;border-radius:999px;font-size:11.5px;font-weight:600;cursor:pointer;}
@@ -445,15 +459,44 @@ function statusClass(s){ return {
   "Pause":"st-pause","Completed":"st-completed","Cancelled":"st-cancelled"
 }[s] || "st-waiting"; }
 
+// Global loading indicator. The app polls every 3s in the background, so we
+// must not flash the loader on those — callers pass {background:true} to stay
+// silent. A short delay before showing means fast calls never flash a bar;
+// only genuinely slow requests (the "web is processing" case) surface it.
+let _activeRequests = 0;
+let _loaderTimer = null;
+function showLoader(){
+  _activeRequests++;
+  if(_loaderTimer || document.getElementById("global-loader")) return;
+  _loaderTimer = setTimeout(()=>{
+    if(_activeRequests <= 0) return;
+    const bar = el(`<div id="global-loader"><div class="global-loader-fill"></div></div>`);
+    document.body.appendChild(bar);
+  }, 250); // only show if the request takes longer than 250ms
+}
+function hideLoader(){
+  _activeRequests = Math.max(0, _activeRequests - 1);
+  if(_activeRequests > 0) return;
+  if(_loaderTimer){ clearTimeout(_loaderTimer); _loaderTimer = null; }
+  const bar = document.getElementById("global-loader");
+  if(bar) bar.remove();
+}
+
 async function api(path, opts={}){
   const headers = opts.headers || {};
   if(state.token) headers["Authorization"] = "Bearer " + state.token;
   if(opts.body && !(opts.body instanceof FormData)) headers["Content-Type"] = "application/json";
-  const res = await fetch(API + path, {...opts, headers});
-  if(res.status === 401){ logout(); throw new Error("เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่"); }
-  const data = await res.json().catch(()=>({}));
-  if(!res.ok){ const e = new Error(data.detail || "การเชื่อมต่อผิดพลาด"); e.status = res.status; throw e; }
-  return data;
+  const silent = opts.background === true;
+  if(!silent) showLoader();
+  try{
+    const res = await fetch(API + path, {...opts, headers});
+    if(res.status === 401){ logout(); throw new Error("เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่"); }
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok){ const e = new Error(data.detail || "การเชื่อมต่อผิดพลาด"); e.status = res.status; throw e; }
+    return data;
+  } finally {
+    if(!silent) hideLoader();
+  }
 }
 
 function toast(msg){
@@ -3442,25 +3485,26 @@ function renderTeamChat(main){
 // ---------------- Data refresh (simple polling = "real-time enough") ----------------
 async function refreshAll(){
   try{
-    state.tasks = await api("/tasks");
-    state.notifications = await api("/notifications");
-    state.me = await api("/me");
+    const bg = {background:true};
+    state.tasks = await api("/tasks", bg);
+    state.notifications = await api("/notifications", bg);
+    state.me = await api("/me", bg);
     if(state.role === "ADMIN"){
-      state.dashboard = await api("/dashboard");
-      state.drivers = await api("/drivers");
-      state.vehicles = await api("/vehicles");
-      state.breakdowns = await api("/breakdowns");
-      state.zones = await api("/zones");
-      state.taskRules = await api("/task-rules");
-      state.auditLogs = await api("/audit-logs");
-      state.allUsers = await api("/admin/users");
-      state.vehicleTypes = await api("/vehicle-types");
-      state.teamChatMessages = await api("/team-chat/messages");
-      state.teamChatParticipants = await api("/team-chat/participants");
+      state.dashboard = await api("/dashboard", bg);
+      state.drivers = await api("/drivers", bg);
+      state.vehicles = await api("/vehicles", bg);
+      state.breakdowns = await api("/breakdowns", bg);
+      state.zones = await api("/zones", bg);
+      state.taskRules = await api("/task-rules", bg);
+      state.auditLogs = await api("/audit-logs", bg);
+      state.allUsers = await api("/admin/users", bg);
+      state.vehicleTypes = await api("/vehicle-types", bg);
+      state.teamChatMessages = await api("/team-chat/messages", bg);
+      state.teamChatParticipants = await api("/team-chat/participants", bg);
     } else if(state.role === "DRIVER"){
-      state.vehicles = await api("/vehicles");
-      state.teamChatMessages = await api("/team-chat/messages");
-      state.teamChatParticipants = await api("/team-chat/participants");
+      state.vehicles = await api("/vehicles", bg);
+      state.teamChatMessages = await api("/team-chat/messages", bg);
+      state.teamChatParticipants = await api("/team-chat/participants", bg);
     }
     // Bug fix: skip re-rendering the tab body while the user is typing into a
     // form inside it, so a 3-second poll never blanks out unsaved input. Also
