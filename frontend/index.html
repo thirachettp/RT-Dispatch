@@ -774,6 +774,13 @@ function renderShell(){
     ADMIN: [["dashboard","แดชบอร์ด"], ["operation","ปฏิบัติการ"], ["settings","ตั้งค่า"], ["profile","โปรไฟล์"]],
   }[state.role];
 
+  if(!tabsDef){
+    // Unknown/blank role — don't render a broken shell (that's the blank-page
+    // symptom). Bounce to a clean login instead.
+    logout();
+    return;
+  }
+
   const tabs = el(`<nav class="tabs">${tabsDef.map(([k,l])=>`<button data-tab="${k}">${l}</button>`).join("")}
     <button data-tab="logout" style="color:var(--red)">ออกจากระบบ</button></nav>`);
   tabs.querySelectorAll("button").forEach(b=>{
@@ -3508,6 +3515,24 @@ async function bootstrap(){
   try{
     state.me = await api("/me");
   }catch(e){ logout(); return; }
+  // /me is the source of truth for role/employee_id — trust it over the
+  // localStorage copy, which can be stale, missing, or the literal string
+  // "null" (e.g. saved before login completed, or cleared out of sync). If
+  // we skip this, state.role can stay null even though the account loaded
+  // fine, and then tabsDef[state.role] is undefined → the tab bar crashes
+  // and the whole page renders blank with a "null" role pill.
+  if(state.me && state.me.role){
+    state.role = state.me.role;
+    state.employee_id = state.me.employee_id;
+    localStorage.setItem("scdc_role", state.me.role);
+    localStorage.setItem("scdc_emp", state.me.employee_id);
+  }
+  if(!state.role){
+    // No usable role even after /me — the session is broken; send them back
+    // to a clean login rather than a dead blank screen.
+    logout();
+    return;
+  }
   if(state.role === "DRIVER" && !state.me.checked_in_vehicle_id){
     renderForcedCheckin();
     return;
