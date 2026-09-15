@@ -2784,10 +2784,51 @@ def get_audit_logs(user=Depends(require_role("ADMIN"))):
 
 
 # ---------------------------------------------------------------------------
-# Dashboard summary (Admin)
+# Combined data endpoint — one request instead of ~14
 # ---------------------------------------------------------------------------
 
-@app.get("/dashboard")
+@app.get("/app-data")
+def app_data(scope: str = "core", user=Depends(current_user)):
+    """Returns everything a screen needs in ONE round-trip instead of the
+    frontend firing 14 separate requests every refresh. Each of those was a
+    separate serverless invocation + DB round-trip on Vercel/Neon, which is
+    what made the app feel constantly busy. This calls the SAME underlying
+    endpoint functions (no logic duplicated/forked) and bundles their output.
+
+    scope controls how much to include, so we only fetch what the current tab
+    actually shows:
+      core      — always: me, tasks, notifications (every role/tab needs these)
+      admin_ops — + drivers, vehicles, users, vehicle types, breakdowns, zones,
+                  task rules, team chat (the Operation/Settings tabs)
+      admin_dash— + dashboard summary (the Dashboard tab)
+      driver    — + vehicles, team chat (driver screens)
+    """
+    out = {
+        "me": me(user),
+        "tasks": list_tasks(None, user),
+        "notifications": get_notifications(user),
+    }
+    if scope == "driver":
+        out["vehicles"] = list_vehicles(user)
+        out["teamChatMessages"] = get_team_chat_messages(user)
+        out["teamChatParticipants"] = team_chat_participants(user)
+    elif scope in ("admin_ops", "admin_dash") and user["role"] == "ADMIN":
+        out["drivers"] = list_drivers(user)
+        out["vehicles"] = list_vehicles(user)
+        out["allUsers"] = list_all_users(user)
+        out["vehicleTypes"] = list_vehicle_types(user)
+        out["breakdowns"] = list_breakdowns(user)
+        out["zones"] = list_zones(user)
+        out["taskRules"] = list_task_rules(user)
+        out["teamChatMessages"] = get_team_chat_messages(user)
+        out["teamChatParticipants"] = team_chat_participants(user)
+        if scope == "admin_dash":
+            out["dashboard"] = dashboard(user)
+            out["auditLogs"] = get_audit_logs(user)
+    return out
+
+
+
 def dashboard(user=Depends(require_role("ADMIN"))):
     with get_db() as db:
         check_waiting_too_long(db)
