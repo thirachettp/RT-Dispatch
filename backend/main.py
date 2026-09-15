@@ -9,6 +9,7 @@ Then open http://localhost:8000 in a browser.
 """
 
 import base64
+import contextvars
 import csv
 import hashlib
 import hmac
@@ -19,15 +20,19 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional, List
 
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse, Response
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 import openpyxl
@@ -78,7 +83,23 @@ PENDING_PASSWORD = "PENDING"
 MIN_PASSWORD_LENGTH = 6
 VAPID_CLAIM_SUB = "mailto:admin@scdc.local"
 
+# Thai labels for statuses that appear inside user-facing error messages. The
+# frontend has its own copies for rendering; these exist so a message built on
+# the server doesn't leak an English status word into a Thai-only UI.
+TASK_STATUS_LABEL_TH = {
+    "Waiting": "รอรับงาน", "Assigned": "มอบหมายแล้ว", "In Progress": "กำลังดำเนินการ",
+    "Pause": "หยุดชั่วคราว", "Completed": "เสร็จสิ้น", "Cancelled": "ยกเลิกแล้ว",
+}
+DRIVER_STATUS_LABEL_TH = {
+    "Available": "ว่าง", "Busy": "ติดงาน", "Breakdown": "รถเสีย", "Offline": "ออฟไลน์",
+}
+
 app = FastAPI(title="SCDC Vehicle Handling Task Management (MVP)")
+
+# /app-data returns a large JSON document on every refresh and was being sent
+# uncompressed. It is highly repetitive JSON, so gzip typically cuts it by
+# ~80% — a direct win on warehouse mobile connections.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +161,9 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
                  "(they haven't turned on notifications in Profile, or it never completed)", user_id)
         return {"attempted": 0, "sent": 0, "reason": "ยังไม่มีการเปิดใช้งานแจ้งเตือนไว้เลย"}
     payload = json.dumps({"title": title, "body": body, "url": url})
-    sent = 0
-    for s in subs:
+
+    def _one(s):
+        """Returns (sent?, subscription_id_to_delete_or_None)."""
         try:
             webpush(
                 subscription_info={"endpoint": s["endpoint"], "keys": {"p256dh": s["p256dh"], "auth": s["auth"]}},
@@ -150,8 +172,8 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
                 vapid_claims={"sub": VAPID_CLAIM_SUB},
                 ttl=60,
             )
-            sent += 1
             log.info("Web push sent to user %s (subscription %s)", user_id, s["id"])
+            return True, None
         except WebPushException as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status in (404, 410, 403):
@@ -163,20 +185,91 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
                 # automatically instead of failing silently forever; the user
                 # just needs to re-enable notifications once in Profile to
                 # get a fresh subscription.
-                db.execute("DELETE FROM push_subscriptions WHERE id=?", (s["id"],))
-                log.info("Web push subscription %s for user %s is invalid (status %s) — removed it. "
+                log.info("Web push subscription %s for user %s is invalid (status %s) — removing it. "
                          "They'll need to toggle notifications off/on again in Profile.", s["id"], user_id, status)
-            else:
-                log.warning("Web push failed for subscription %s (user %s): %s", s["id"], user_id, e)
+                return False, s["id"]
+            log.warning("Web push failed for subscription %s (user %s): %s", s["id"], user_id, e)
+            return False, None
         except Exception as e:
             # Most commonly: the server has no outbound internet access to reach
             # the browser's push relay (fcm.googleapis.com / Mozilla autopush /
             # Apple push) — very possible on a LAN-only office deployment.
             log.warning("Web push error for subscription %s (user %s): %s", s["id"], user_id, e)
+            return False, None
+
+    # Devices are pushed to CONCURRENTLY. Each webpush() is a blocking HTTPS
+    # call out to FCM/Mozilla/Apple; done in sequence, a user with three
+    # devices meant three round-trips stacked end to end. The DB is
+    # deliberately not touched from these threads (a psycopg2 connection is
+    # not safe to share) — failures come back as ids and are deleted below,
+    # on this thread.
+    sent = 0
+    stale = []
+    if len(subs) == 1:
+        ok, bad = _one(subs[0])
+        sent += 1 if ok else 0
+        if bad:
+            stale.append(bad)
+    else:
+        with ThreadPoolExecutor(max_workers=min(8, len(subs))) as pool:
+            for ok, bad in pool.map(_one, subs):
+                sent += 1 if ok else 0
+                if bad:
+                    stale.append(bad)
+    for sub_id in stale:
+        db.execute("DELETE FROM push_subscriptions WHERE id=?", (sub_id,))
     return {
         "attempted": len(subs), "sent": sent,
         "reason": None if sent else "ส่งไม่สำเร็จทุกอุปกรณ์ที่เปิดแจ้งเตือนไว้ — ลองปิดแล้วเปิดใหม่อีกครั้ง",
     }
+
+
+# --------------------------------------------------------------------------
+# Deferred push delivery
+# --------------------------------------------------------------------------
+# notify() used to call send_web_push_to_user() inline, so the HTTP request
+# that triggered a notification sat waiting for every push to be delivered to
+# Google/Apple before it could return. notify_admins() made that far worse: it
+# looped over every admin, and each admin over each of their devices. With 5
+# admins on 2 devices, a driver tapping "รับงาน" waited on 10 sequential
+# outbound HTTPS calls before the button released.
+#
+# Pushes raised during a request are now collected here and flushed AFTER the
+# response has been sent (Starlette BackgroundTask — still inside the same
+# serverless invocation, so nothing is lost on Vercel). A contextvar holding a
+# shared list is what carries them: FastAPI copies the context into the worker
+# thread that runs the endpoint, and because the list object itself is shared,
+# appends made in that thread are visible back here.
+_push_queue_var = contextvars.ContextVar("scdc_push_queue", default=None)
+
+
+def _flush_push_queue(jobs):
+    """Runs after the response is delivered. Opens its own connection: the
+    request's was already committed and closed by then."""
+    try:
+        with get_db() as db:
+            for user_id, title, body, url in jobs:
+                try:
+                    send_web_push_to_user(db, user_id, title, body, url)
+                except Exception as e:
+                    log.warning("Deferred push to user %s failed: %s", user_id, e)
+    except Exception as e:
+        # A push problem must never be able to surface as a request failure —
+        # by this point the user already has their response.
+        log.warning("Deferred push flush failed: %s", e)
+
+
+@app.middleware("http")
+async def _deferred_push_middleware(request, call_next):
+    queue = []
+    token = _push_queue_var.set(queue)
+    try:
+        response = await call_next(request)
+    finally:
+        _push_queue_var.reset(token)
+    if queue:
+        response.background = BackgroundTask(_flush_push_queue, list(queue))
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +353,33 @@ else:
     IntegrityError = sqlite3.IntegrityError
 
 
+# One database connection PER REQUEST instead of per get_db() call.
+#
+# Every endpoint function opens `with get_db() as db`, which used to mean a
+# brand new psycopg2.connect() — a full TCP + TLS handshake to Neon — each
+# time. /app-data deliberately bundles ~12 endpoint functions into a single
+# HTTP round-trip, but because each of them opened its own connection, one
+# poll still paid for ~13 handshakes (roughly 50-150ms each, even against a
+# pooled endpoint: pooling saves the Postgres-side backend startup, not the
+# client-side TLS negotiation). That was the single largest source of latency
+# in the app, and it repeated every poll cycle for every signed-in user.
+#
+# get_db() is now re-entrant: the outermost `with` opens the connection and
+# owns commit/close, and any nested `with get_db()` inside the same thread
+# hands back that same connection. Call sites are unchanged.
+#
+# threading.local (rather than a contextvar) is the right scope here because
+# FastAPI runs every `def` (non-async) endpoint and dependency in a worker
+# thread, and one request's whole call tree stays on that one thread.
+#
+# Side effect, and an improvement: a request is now a single transaction, so
+# a failure partway through /tasks/{id}/self-assign no longer leaves half its
+# writes committed.
+_db_local = threading.local()
+
+
 @contextmanager
-def get_db():
+def _new_db_connection():
     if IS_POSTGRES:
         conn = psycopg2.connect(DATABASE_URL)
         wrapped = _PgConnection(conn)
@@ -279,6 +397,24 @@ def get_db():
             conn.commit()
         finally:
             conn.close()
+
+
+@contextmanager
+def get_db():
+    existing = getattr(_db_local, "conn", None)
+    if existing is not None:
+        # Nested call — reuse the connection the outermost caller opened, and
+        # leave commit/close to it.
+        yield existing
+        return
+    with _new_db_connection() as conn:
+        _db_local.conn = conn
+        try:
+            yield conn
+        finally:
+            # Always clear, even on error: worker threads are reused across
+            # requests and must never inherit a closed connection.
+            _db_local.conn = None
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -574,6 +710,44 @@ CREATE TABLE IF NOT EXISTS task_photos (
 """
 
 
+# Indexes the query plans above actually need. Kept separate from SCHEMA and
+# run on every boot because Postgres only executes SCHEMA on a FRESH database
+# — an already-deployed production database would otherwise never receive
+# them. CREATE INDEX IF NOT EXISTS is valid on both SQLite and Postgres and is
+# a no-op once the index exists, so this is cheap to repeat.
+#
+# The sessions(token) one matters most: current_user() looks a token up on
+# EVERY authenticated request and, with no index, that was a full scan of a
+# table which grows with every login the system has ever seen.
+INDEX_STATEMENTS = [
+    "CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_requester ON tasks(requester_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ta_task_status ON task_assignments(task_id, assignment_status)",
+    "CREATE INDEX IF NOT EXISTS idx_ta_driver ON task_assignments(driver_id)",
+    "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read)",
+    "CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_task_messages_task ON task_messages(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_task_photos_task ON task_photos(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_status_hist_task ON task_status_history(task_id)",
+]
+
+
+def ensure_indexes():
+    try:
+        with get_db() as db:
+            for stmt in INDEX_STATEMENTS:
+                try:
+                    db.execute(stmt)
+                except Exception as e:
+                    # A single index failing (e.g. a column missing on a very
+                    # old database) must not stop the rest or block startup.
+                    log.warning("Could not create index (%s): %s", stmt, e)
+    except Exception as e:
+        log.warning("ensure_indexes skipped: %s", e)
+
+
 def init_db():
     if IS_POSTGRES:
         with get_db() as db:
@@ -838,7 +1012,14 @@ def notify(db, user_id: int, message: str, task_id: Optional[int] = None, kind: 
         (user_id, message, task_id, kind, now_iso()),
     )
     push_url = f"/?task={task_id}" if (kind in ("task", "chat") and task_id) else "/"
-    send_web_push_to_user(db, user_id, "SCDC", message, push_url)
+    queue = _push_queue_var.get()
+    if queue is None:
+        # Outside an HTTP request (startup tasks, scripts) — send inline.
+        send_web_push_to_user(db, user_id, "SCDC", message, push_url)
+    else:
+        # Inside a request — hand off to the post-response flush so the caller
+        # isn't blocked on push delivery.
+        queue.append((user_id, "SCDC", message, push_url))
 
 
 def notify_admins(db, message: str, task_id: Optional[int] = None, kind: str = "task"):
@@ -922,7 +1103,7 @@ class ProfileUpdateBody(BaseModel):
 
 def current_user(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing token")
+        raise HTTPException(401, "ไม่พบ token กรุณาเข้าสู่ระบบใหม่")
     token = authorization.removeprefix("Bearer ").strip()
     with get_db() as db:
         row = db.execute(
@@ -930,14 +1111,14 @@ def current_user(authorization: Optional[str] = Header(None)):
             (token,),
         ).fetchone()
     if not row or row["deleted_at"]:
-        raise HTTPException(401, "Invalid or expired token")
+        raise HTTPException(401, "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่")
     return dict(row)
 
 
 def require_role(*roles):
     def checker(user=Depends(current_user)):
         if user["role"] not in roles:
-            raise HTTPException(403, f"Requires role: {roles}")
+            raise HTTPException(403, "คุณไม่มีสิทธิ์เข้าถึงส่วนนี้")
         return user
     return checker
 
@@ -952,7 +1133,7 @@ def login(body: LoginBody):
         if not row or row["deleted_at"]:
             raise HTTPException(404, "ยังไม่มีบัญชีนี้ โปรดสมัครสมาชิก")
         if row["password_hash"] == PENDING_PASSWORD:
-            raise HTTPException(428, "First login: please set your password")
+            raise HTTPException(428, "เข้าสู่ระบบครั้งแรก กรุณาตั้งรหัสผ่าน")
         if not verify_password(body.password, row["password_hash"]):
             raise HTTPException(401, "รหัสผ่านไม่ถูกต้อง หากลืมรหัสโปรดติดต่อ Admin")
         if row["role"] == "DRIVER":
@@ -980,11 +1161,11 @@ def register(body: RegisterBody):
             raise HTTPException(400, "รหัสพนักงานนี้มีผู้ใช้งานแล้ว")
         email = validate_and_normalize_email(db, body.email)
         if not body.cost_center.isdigit():
-            raise HTTPException(400, "Cost center must be 5 digits")
+            raise HTTPException(400, "Cost center ต้องเป็นตัวเลข 5 หลัก")
         if not body.full_name.strip():
-            raise HTTPException(400, "Full name is required")
+            raise HTTPException(400, "กรุณากรอกชื่อ-นามสกุล")
         if not valid_thai_phone(body.contact):
-            raise HTTPException(400, "Contact number looks invalid (expects a 9-10 digit Thai phone number)")
+            raise HTTPException(400, "เบอร์ติดต่อไม่ถูกต้อง (ต้องเป็นเบอร์โทรไทย 9-10 หลัก)")
         if len(body.password) < MIN_PASSWORD_LENGTH:
             raise HTTPException(400, f"รหัสผ่านต้องมีอย่างน้อย {MIN_PASSWORD_LENGTH} ตัวอักษร")
         db.execute(
@@ -1003,7 +1184,7 @@ def set_password(body: SetPasswordBody):
     with get_db() as db:
         row = db.execute("SELECT * FROM users WHERE employee_id=?", (body.employee_id,)).fetchone()
         if not row or row["password_hash"] != PENDING_PASSWORD:
-            raise HTTPException(400, "This account does not need first-time password setup")
+            raise HTTPException(400, "บัญชีนี้ตั้งรหัสผ่านไว้แล้ว")
         db.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(body.new_password), row["id"]))
         return {"ok": True}
 
@@ -1015,7 +1196,7 @@ def change_password(body: ChangePasswordBody, user=Depends(current_user)):
     with get_db() as db:
         row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if not verify_password(body.old_password, row["password_hash"]):
-            raise HTTPException(400, "Current password is incorrect")
+            raise HTTPException(400, "รหัสผ่านปัจจุบันไม่ถูกต้อง")
         db.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(body.new_password), user["id"]))
         return {"ok": True}
 
@@ -1035,17 +1216,17 @@ def update_me(body: ProfileUpdateBody, user=Depends(current_user)):
     fields = {}
     if body.full_name is not None:
         if not body.full_name.strip():
-            raise HTTPException(400, "Full name cannot be empty")
+            raise HTTPException(400, "ชื่อ-นามสกุลต้องไม่เว้นว่าง")
         fields["full_name"] = body.full_name.strip()
     if body.contact is not None:
         if not valid_thai_phone(body.contact):
-            raise HTTPException(400, "Contact number looks invalid (expects a 9-10 digit Thai phone number)")
+            raise HTTPException(400, "เบอร์ติดต่อไม่ถูกต้อง (ต้องเป็นเบอร์โทรไทย 9-10 หลัก)")
         fields["contact"] = body.contact
     if body.cost_center is not None:
         if user["role"] != "USER":
-            raise HTTPException(400, "Only USER accounts have a cost center")
+            raise HTTPException(400, "เฉพาะบัญชีผู้ขอใช้งานเท่านั้นที่มี Cost center")
         if not body.cost_center.isdigit() or len(body.cost_center) != 5:
-            raise HTTPException(400, "Cost center must be 5 digits")
+            raise HTTPException(400, "Cost center ต้องเป็นตัวเลข 5 หลัก")
         fields["cost_center"] = body.cost_center
     if not fields and body.email is None:
         return {"ok": True}
@@ -1074,7 +1255,7 @@ class NewDriverBody(BaseModel):
 def create_driver(body: NewDriverBody, user=Depends(require_role("ADMIN"))):
     with get_db() as db:
         if db.execute("SELECT 1 FROM users WHERE employee_id=?", (body.employee_id,)).fetchone():
-            raise HTTPException(400, "Employee ID already exists")
+            raise HTTPException(400, "รหัสพนักงานนี้มีอยู่ในระบบแล้ว")
         email = validate_and_normalize_email(db, body.email)
         cur = db.execute(
             "INSERT INTO users (employee_id, email, full_name, password_hash, role, driver_status, created_at) "
@@ -1377,48 +1558,120 @@ class PriorityBody(BaseModel):
     priority: str
 
 
-def task_to_dict(row, db, viewer_role: Optional[str] = None) -> dict:
-    d = dict(row)
-    # Rating/comment are hidden from Drivers specifically (so they don't see
-    # how they were scored) — but not from the User who submitted it, since
-    # they need `rating` to tell "already reviewed" from "awaiting review"
-    # (hiding it from them too broke that tracking: the rate button would
-    # never disappear). Admin always sees everything.
-    if viewer_role == "DRIVER":
-        d["rating"] = None
-        d["rating_comment"] = None
-    d["driver_employee_id"] = None
-    d["driver_name"] = None
-    d["vehicle_code"] = None
-    if d.get("current_driver_id"):
-        u = db.execute("SELECT employee_id, full_name FROM users WHERE id=?", (d["current_driver_id"],)).fetchone()
-        if u:
-            d["driver_employee_id"] = u["employee_id"]
-            d["driver_name"] = u["full_name"]
-    if d.get("current_vehicle_id"):
-        v = db.execute("SELECT code FROM vehicles WHERE id=?", (d["current_vehicle_id"],)).fetchone()
-        d["vehicle_code"] = v["code"] if v else None
-    req = db.execute("SELECT employee_id, full_name, contact FROM users WHERE id=?", (d["requester_id"],)).fetchone()
-    if req:
-        d["requester_employee_id"] = req["employee_id"]
-        d["requester_name"] = req["full_name"]
-        d["requester_contact"] = req["contact"]
-    # Multi-driver: everyone currently Active on this task (primary = current_driver_id, first joined).
-    active_rows = db.execute(
-        "SELECT task_assignments.*, users.employee_id, users.full_name FROM task_assignments "
-        "JOIN users ON users.id = task_assignments.driver_id "
-        "WHERE task_id=? AND assignment_status='Active' ORDER BY assigned_at", (d["id"],)
+def _placeholders(n: int) -> str:
+    """`?,?,?` for an IN (...) clause. Works on both backends — the Postgres
+    wrapper rewrites `?` to `%s` for us."""
+    return ",".join(["?"] * n)
+
+
+def tasks_to_dicts(rows, db, viewer_role: Optional[str] = None) -> list:
+    """Serialise many task rows with a FIXED number of queries (4), instead of
+    4-6 queries per task.
+
+    The previous per-task version meant a list of 200 tasks fired roughly a
+    thousand queries — every single poll, per signed-in admin — and got worse
+    every week as the task table grew. This prefetches the related users,
+    vehicles and active assignments in one query each and joins them in
+    memory. Output shape is byte-for-byte what task_to_dict produced.
+    """
+    rows = list(rows)
+    if not rows:
+        return []
+    dicts = [dict(r) for r in rows]
+    task_ids = [d["id"] for d in dicts]
+
+    # 1. Active assignments for every task at once (was: one query per task).
+    assignments_by_task = {}
+    arows = db.execute(
+        "SELECT task_assignments.task_id, task_assignments.vehicle_id, "
+        "task_assignments.assigned_at, users.employee_id, users.full_name "
+        "FROM task_assignments JOIN users ON users.id = task_assignments.driver_id "
+        f"WHERE task_assignments.task_id IN ({_placeholders(len(task_ids))}) "
+        "AND task_assignments.assignment_status='Active' "
+        "ORDER BY task_assignments.assigned_at",
+        tuple(task_ids),
     ).fetchall()
-    drivers = []
-    for r in active_rows:
-        v = db.execute("SELECT code FROM vehicles WHERE id=?", (r["vehicle_id"],)).fetchone()
-        drivers.append({
-            "employee_id": r["employee_id"], "full_name": r["full_name"],
-            "vehicle_code": v["code"] if v else None,
-        })
-    d["drivers"] = drivers
-    d["other_driver_count"] = max(0, len(drivers) - 1)
-    return d
+    for a in arows:
+        assignments_by_task.setdefault(a["task_id"], []).append(a)
+
+    # 2. Every user referenced by any task (driver + requester) in one query.
+    user_ids = set()
+    for d in dicts:
+        if d.get("current_driver_id"):
+            user_ids.add(d["current_driver_id"])
+        if d.get("requester_id"):
+            user_ids.add(d["requester_id"])
+    users_by_id = {}
+    if user_ids:
+        ids = list(user_ids)
+        for u in db.execute(
+            f"SELECT id, employee_id, full_name, contact FROM users WHERE id IN ({_placeholders(len(ids))})",
+            tuple(ids),
+        ).fetchall():
+            users_by_id[u["id"]] = u
+
+    # 3. Every vehicle referenced by a task OR by one of its active
+    #    assignments (the old code re-queried the vehicle for each driver).
+    vehicle_ids = set()
+    for d in dicts:
+        if d.get("current_vehicle_id"):
+            vehicle_ids.add(d["current_vehicle_id"])
+    for alist in assignments_by_task.values():
+        for a in alist:
+            if a["vehicle_id"]:
+                vehicle_ids.add(a["vehicle_id"])
+    vehicle_code_by_id = {}
+    if vehicle_ids:
+        ids = list(vehicle_ids)
+        for v in db.execute(
+            f"SELECT id, code FROM vehicles WHERE id IN ({_placeholders(len(ids))})",
+            tuple(ids),
+        ).fetchall():
+            vehicle_code_by_id[v["id"]] = v["code"]
+
+    out = []
+    for d in dicts:
+        # Rating/comment are hidden from Drivers specifically (so they don't see
+        # how they were scored) — but not from the User who submitted it, since
+        # they need `rating` to tell "already reviewed" from "awaiting review"
+        # (hiding it from them too broke that tracking: the rate button would
+        # never disappear). Admin always sees everything.
+        if viewer_role == "DRIVER":
+            d["rating"] = None
+            d["rating_comment"] = None
+        d["driver_employee_id"] = None
+        d["driver_name"] = None
+        d["vehicle_code"] = None
+        if d.get("current_driver_id"):
+            u = users_by_id.get(d["current_driver_id"])
+            if u:
+                d["driver_employee_id"] = u["employee_id"]
+                d["driver_name"] = u["full_name"]
+        if d.get("current_vehicle_id"):
+            d["vehicle_code"] = vehicle_code_by_id.get(d["current_vehicle_id"])
+        req = users_by_id.get(d.get("requester_id"))
+        if req:
+            d["requester_employee_id"] = req["employee_id"]
+            d["requester_name"] = req["full_name"]
+            d["requester_contact"] = req["contact"]
+        # Multi-driver: everyone currently Active on this task (primary = current_driver_id, first joined).
+        drivers = [
+            {
+                "employee_id": a["employee_id"], "full_name": a["full_name"],
+                "vehicle_code": vehicle_code_by_id.get(a["vehicle_id"]),
+            }
+            for a in assignments_by_task.get(d["id"], [])
+        ]
+        d["drivers"] = drivers
+        d["other_driver_count"] = max(0, len(drivers) - 1)
+        out.append(d)
+    return out
+
+
+def task_to_dict(row, db, viewer_role: Optional[str] = None) -> dict:
+    """Single-task convenience wrapper. Delegates to the batch version so the
+    two can never drift apart."""
+    return tasks_to_dicts([row], db, viewer_role=viewer_role)[0]
 
 
 @app.post("/tasks")
@@ -1461,11 +1714,11 @@ def update_task(task_id: int, body: TaskUpdate, user=Depends(require_role("USER"
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["requester_id"] != user["id"]:
-            raise HTTPException(403, "Not your task")
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         if row["status"] != "Waiting":
-            raise HTTPException(400, "Task can only be modified before work starts (status=Waiting)")
+            raise HTTPException(400, "แก้ไขงานได้เฉพาะตอนที่ยังไม่เริ่มงาน (สถานะรอรับงาน)")
         fields = body.dict(exclude_unset=True)
         if not fields:
             return task_to_dict(row, db, viewer_role=user["role"])
@@ -1491,7 +1744,7 @@ def upload_task_photo(task_id: int, file: UploadFile = File(...), user=Depends(r
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row or row["requester_id"] != user["id"]:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         content = file.file.read()
         content_type = file.content_type or "image/jpeg"
         cur = db.execute(
@@ -1511,7 +1764,7 @@ def get_task_photo(task_id: int, photo_id: int, user=Depends(current_user)):
             "SELECT * FROM task_photos WHERE id=? AND task_id=?", (photo_id, task_id)
         ).fetchone()
         if not row:
-            raise HTTPException(404, "Photo not found")
+            raise HTTPException(404, "ไม่พบรูปภาพนี้")
         return Response(content=bytes(row["data"]), media_type=row["content_type"])
 
 
@@ -1520,9 +1773,9 @@ def change_priority(task_id: int, body: PriorityBody, user=Depends(require_role(
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] in ("Completed", "Cancelled"):
-            raise HTTPException(400, f"Cannot change priority of a {row['status']} task")
+            raise HTTPException(400, f"เปลี่ยนความสำคัญของงานสถานะ {TASK_STATUS_LABEL_TH.get(row['status'], row['status'])} ไม่ได้")
         old = row["priority"]
         db.execute("UPDATE tasks SET priority=? WHERE id=?", (body.priority, task_id))
         audit(db, user["id"], "change_priority", f"task {row['task_code']}: {old} -> {body.priority}")
@@ -1530,31 +1783,53 @@ def change_priority(task_id: int, body: PriorityBody, user=Depends(require_role(
         return {"ok": True}
 
 
+# How far back finished work stays in the list every refresh pulls down.
+# Live (non-terminal) tasks are ALWAYS included regardless of age — this only
+# bounds the history tail. Without it an admin's poll fetched every task ever
+# created, so the payload and query cost grew without limit for the lifetime
+# of the deployment. Anything older than this is still in the database and
+# still in the dashboard exports; it just isn't re-sent every few seconds.
+HISTORY_WINDOW_DAYS = 14
+
+
+def _history_cutoff_iso() -> str:
+    return (datetime.utcnow() - timedelta(days=HISTORY_WINDOW_DAYS)).isoformat(timespec="seconds") + "Z"
+
+
 @app.get("/tasks")
 def list_tasks(status_filter: Optional[str] = None, user=Depends(current_user)):
     with get_db() as db:
         if user["role"] == "ADMIN":
             check_waiting_too_long(db)
+        cutoff = _history_cutoff_iso()
         if user["role"] == "USER":
-            q = "SELECT * FROM tasks WHERE requester_id=?"
-            params = [user["id"]]
+            # Live tasks, recent history, and — regardless of age — anything
+            # still awaiting this requester's rating, so the "ให้คะแนน" button
+            # can never vanish just because the task got old.
+            q = ("SELECT * FROM tasks WHERE requester_id=? AND ("
+                 "status NOT IN ('Completed','Cancelled') "
+                 "OR created_at >= ? "
+                 "OR (status='Completed' AND rating IS NULL))")
+            params = [user["id"], cutoff]
         elif user["role"] == "DRIVER":
-            # Drivers see: any task they've ever had an assignment on (any status,
-            # for history — including as a joiner, not just primary driver), plus
+            # Drivers see: any task they've had an assignment on (recent
+            # history — including as a joiner, not just primary driver), plus
             # every non-terminal task (so they can self-assign/join/take-over).
             q = ("SELECT DISTINCT tasks.* FROM tasks "
                  "LEFT JOIN task_assignments ON task_assignments.task_id = tasks.id AND task_assignments.driver_id=? "
-                 "WHERE (task_assignments.driver_id IS NOT NULL OR tasks.status NOT IN ('Completed','Cancelled'))")
-            params = [user["id"]]
+                 "WHERE (tasks.status NOT IN ('Completed','Cancelled') "
+                 "OR (task_assignments.driver_id IS NOT NULL AND tasks.created_at >= ?))")
+            params = [user["id"], cutoff]
         else:
-            q = "SELECT * FROM tasks WHERE 1=1"
-            params = []
+            q = ("SELECT * FROM tasks WHERE (status NOT IN ('Completed','Cancelled') "
+                 "OR created_at >= ?)")
+            params = [cutoff]
         if status_filter:
             q += " AND status=?"
             params.append(status_filter)
         q += " ORDER BY created_at DESC"
         rows = db.execute(q, params).fetchall()
-        return [task_to_dict(r, db, viewer_role=user["role"]) for r in rows]
+        return tasks_to_dicts(rows, db, viewer_role=user["role"])
 
 
 @app.get("/tasks/{task_id}")
@@ -1562,7 +1837,7 @@ def get_task(task_id: int, user=Depends(current_user)):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         history = db.execute(
             "SELECT * FROM task_assignments WHERE task_id=? ORDER BY assigned_at", (task_id,)
         ).fetchall()
@@ -1580,12 +1855,12 @@ def cancel_task(task_id: int, reason: Optional[str] = None, user=Depends(current
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if user["role"] == "USER":
             if row["requester_id"] != user["id"] or row["status"] not in ("Waiting", "Assigned"):
-                raise HTTPException(403, "Cannot cancel this task")
+                raise HTTPException(403, "ยกเลิกงานนี้ไม่ได้")
         elif user["role"] != "ADMIN":
-            raise HTTPException(403, "Not allowed")
+            raise HTTPException(403, "ไม่มีสิทธิ์ดำเนินการนี้")
         transition(db, row, "Cancelled", user["id"], note=reason)
         db.execute("UPDATE tasks SET cancel_reason=? WHERE id=?", (reason, task_id))
         free_up_driver_and_vehicle(db, row["current_driver_id"], row["current_vehicle_id"])
@@ -1611,7 +1886,7 @@ def send_back_task(task_id: int, body: SendBackBody, user=Depends(require_role("
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] != "Waiting":
             raise HTTPException(400, "ตีกลับได้เฉพาะงานที่ยังรอดำเนินการ (Waiting) เท่านั้น")
         db.execute("UPDATE tasks SET blocked_reason=?, blocked_at=? WHERE id=?", (body.reason, now_iso(), task_id))
@@ -1625,9 +1900,9 @@ def resubmit_task(task_id: int, user=Depends(require_role("USER"))):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["requester_id"] != user["id"]:
-            raise HTTPException(403, "Not your task")
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         if row["status"] != "Waiting" or not row["blocked_reason"]:
             raise HTTPException(400, "งานนี้ไม่ได้ถูกตีกลับ")
         db.execute(
@@ -1739,9 +2014,9 @@ def assign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADMIN
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("Waiting",):
-            raise HTTPException(400, "Task is not in Waiting status; use /reassign instead")
+            raise HTTPException(400, "งานนี้ไม่ได้อยู่ในสถานะรอรับงานแล้ว กรุณาใช้การมอบหมายใหม่แทน")
         driver = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'",
                              (body.driver_employee_id,)).fetchone()
         if not driver:
@@ -1764,9 +2039,9 @@ def reassign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADM
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("Assigned", "In Progress", "Pause"):
-            raise HTTPException(400, f"Cannot reassign task in status {row['status']}")
+            raise HTTPException(400, f"มอบหมายงานใหม่ไม่ได้ เพราะงานอยู่ในสถานะ {TASK_STATUS_LABEL_TH.get(row['status'], row['status'])}")
         driver = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'",
                              (body.driver_employee_id,)).fetchone()
         if not driver:
@@ -1794,18 +2069,18 @@ def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_ro
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] != "Waiting":
-            raise HTTPException(400, "Task is no longer waiting")
+            raise HTTPException(400, "งานนี้ถูกรับไปแล้ว")
         driver = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if not driver["checked_in_vehicle_id"]:
-            raise HTTPException(400, "Please check in with a vehicle first")
+            raise HTTPException(400, "กรุณาเช็คอินรถก่อนรับงาน")
         if driver["driver_status"] != "Available":
-            raise HTTPException(400, f"You are currently {driver['driver_status']}, not Available")
+            raise HTTPException(400, f"สถานะของคุณตอนนี้คือ {DRIVER_STATUS_LABEL_TH.get(driver['driver_status'], driver['driver_status'])} จึงรับงานไม่ได้")
         vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["checked_in_vehicle_id"],)).fetchone()
         issues = eligibility_issues(db, driver, vehicle, row)
         if issues:
-            raise HTTPException(409, "Cannot take this task: " + "; ".join(issues))
+            raise HTTPException(409, "รับงานนี้ไม่ได้: " + "; ".join(issues))
         _do_assign(db, row, driver, vehicle, user["id"], "Self-assigned by driver", None, is_reassign=False)
         db.execute("UPDATE tasks SET accepted_at=?, accept_battery_level=? WHERE id=?",
                    (now_iso(), body.battery_level, task_id))
@@ -1821,20 +2096,20 @@ def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_role
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("Assigned", "In Progress", "Pause"):
-            raise HTTPException(400, "This task cannot be taken over right now")
+            raise HTTPException(400, "ตอนนี้ยังรับช่วงงานนี้ไม่ได้")
         if row["current_driver_id"] == user["id"]:
-            raise HTTPException(400, "This is already your task")
+            raise HTTPException(400, "นี่เป็นงานของคุณอยู่แล้ว")
         driver = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if not driver["checked_in_vehicle_id"]:
-            raise HTTPException(400, "Please check in with a vehicle first")
+            raise HTTPException(400, "กรุณาเช็คอินรถก่อนรับงาน")
         if driver["driver_status"] != "Available":
-            raise HTTPException(400, f"You are currently {driver['driver_status']}, not Available")
+            raise HTTPException(400, f"สถานะของคุณตอนนี้คือ {DRIVER_STATUS_LABEL_TH.get(driver['driver_status'], driver['driver_status'])} จึงรับงานไม่ได้")
         vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["checked_in_vehicle_id"],)).fetchone()
         issues = eligibility_issues(db, driver, vehicle, row)
         if issues:
-            raise HTTPException(409, "Cannot take over this task: " + "; ".join(issues))
+            raise HTTPException(409, "รับช่วงงานนี้ไม่ได้: " + "; ".join(issues))
         _do_assign(db, row, driver, vehicle, user["id"], "Taken over by another driver", None, is_reassign=True)
         db.execute("UPDATE tasks SET accepted_at=?, accept_battery_level=? WHERE id=?",
                    (now_iso(), body.battery_level, task_id))
@@ -1859,7 +2134,7 @@ def accept_task(task_id: int, body: AcceptBody, user=Depends(require_role("DRIVE
             (now_iso(), body.battery_level, task_id, user["id"]),
         )
         if cur.rowcount == 0:
-            raise HTTPException(409, "Task already accepted, not assigned to you, or not in Assigned status")
+            raise HTTPException(409, "งานนี้ถูกกดรับไปแล้ว หรือไม่ได้มอบหมายให้คุณ")
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if row["current_vehicle_id"]:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, row["current_vehicle_id"]))
@@ -1873,11 +2148,11 @@ def start_task(task_id: int, user=Depends(require_role("DRIVER"))):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["current_driver_id"] != user["id"]:
-            raise HTTPException(403, "Not your task")
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         if row["status"] != "Assigned" or row["accepted_at"] is None:
-            raise HTTPException(400, "Task must be accepted before it can be started")
+            raise HTTPException(400, "ต้องกดรับงานก่อนจึงจะเริ่มงานได้")
         transition(db, row, "In Progress", user["id"])
         db.execute("UPDATE tasks SET started_at=? WHERE id=?", (now_iso(), task_id))
         notify(db, row["requester_id"], f"Driver started task {row['task_code']}", task_id)
@@ -1889,15 +2164,15 @@ def complete_task(task_id: int, user=Depends(require_role("DRIVER"))):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         my_assignment = db.execute(
             "SELECT * FROM task_assignments WHERE task_id=? AND driver_id=? AND assignment_status='Active'",
             (task_id, user["id"]),
         ).fetchone()
         if not my_assignment:
-            raise HTTPException(403, "Not your task")
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         if row["status"] not in ("In Progress",):
-            raise HTTPException(400, "Task already completed or not in progress")
+            raise HTTPException(400, "งานนี้จบไปแล้ว หรือยังไม่ได้เริ่มทำ")
         db.execute(
             "UPDATE task_assignments SET unassigned_at=?, assignment_status='Completed' WHERE id=?",
             (now_iso(), my_assignment["id"]),
@@ -1934,7 +2209,7 @@ def admin_complete_task(task_id: int, user=Depends(require_role("ADMIN"))):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("In Progress", "Pause"):
             raise HTTPException(
                 400, f"ทำเครื่องหมายเสร็จไม่ได้ในสถานะ {row['status']} "
@@ -1967,7 +2242,7 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_role("DRIVE
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("Assigned", "In Progress", "Pause"):
             raise HTTPException(400, "งานนี้ยังไม่เริ่ม หรือปิดงานไปแล้ว")
         if db.execute(
@@ -2008,7 +2283,7 @@ def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_rol
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("Assigned", "In Progress", "Pause"):
             raise HTTPException(400, "เพิ่มคนขับได้เฉพาะงานที่กำลังดำเนินการเท่านั้น")
         driver = db.execute(
@@ -2047,7 +2322,7 @@ def leave_task(task_id: int, user=Depends(require_role("DRIVER"))):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         my_assignment = db.execute(
             "SELECT * FROM task_assignments WHERE task_id=? AND driver_id=? AND assignment_status='Active'",
             (task_id, user["id"]),
@@ -2101,9 +2376,9 @@ def rate_task(task_id: int, body: RatingBody, user=Depends(require_role("USER"))
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if row["requester_id"] != user["id"]:
-            raise HTTPException(403, "Not your task")
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         if row["status"] != "Completed":
             raise HTTPException(400, "ให้คะแนนได้เฉพาะงานที่เสร็จสิ้นแล้ว")
         db.execute("UPDATE tasks SET rating=?, rating_comment=? WHERE id=?", (body.rating, body.comment, task_id))
@@ -2125,13 +2400,13 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(require_role("DRIVER"
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         my_assignment = db.execute(
             "SELECT * FROM task_assignments WHERE task_id=? AND driver_id=? AND assignment_status='Active'",
             (task_id, user["id"]),
         ).fetchone()
         if not my_assignment:
-            raise HTTPException(403, "Not your task")
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         note = f"[{body.category}] {body.reason}"
 
         # A problem on the requester's side (location/goods not ready) blocks
@@ -2191,13 +2466,13 @@ def resume_task(task_id: int, user=Depends(require_role("DRIVER"))):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         my_assignment = db.execute(
             "SELECT 1 FROM task_assignments WHERE task_id=? AND driver_id=? AND assignment_status='Active'",
             (task_id, user["id"]),
         ).fetchone()
         if not my_assignment:
-            raise HTTPException(403, "Not your task")
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         transition(db, row, "In Progress", user["id"])
         return {"ok": True}
 
@@ -2215,9 +2490,9 @@ def get_task_messages(task_id: int, user=Depends(current_user)):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if not task_chat_allowed(db, row, user):
-            raise HTTPException(403, "You are not part of this task's conversation")
+            raise HTTPException(403, "คุณไม่ได้อยู่ในห้องแชทของงานนี้")
         rows = db.execute(
             "SELECT task_messages.*, users.employee_id AS sender_employee_id, users.role AS sender_role "
             "FROM task_messages JOIN users ON users.id = task_messages.sender_id "
@@ -2231,11 +2506,11 @@ def post_task_message(task_id: int, body: ChatMessageBody, user=Depends(current_
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         if not task_chat_allowed(db, row, user):
-            raise HTTPException(403, "You are not part of this task's conversation")
+            raise HTTPException(403, "คุณไม่ได้อยู่ในห้องแชทของงานนี้")
         if not body.message.strip():
-            raise HTTPException(400, "Message cannot be empty")
+            raise HTTPException(400, "ข้อความต้องไม่เว้นว่าง")
         db.execute(
             "INSERT INTO task_messages (task_id, sender_id, message, created_at) VALUES (?,?,?,?)",
             (task_id, user["id"], body.message.strip(), now_iso()),
@@ -2287,7 +2562,7 @@ def get_team_chat_messages(user=Depends(require_role("ADMIN", "DRIVER"))):
 def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN", "DRIVER"))):
     message = body.message.strip()
     if not message:
-        raise HTTPException(400, "Message cannot be empty")
+        raise HTTPException(400, "ข้อความต้องไม่เว้นว่าง")
     with get_db() as db:
         db.execute(
             "INSERT INTO team_chat_messages (sender_id, message, created_at) VALUES (?,?,?)",
@@ -2418,7 +2693,7 @@ def delete_vehicle(vehicle_id: int, user=Depends(require_role("ADMIN"))):
     with get_db() as db:
         row = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Vehicle not found")
+            raise HTTPException(404, "ไม่พบรถคันนี้")
         active_task = db.execute(
             "SELECT 1 FROM tasks WHERE current_vehicle_id=? AND status NOT IN ('Completed','Cancelled')",
             (vehicle_id,),
@@ -2441,7 +2716,7 @@ def update_vehicle(vehicle_id: int, body: VehicleUpdateBody, user=Depends(requir
     with get_db() as db:
         row = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "Vehicle not found")
+            raise HTTPException(404, "ไม่พบรถคันนี้")
         fields = body.dict(exclude_unset=True)
         if not fields:
             return {"ok": True}
@@ -2475,7 +2750,7 @@ class DriverStatusBody(BaseModel):
 @app.post("/drivers/status")
 def set_driver_status(body: DriverStatusBody, user=Depends(require_role("DRIVER"))):
     if body.status not in ("Not Checked-in", "Available", "Busy", "Pause", "Breakdown"):
-        raise HTTPException(400, "Invalid status")
+        raise HTTPException(400, "สถานะไม่ถูกต้อง")
     with get_db() as db:
         db.execute("UPDATE users SET driver_status=? WHERE id=?", (body.status, user["id"]))
         if body.status == "Breakdown":
@@ -2493,9 +2768,9 @@ def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
     with get_db() as db:
         v = db.execute("SELECT * FROM vehicles WHERE code=?", (body.vehicle_code,)).fetchone()
         if not v:
-            raise HTTPException(404, "Vehicle not found")
+            raise HTTPException(404, "ไม่พบรถคันนี้")
         if v["status"] == "Breakdown":
-            raise HTTPException(400, "Vehicle is marked as Breakdown; cannot check in")
+            raise HTTPException(400, "รถคันนี้ถูกแจ้งว่าเสีย จึงเช็คอินไม่ได้")
         db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, v["id"]))
         db.execute("UPDATE users SET checked_in_vehicle_id=? WHERE id=?", (v["id"], user["id"]))
         cur = db.execute(
@@ -2526,7 +2801,7 @@ def suggest_dispatch(task_id: int, user=Depends(require_role("ADMIN"))):
     with get_db() as db:
         task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not task:
-            raise HTTPException(404, "Task not found")
+            raise HTTPException(404, "ไม่พบงานนี้")
         vehicles = db.execute("SELECT * FROM vehicles WHERE status='Available'").fetchall()
         suggestions = []
         for v in vehicles:
@@ -2563,7 +2838,7 @@ def my_driver_stats(period: str = "day", date: Optional[str] = None, user=Depend
             start = datetime.strptime(date, "%Y-%m")
             end = (start + timedelta(days=32)).replace(day=1)
     except ValueError:
-        raise HTTPException(400, "Invalid date format")
+        raise HTTPException(400, "รูปแบบวันที่ไม่ถูกต้อง")
     start_iso = start.isoformat(timespec="seconds") + "Z"
     end_iso = end.isoformat(timespec="seconds") + "Z"
     with get_db() as db:
@@ -2607,10 +2882,10 @@ def report_breakdown(body: BreakdownBody, user=Depends(require_role("DRIVER"))):
             db.execute("UPDATE users SET driver_status='Breakdown' WHERE id=?", (user["id"],))
         elif body.target_type == "vehicle":
             if not body.vehicle_code:
-                raise HTTPException(400, "vehicle_code required")
+                raise HTTPException(400, "กรุณาระบุรหัสรถ")
             v = db.execute("SELECT * FROM vehicles WHERE code=?", (body.vehicle_code,)).fetchone()
             if not v:
-                raise HTTPException(404, "Vehicle not found")
+                raise HTTPException(404, "ไม่พบรถคันนี้")
             target_id = v["id"]
             label = v["code"]
             db.execute("UPDATE vehicles SET status='Breakdown' WHERE id=?", (v["id"],))
@@ -2641,7 +2916,7 @@ def resolve_breakdown(breakdown_id: int, body: ResolveBreakdownBody = ResolveBre
     with get_db() as db:
         b = db.execute("SELECT * FROM breakdowns WHERE id=?", (breakdown_id,)).fetchone()
         if not b:
-            raise HTTPException(404, "Breakdown not found")
+            raise HTTPException(404, "ไม่พบรายการแจ้งเสียนี้")
         note = (body.resolution_note or "").strip() or None
         db.execute(
             "UPDATE breakdowns SET status='Resolved', resolved_at=?, resolution_note=? WHERE id=?",
@@ -2722,7 +2997,7 @@ def push_subscribe(body: PushSubscribeBody, user=Depends(current_user)):
     p256dh = body.keys.get("p256dh")
     auth = body.keys.get("auth")
     if not p256dh or not auth:
-        raise HTTPException(400, "Invalid subscription payload")
+        raise HTTPException(400, "ข้อมูลการสมัครรับแจ้งเตือนไม่ถูกต้อง")
     with get_db() as db:
         db.execute(
             "INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, created_at) VALUES (?,?,?,?,?) "
@@ -2803,29 +3078,35 @@ def app_data(scope: str = "core", user=Depends(current_user)):
       admin_dash— + dashboard summary (the Dashboard tab)
       driver    — + vehicles, team chat (driver screens)
     """
-    out = {
-        "me": me(user),
-        "tasks": list_tasks(None, user),
-        "notifications": get_notifications(user),
-    }
-    if scope == "driver":
-        out["vehicles"] = list_vehicles(user)
-        out["teamChatMessages"] = get_team_chat_messages(user)
-        out["teamChatParticipants"] = team_chat_participants(user)
-    elif scope in ("admin_ops", "admin_dash") and user["role"] == "ADMIN":
-        out["drivers"] = list_drivers(user)
-        out["vehicles"] = list_vehicles(user)
-        out["allUsers"] = list_all_users(user)
-        out["vehicleTypes"] = list_vehicle_types(user)
-        out["breakdowns"] = list_breakdowns(user)
-        out["zones"] = list_zones(user)
-        out["taskRules"] = list_task_rules(user)
-        out["teamChatMessages"] = get_team_chat_messages(user)
-        out["teamChatParticipants"] = team_chat_participants(user)
-        if scope == "admin_dash":
-            out["dashboard"] = dashboard(user)
-            out["auditLogs"] = get_audit_logs(user)
-    return out
+    # Holding ONE connection open across the whole bundle is what makes the
+    # single-round-trip design actually pay off. Each helper below opens its
+    # own `with get_db()`, but get_db() is re-entrant, so they all reuse this
+    # one instead of each doing its own TLS handshake to the database. This
+    # request went from 12 connections to 1 (plus one for authentication).
+    with get_db():
+        out = {
+            "me": me(user),
+            "tasks": list_tasks(None, user),
+            "notifications": get_notifications(user),
+        }
+        if scope == "driver":
+            out["vehicles"] = list_vehicles(user)
+            out["teamChatMessages"] = get_team_chat_messages(user)
+            out["teamChatParticipants"] = team_chat_participants(user)
+        elif scope in ("admin_ops", "admin_dash") and user["role"] == "ADMIN":
+            out["drivers"] = list_drivers(user)
+            out["vehicles"] = list_vehicles(user)
+            out["allUsers"] = list_all_users(user)
+            out["vehicleTypes"] = list_vehicle_types(user)
+            out["breakdowns"] = list_breakdowns(user)
+            out["zones"] = list_zones(user)
+            out["taskRules"] = list_task_rules(user)
+            out["teamChatMessages"] = get_team_chat_messages(user)
+            out["teamChatParticipants"] = team_chat_participants(user)
+            if scope == "admin_dash":
+                out["dashboard"] = dashboard(user)
+                out["auditLogs"] = get_audit_logs(user)
+        return out
 
 
 
@@ -3202,6 +3483,7 @@ try:
         # /healthz report the import error as the root cause.
         raise RuntimeError(f"Postgres driver import failed: {_IMPORT_ERROR}")
     init_db()
+    ensure_indexes()
     ensure_vapid_keys()
 except Exception as e:
     # On a normal server (Replit, a VM) this runs once at startup and any DB
