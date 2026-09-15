@@ -3484,36 +3484,44 @@ function renderTeamChat(main){
 
 // ---------------- Data refresh (simple polling = "real-time enough") ----------------
 async function refreshAll(){
-  // Load each endpoint independently: one failing request must not stop the
-  // others (previously they were chained in one try, so an early failure —
-  // e.g. /drivers erroring — left later state like allUsers empty, showing
-  // "พนักงาน (0/0)" even though those endpoints were fine). loadInto keeps
-  // the previous value on failure and tracks whether anything failed.
+  // Load endpoints in PARALLEL, not one-after-another. On serverless (Vercel +
+  // Neon) each call is a separate round-trip; doing ~14 of them sequentially
+  // took 2+ seconds every cycle and made the app feel perpetually busy/slow.
+  // Promise.all fires them together so a refresh finishes in about the time of
+  // the single slowest call. Each still fails independently (settled, not all)
+  // so one error never blanks the others — the "พนักงาน (0/0)" class of bug.
   let anyFailed = false;
   async function loadInto(key, path){
     try{ state[key] = await api(path, {background:true}); }
     catch(e){ anyFailed = true; }
   }
-  await loadInto("tasks", "/tasks");
-  await loadInto("notifications", "/notifications");
-  try{ state.me = await api("/me", {background:true}); }catch(e){ anyFailed = true; }
+  const jobs = [
+    loadInto("tasks", "/tasks"),
+    loadInto("notifications", "/notifications"),
+    (async ()=>{ try{ state.me = await api("/me", {background:true}); }catch(e){ anyFailed = true; } })(),
+  ];
   if(state.role === "ADMIN"){
-    await loadInto("dashboard", "/dashboard");
-    await loadInto("drivers", "/drivers");
-    await loadInto("vehicles", "/vehicles");
-    await loadInto("breakdowns", "/breakdowns");
-    await loadInto("zones", "/zones");
-    await loadInto("taskRules", "/task-rules");
-    await loadInto("auditLogs", "/audit-logs");
-    await loadInto("allUsers", "/admin/users");
-    await loadInto("vehicleTypes", "/vehicle-types");
-    await loadInto("teamChatMessages", "/team-chat/messages");
-    await loadInto("teamChatParticipants", "/team-chat/participants");
+    jobs.push(
+      loadInto("dashboard", "/dashboard"),
+      loadInto("drivers", "/drivers"),
+      loadInto("vehicles", "/vehicles"),
+      loadInto("breakdowns", "/breakdowns"),
+      loadInto("zones", "/zones"),
+      loadInto("taskRules", "/task-rules"),
+      loadInto("auditLogs", "/audit-logs"),
+      loadInto("allUsers", "/admin/users"),
+      loadInto("vehicleTypes", "/vehicle-types"),
+      loadInto("teamChatMessages", "/team-chat/messages"),
+      loadInto("teamChatParticipants", "/team-chat/participants"),
+    );
   } else if(state.role === "DRIVER"){
-    await loadInto("vehicles", "/vehicles");
-    await loadInto("teamChatMessages", "/team-chat/messages");
-    await loadInto("teamChatParticipants", "/team-chat/participants");
+    jobs.push(
+      loadInto("vehicles", "/vehicles"),
+      loadInto("teamChatMessages", "/team-chat/messages"),
+      loadInto("teamChatParticipants", "/team-chat/participants"),
+    );
   }
+  await Promise.all(jobs);
   try{
     // Bug fix: skip re-rendering the tab body while the user is typing into a
     // form inside it, so a 3-second poll never blanks out unsaved input. Also
@@ -3597,13 +3605,29 @@ async function bootstrap(){
   }
   renderShell();
   await refreshAll();
-  if(pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(refreshAll, 3000);
+  startPolling();
   maybeAutoPromptNotifications(); // fire-and-forget; never blocks app usage
 }
 
+// Self-scheduling poll instead of setInterval: each cycle only schedules the
+// next one AFTER it finishes, so slow cycles (serverless latency) never pile
+// up on top of each other the way a fixed 3s interval would. 5s spacing is
+// plenty for warehouse dispatch and roughly halves the request load vs 3s.
+const POLL_INTERVAL_MS = 5000;
+function startPolling(){
+  stopPolling();
+  const tick = async ()=>{
+    await refreshAll();
+    if(state.token) pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+  };
+  pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+}
+function stopPolling(){
+  if(pollTimer){ clearTimeout(pollTimer); pollTimer = null; }
+}
+
 function render(){
-  if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+  stopPolling();
   if(state.token){ bootstrap(); } else { renderLogin(); }
 }
 
