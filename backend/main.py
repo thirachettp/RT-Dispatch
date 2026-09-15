@@ -592,6 +592,12 @@ def init_db():
             if fresh:
                 db.executescript(_postgres_schema())
                 seed(db)
+            else:
+                # Self-heal: a broken earlier deploy may have created the tables
+                # but left master data (vehicle types, zones, etc.) empty, which
+                # makes it impossible to create vehicles or tasks. Refill any
+                # empty master table on every boot — cheap, and idempotent.
+                seed_master_data(db)
         # No migrate_db() here: a Postgres database always starts from today's
         # schema, so there's never an older SQLite-era shape to evolve away from.
         return
@@ -601,6 +607,8 @@ def init_db():
         db.executescript(SCHEMA)
         if fresh:
             seed(db)
+        else:
+            seed_master_data(db)  # same self-heal for the SQLite path
     if not fresh:
         migrate_db()
 
@@ -667,6 +675,56 @@ def migrate_db():
             log.info("Migrated database: added EMPTY_PALLET zone")
 
 
+def seed_master_data(db):
+    """Master/reference data (vehicle types, zones, the type<->zone matrix,
+    task rules). Split out from user seeding and made idempotent PER TABLE so
+    it self-heals: if an earlier broken deploy left these tables empty (tables
+    created but seed never completed), this refills whatever is missing on the
+    next boot instead of staying empty forever. Safe to call every startup."""
+    if not db.execute("SELECT 1 FROM vehicle_types LIMIT 1").fetchone():
+        db.execute(
+            "INSERT INTO vehicle_types (type_key, type_name_th, description) VALUES "
+            "('RT','รถ Reach Truck','ยกสินค้าขึ้นชั้นวางสูง'),"
+            "('PE','รถ Pallet Truck (ไฟฟ้า)','ลากพาเลทระยะสั้น'),"
+            "('FORKLIFT','รถโฟล์คลิฟท์','ยกของทั่วไป')"
+        )
+        log.info("Seeded master data: vehicle_types")
+
+    if not db.execute("SELECT 1 FROM zones LIMIT 1").fetchone():
+        db.execute(
+            "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) VALUES "
+            "('CONCRETE_YARD','ลานปูน','^ลานปูน-[1-7]$',0,'ลานปูน-3',1,0),"
+            "('GATE','ประตู','^ประตู-([1-9]|[1-7][0-9]|8[0-5])$',1,'ประตู-12',2,0),"
+            "('SORT_YARD','ลาน Sort','^ลาน Sort$',0,'ลาน Sort',3,0),"
+            "('MEZZANINE','Mezzanine','^Mezzanine-[1-4]-(ซ้าย \\(Cross dock\\)|ขวา \\(Double Deep\\))$',0,'Mezzanine-2-ซ้าย (Cross dock)',4,0),"
+            "('SELECTIVE_RACK','Selective Rack','^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$',1,'BAA01A1',5,0),"
+            "('DOUBLE_DEEP','Double Deep','^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$',1,'AAA01G1',6,0),"
+            "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า-จุดจ่าย',7,1)"
+        )
+        log.info("Seeded master data: zones")
+
+    if not db.execute("SELECT 1 FROM vehicle_type_zones LIMIT 1").fetchone():
+        # Default: every vehicle type can work every zone. Admin narrows this
+        # down later via the vehicle-type <-> zone matrix in Settings.
+        zone_keys = ["CONCRETE_YARD", "GATE", "SORT_YARD", "MEZZANINE", "SELECTIVE_RACK", "DOUBLE_DEEP"]
+        for vt in ("RT", "PE", "FORKLIFT"):
+            for zk in zone_keys:
+                db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) ON CONFLICT DO NOTHING", (vt, zk))
+        log.info("Seeded master data: vehicle_type_zones")
+
+    if not db.execute("SELECT 1 FROM task_rules LIMIT 1").fetchone():
+        db.execute(
+            "INSERT INTO task_rules (from_zone, to_zone, task_type) VALUES "
+            "('CONCRETE_YARD','SELECTIVE_RACK','Putaway'),"
+            "('CONCRETE_YARD','DOUBLE_DEEP','Putaway'),"
+            "('SELECTIVE_RACK','GATE','Picking'),"
+            "('DOUBLE_DEEP','GATE','Picking'),"
+            "('SELECTIVE_RACK','CONCRETE_YARD','Replenishment'),"
+            "('DOUBLE_DEEP','CONCRETE_YARD','Replenishment')"
+        )
+        log.info("Seeded master data: task_rules")
+
+
 def seed(db):
     ts = now_iso()
 
@@ -696,40 +754,7 @@ def seed(db):
     log.warning("  scdc.db does not exist yet). Write the password down now.")
     log.warning("=" * 60)
 
-    db.execute(
-        "INSERT INTO vehicle_types (type_key, type_name_th, description) VALUES "
-        "('RT','รถ Reach Truck','ยกสินค้าขึ้นชั้นวางสูง'),"
-        "('PE','รถ Pallet Truck (ไฟฟ้า)','ลากพาเลทระยะสั้น'),"
-        "('FORKLIFT','รถโฟล์คลิฟท์','ยกของทั่วไป')"
-    )
-
-    db.execute(
-        "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) VALUES "
-        "('CONCRETE_YARD','ลานปูน','^ลานปูน-[1-7]$',0,'ลานปูน-3',1,0),"
-        "('GATE','ประตู','^ประตู-([1-9]|[1-7][0-9]|8[0-5])$',1,'ประตู-12',2,0),"
-        "('SORT_YARD','ลาน Sort','^ลาน Sort$',0,'ลาน Sort',3,0),"
-        "('MEZZANINE','Mezzanine','^Mezzanine-[1-4]-(ซ้าย \\(Cross dock\\)|ขวา \\(Double Deep\\))$',0,'Mezzanine-2-ซ้าย (Cross dock)',4,0),"
-        "('SELECTIVE_RACK','Selective Rack','^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$',1,'BAA01A1',5,0),"
-        "('DOUBLE_DEEP','Double Deep','^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$',1,'AAA01G1',6,0),"
-        "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า-จุดจ่าย',7,1)"
-    )
-
-    # Default: every vehicle type can work every zone. Admin narrows this
-    # down later via the vehicle-type <-> zone matrix in Settings.
-    zone_keys = ["CONCRETE_YARD", "GATE", "SORT_YARD", "MEZZANINE", "SELECTIVE_RACK", "DOUBLE_DEEP"]
-    for vt in ("RT", "PE", "FORKLIFT"):
-        for zk in zone_keys:
-            db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?)", (vt, zk))
-
-    db.execute(
-        "INSERT INTO task_rules (from_zone, to_zone, task_type) VALUES "
-        "('CONCRETE_YARD','SELECTIVE_RACK','Putaway'),"
-        "('CONCRETE_YARD','DOUBLE_DEEP','Putaway'),"
-        "('SELECTIVE_RACK','GATE','Picking'),"
-        "('DOUBLE_DEEP','GATE','Picking'),"
-        "('SELECTIVE_RACK','CONCRETE_YARD','Replenishment'),"
-        "('DOUBLE_DEEP','CONCRETE_YARD','Replenishment')"
-    )
+    seed_master_data(db)
 
 
 # ---------------------------------------------------------------------------
