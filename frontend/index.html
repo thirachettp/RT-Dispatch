@@ -50,6 +50,46 @@
     #refresh-bar-icon.spin{animation:none;opacity:.5;}
   }
 
+  /* Task card, laid out as: code chip + status pill / route / icon fact strip
+     / actions. The strip scrolls sideways on narrow phones rather than
+     wrapping into a ragged block. */
+  .card-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;}
+  .task-code{display:inline-flex;align-items:center;gap:8px;background:var(--panel-2);
+    border-radius:10px;padding:7px 12px;font-weight:800;font-size:14px;letter-spacing:.02em;}
+  .tc-ico{width:17px;height:17px;display:block;color:var(--blue);}
+  .tc-ico svg{width:100%;height:100%;display:block;}
+  .route{font-size:16px;font-weight:800;line-height:1.45;margin-bottom:12px;}
+  .route .arrow{margin:0 9px;color:var(--ink-dim);font-weight:500;}
+  .route-type{font-weight:500;color:var(--ink-dim);font-size:13px;margin-left:5px;}
+  .fact-strip{display:flex;align-items:stretch;gap:0;overflow-x:auto;
+    -webkit-overflow-scrolling:touch;padding-bottom:2px;}
+  .fact-strip::-webkit-scrollbar{display:none;}
+  .fact{display:flex;align-items:center;gap:8px;padding:0 14px;flex:none;
+    border-left:1px solid var(--line);}
+  .fact:first-child{padding-left:0;border-left:none;}
+  .fact-ico{width:19px;height:19px;flex:none;color:var(--ink-dim);}
+  .fact-ico svg{width:100%;height:100%;display:block;}
+  .fact-l{font-size:11px;color:var(--ink-dim);line-height:1.3;white-space:nowrap;}
+  .fact-v{font-size:13px;font-weight:700;line-height:1.35;white-space:nowrap;}
+  .card-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;
+    padding-top:12px;border-top:1px solid var(--line);}
+
+  /* Multi-select driver picker in the assign sheet. */
+  .driver-pick-list{max-height:46vh;overflow-y:auto;margin:10px 0;border:1px solid var(--line);
+    border-radius:12px;}
+  .driver-pick{display:flex;align-items:flex-start;gap:11px;padding:11px 13px;cursor:pointer;
+    border-bottom:1px solid var(--line);}
+  .driver-pick:last-child{border-bottom:none;}
+  .driver-pick input[type=checkbox]{width:19px;height:19px;flex:none;margin-top:2px;}
+  .driver-pick.is-on{background:var(--panel-2);}
+  .driver-pick.is-blocked{opacity:.5;cursor:not-allowed;}
+  .dp-body{display:flex;flex-direction:column;gap:2px;min-width:0;}
+  .dp-name{font-weight:700;font-size:14px;}
+  .dp-sub{font-size:12px;color:var(--ink-dim);}
+  .dp-warn{font-size:11px;color:var(--warn);}
+  .as-more{margin:4px 0 10px;}
+  .as-more summary{cursor:pointer;font-size:13px;color:var(--ink-dim);padding:6px 0;}
+
   .brand{display:flex;align-items:center;gap:10px;}
   .logo-mark{width:28px;height:28px;border-radius:8px;background:var(--amber);display:flex;
     align-items:center;justify-content:center;flex:none;}
@@ -858,20 +898,18 @@ async function renderForcedCheckin(){
   app.classList.add("app-full");
   app.innerHTML = "";
   let vehicles = [];
-  try{ vehicles = await api("/vehicles/available-for-checkin"); }catch(e){ toast(e.message); }
+  try{ vehicles = await api("/vehicles/available-for-checkin", {background:true}); }catch(e){ toast(e.message); }
   let selected = null;
   const wrap = el(`
     <div class="login-wrap">
       <div class="login-card" style="max-width:420px;">
         <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;">SCDC</b></div>
         <h1>เช็คอินรถก่อนเริ่มงาน</h1>
-        <p class="sub">คุณ ${state.employee_id} ยังไม่ได้ขึ้นรถ กรุณาเลือกรถและระบุ % แบตเตอรี่เริ่มต้น ก่อนใช้งานระบบ</p>
+        <p class="sub">คุณ ${state.employee_id} ยังไม่ได้ขึ้นรถ กรุณาเลือกรถก่อนใช้งานระบบ</p>
         <label>เลือกรถที่ยังไม่มีคนขับ</label>
         <div class="vehicle-pick-list" id="fc-list">
           ${vehicles.length === 0 ? '<div class="empty">ไม่มีรถว่างในขณะนี้ กรุณาติดต่อ Admin</div>' : ''}
         </div>
-        <label>แบตเตอรี่เริ่มต้น %</label>
-        ${batterySliderHTML("fc-battery", 80)}
         <button class="primary" id="fc-submit">ยืนยันเช็คอิน</button>
         <button class="ghost" id="fc-logout">ออกจากระบบ</button>
         <div id="fc-err"></div>
@@ -879,11 +917,10 @@ async function renderForcedCheckin(){
     </div>
   `);
   app.appendChild(wrap);
-  wireBatterySlider(wrap, "fc-battery");
   const list = wrap.querySelector("#fc-list");
   vehicles.forEach(v=>{
     const item = el(`<div class="vehicle-pick-item" data-id="${v.id}">
-      <div><div class="vp-main">${v.code}</div><div class="vp-sub">${v.vehicle_type} · แบต ${v.battery_level ?? '-'}%</div></div>
+      <div><div class="vp-main">${v.code}</div><div class="vp-sub">${v.vehicle_type}</div></div>
     </div>`);
     item.onclick = ()=>{
       selected = v.code;
@@ -898,7 +935,6 @@ async function renderForcedCheckin(){
     try{
       await api("/vehicles/check-in", {method:"POST", body: JSON.stringify({
         vehicle_code: selected,
-        battery_level: parseInt(wrap.querySelector("#fc-battery").value || "0"),
       })});
       toast("เช็คอินสำเร็จ");
       await bootstrap();
@@ -1028,6 +1064,9 @@ function renderShell(){
 function setTab(tab, subtab){
   state.tab = tab;
   state.subtab = subtab || "";
+  // Force the next renderContent() to actually run: the payload hasn't
+  // changed, but the screen must.
+  state._renderedSig = null;
   try{
     localStorage.setItem("scdc_tab", state.tab);
     localStorage.setItem("scdc_subtab", state.subtab);
@@ -1055,33 +1094,56 @@ async function renderContent(){
 }
 
 // ---------------- Task card ----------------
+// Facts shown as a single icon strip under the route. Each entry is
+// {icon, label, value}; empty ones are dropped so the strip never shows a
+// dangling divider.
+function cardFact(icon, label, value){
+  return `<div class="fact">
+    <div class="fact-ico">${icon}</div>
+    <div class="fact-txt"><div class="fact-l">${label}</div><div class="fact-v">${value}</div></div>
+  </div>`;
+}
+
+const ICO = {
+  box:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8 12 3 3 8l9 5 9-5Z"/><path d="M3 8v8l9 5 9-5V8"/><path d="m12 13v8"/></svg>`,
+  cal:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 11h18"/></svg>`,
+  clock: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
+  truck: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h11v9H3z"/><path d="M14 10h4l3 3v3h-7z"/><circle cx="7" cy="18" r="1.6"/><circle cx="17.5" cy="18" r="1.6"/></svg>`,
+  user:  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.4"/><path d="M5 20c0-3.6 3.1-5.6 7-5.6s7 2 7 5.6"/></svg>`,
+  phone: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M10 7h4"/><circle cx="12" cy="15" r="2"/></svg>`,
+  star:  `<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="m12 3 2.6 5.5 6 .8-4.4 4.2 1.1 6-5.3-2.9-5.3 2.9 1.1-6L3.4 9.3l6-.8z"/></svg>`,
+};
+
 function taskCard(t, actionsHtml, opts={}){
   const cls = statusClass(t.status);
-  const acceptedBadge = (t.status === "Assigned" && t.accepted_at) ? `<span class="accepted-badge">✓ รับงานแล้ว</span>` : "";
   const showRequester = opts.showRequester;
+  const driverLabel = t.driver_name || t.driver_employee_id
+    ? `${t.driver_name || t.driver_employee_id}${t.other_driver_count > 0 ? ' +' + t.other_driver_count : ''}`
+    : null;
+
+  const facts = [
+    cardFact(ICO.box, "พาเลท", t.pallet_qty),
+    t.request_type === "Booking" && t.scheduled_at
+      ? cardFact(ICO.cal, "นัดหมาย", fmtTime(t.scheduled_at))
+      : "",
+    cardFact(ICO.clock, "วันที่/เวลา", fmtTime(t.created_at)),
+    driverLabel ? cardFact(ICO.truck, "คนขับ", driverLabel + (t.vehicle_code ? ` · ${t.vehicle_code}` : "")) : "",
+    showRequester ? cardFact(ICO.user, "ผู้ขอ", t.requester_name || t.requester_employee_id || "-") : "",
+    showRequester ? cardFact(ICO.phone, "ติดต่อ", t.requester_contact || "-") : "",
+    t.rating ? cardFact(ICO.star, "คะแนน", "★".repeat(t.rating) + "☆".repeat(5 - t.rating)) : "",
+  ].filter(Boolean).join("");
+
   return `
     <div class="card ${cls}" data-id="${t.id}">
       <div class="card-top">
-        <span class="task-code mono">${t.task_code}</span>
+        <span class="task-code mono"><span class="tc-ico">${ICO.box}</span>${t.task_code}</span>
         <span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span>
       </div>
       ${t.blocked_reason ? `<div class="blocked-banner">⚠️ ถูกตีกลับ: ${t.blocked_reason}</div>` : ""}
       <div class="route">${t.from_location}<span class="arrow">→</span>${t.to_location}
-        <span style="font-weight:400;color:var(--ink-dim);font-size:12px;">(${t.task_type})</span>${acceptedBadge}</div>
-      ${t.request_type === "Booking" && t.scheduled_at ? `<div class="meta-row"><span>📅 นัดหมาย: <b>${fmtTime(t.scheduled_at)}</b></span></div>` : ""}
-      <div class="meta-row">
-        <span>พาเลท: <b>${t.pallet_qty}</b></span>
-        <span class="priority-${t.priority}">● ${PRIORITY_LABEL[t.priority] || t.priority}</span>
-        <span>${fmtTime(t.created_at)}</span>
-      </div>
-      <div class="meta-row">
-        <span>คนขับ: <b>${t.driver_name || t.driver_employee_id || '-'}${t.other_driver_count > 0 ? ' +'+t.other_driver_count : ''}</b></span>
-        <span>รถ: <b>${t.vehicle_code || '-'}</b></span>
-        ${t.estimated_arrival ? `<span>ETA: <b>${fmtTime(t.estimated_arrival)}</b></span>` : ""}
-      </div>
-      ${showRequester ? `<div class="meta-row"><span>ผู้ขอ: <b>${t.requester_name || t.requester_employee_id}</b></span><span>ติดต่อ: <b>${t.requester_contact || '-'}</b></span></div>` : ""}
+        <span class="route-type">(${t.task_type})</span></div>
+      <div class="fact-strip">${facts}</div>
       ${t.photo_url ? `<img class="thumb" data-photo-url="${t.photo_url}" />` : ""}
-      ${t.rating ? `<div class="meta-row"><span>คะแนน: <b style="color:var(--amber);">${"★".repeat(t.rating)}${"☆".repeat(5-t.rating)}</b></span></div>` : ""}
       ${actionsHtml ? `<div class="card-actions">${actionsHtml}</div>` : ""}
     </div>`;
 }
@@ -1153,9 +1215,11 @@ const OPTIMISTIC_PATCH = {
   "complete": () => ({status: "Completed"}),
   "resume":   () => ({status: "In Progress"}),
   "cancel":   () => ({status: "Cancelled"}),
-  "accept":   () => ({accepted_at: new Date().toISOString()}),
+  // Assignment starts the work — there is no accept tap any more, so the card
+  // should land on In Progress immediately rather than flashing "Assigned".
   "self-assign": (t) => ({
-    status: "Assigned",
+    status: "In Progress",
+    started_at: new Date().toISOString(),
     accepted_at: new Date().toISOString(),
     driver_employee_id: state.employee_id,
     driver_name: (state.me && state.me.full_name) || state.employee_id,
@@ -1539,9 +1603,8 @@ function openCreateTask(prefill){
           </div>
         </div>
         <label style="margin-top:14px;">จำนวนพาเลท</label>
-        ${dualSliderHTML("ct-pallet", 1, 1, 30, "พาเลท")}
-        <label>ความสำคัญ</label>
-        <select id="ct-priority"><option value="Normal">ปกติ</option><option value="High">สูง</option><option value="Low">ต่ำ</option></select>
+        <input id="ct-pallet" type="number" min="1" step="1" value="1" placeholder="จำนวนพาเลท" />
+
         <label>หมายเหตุ</label>
         <textarea id="ct-remark" rows="2" placeholder="ไม่บังคับ"></textarea>
         <button class="primary" id="ct-submit">ส่งคำขอ</button>
@@ -1549,7 +1612,6 @@ function openCreateTask(prefill){
     </div>
   `);
   document.body.appendChild(overlay);
-  wireDualSlider(overlay, "ct-pallet", 1, 30);
   overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#ct-type").onchange = (e)=>{
@@ -1590,10 +1652,8 @@ function openCreateTask(prefill){
   // change what's different this time.
   if(prefill){
     overlay.querySelector("#ct-bu").value = prefill.bu || BU_LIST[0];
-    overlay.querySelector("#ct-priority").value = prefill.priority || "Normal";
     overlay.querySelector("#ct-remark").value = prefill.remark || "";
     document.getElementById("ct-pallet").value = prefill.pallet_qty || 1;
-    document.getElementById("ct-pallet-num").value = prefill.pallet_qty || 1;
     ensureZones().then(zones=>{
       fromValue = {zone: prefill.from_zone, value: prefill.from_location};
       toValue = {zone: prefill.to_zone, value: prefill.to_location};
@@ -1616,7 +1676,6 @@ function openCreateTask(prefill){
         from_zone: fromValue.zone, from_location: fromValue.value,
         to_zone: toValue.zone, to_location: toValue.value,
         pallet_qty: parseInt(overlay.querySelector("#ct-pallet").value || "1"),
-        priority: overlay.querySelector("#ct-priority").value,
         remark: overlay.querySelector("#ct-remark").value,
       })});
       closeSheet(overlay);
@@ -1647,11 +1706,8 @@ function openEditTask(taskId){
           </div>
         </div>
         <label style="margin-top:14px;">จำนวนพาเลท</label>
-        ${dualSliderHTML("et-pallet", t.pallet_qty, 1, 30, "พาเลท")}
-        <label>ความสำคัญ</label>
-        <select id="et-priority">
-          ${["Normal","High","Low"].map(p=>`<option value="${p}" ${p===t.priority?"selected":""}>${PRIORITY_LABEL[p]}</option>`).join("")}
-        </select>
+        <input id="et-pallet" type="number" min="1" step="1" value="${t.pallet_qty}" />
+
         <label>หมายเหตุ</label>
         <textarea id="et-remark" rows="2">${t.remark || ''}</textarea>
         <button class="primary" id="et-submit">บันทึกการแก้ไข</button>
@@ -1659,7 +1715,6 @@ function openEditTask(taskId){
     </div>
   `);
   document.body.appendChild(overlay);
-  wireDualSlider(overlay, "et-pallet", 1, 30);
   overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
@@ -1699,7 +1754,6 @@ function openEditTask(taskId){
         from_zone: fromValue.zone, from_location: fromValue.value,
         to_zone: toValue.zone, to_location: toValue.value,
         pallet_qty: parseInt(overlay.querySelector("#et-pallet").value),
-        priority: overlay.querySelector("#et-priority").value,
         remark: overlay.querySelector("#et-remark").value,
       };
       if(isBooking){ body.scheduled_at = overlay.querySelector("#et-scheduled").value; }
@@ -1847,7 +1901,7 @@ async function renderPushSection(pushCard){
     return;
   }
   let status;
-  try{ status = await api("/push/status"); }catch(e){ status = {available:false, subscribed:false}; }
+  try{ status = await api("/push/status", {background:true}); }catch(e){ status = {available:false, subscribed:false}; }
 
   pushCard.appendChild(el(pushDiagnosticsHTML(status)));
 
@@ -1963,8 +2017,7 @@ function renderDriverTab(main){
       mine.forEach(t=>{
         const amPrimary = t.driver_employee_id === state.employee_id;
         let actions = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
-        if(t.status === "Assigned" && amPrimary && !t.accepted_at) actions = `<button class="btn amber" data-accept="${t.id}">รับงาน</button>` + actions;
-        else if(t.status === "Assigned" && amPrimary && t.accepted_at) actions = `<button class="btn green" data-action="start">เริ่มงาน</button>` + actions;
+        if(t.status === "Assigned" && amPrimary) actions = `<button class="btn green" data-action="start">เริ่มงาน</button>` + actions;
         else if(t.status === "In Progress") actions = `<button class="btn green" data-action="complete">เสร็จงาน</button>
           <button class="btn" data-pause="${t.id}">หยุดชั่วคราว</button>` + actions;
         else if(t.status === "Pause") actions = `<button class="btn amber" data-action="resume">ทำงานต่อ</button>` + actions;
@@ -1972,7 +2025,6 @@ function renderDriverTab(main){
         main.appendChild(el(taskCard(t, actions)));
       });
       bindCardActions(main);
-      main.querySelectorAll("[data-accept]").forEach(b=> b.onclick = ()=> openBatterySheet(b.dataset.accept, "accept"));
       main.querySelectorAll("[data-pause]").forEach(b=> b.onclick = ()=> openPauseSheet(b.dataset.pause));
       main.querySelectorAll("[data-leave]").forEach(b=>{
         b.onclick = async ()=>{
@@ -2117,8 +2169,6 @@ function openVehicleCheckSheet(){
         <div class="field-note" style="margin-bottom:10px;">${meVehicle ? 'รถปัจจุบัน: <b>'+meVehicle.code+'</b>' : 'ยังไม่ได้เช็คอินรถ'}</div>
         <label>เลือกรถ (แสดงเฉพาะรถที่ยังไม่มีคนขับ)</label>
         <select id="vc-vehicle"><option value="">กำลังโหลด...</option></select>
-        <label>แบตเตอรี่ %</label>
-        ${batterySliderHTML("vc-battery", 100)}
         <div class="grid2" style="margin-top:10px;">
           <button class="btn amber" id="vc-checkin">เช็คอิน</button>
           <button class="btn red" id="vc-checkout" ${meVehicle ? '' : 'disabled'}>เช็คเอาท์</button>
@@ -2127,7 +2177,6 @@ function openVehicleCheckSheet(){
     </div>
   `);
   document.body.appendChild(overlay);
-  wireBatterySlider(overlay, "vc-battery");
   overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   (async ()=>{
@@ -2145,7 +2194,7 @@ function openVehicleCheckSheet(){
     if(!vehicle_code){ toast("กรุณาเลือกรถ"); return; }
     try{
       await api("/vehicles/check-in", {method:"POST", body: JSON.stringify({
-        vehicle_code, battery_level: parseInt(overlay.querySelector("#vc-battery").value || "0"),
+        vehicle_code,
       })});
       closeSheet(overlay);
       toast("เช็คอินสำเร็จ");
@@ -2293,7 +2342,7 @@ async function renderDriverHistory(main){
   async function loadStats(){
     const dateVal = statCard.querySelector("#dh-date").value;
     try{
-      const res = await api(`/drivers/me/stats?period=${period}&date=${dateVal}`);
+      const res = await api(`/drivers/me/stats?period=${period}&date=${dateVal}`, {background:true});
       statCard.querySelector("#dh-count").textContent = res.task_count;
       statCard.querySelector("#dh-pallet").textContent = res.pallet_total;
     }catch(e){ toast(e.message); }
@@ -2321,24 +2370,20 @@ async function renderDriverHistory(main){
 
 function openBatterySheet(taskId, mode){
   const title = mode === "self-assign" ? "รับงานด้วยตัวเอง" : mode === "take-over" ? "รับช่วงงานนี้"
-    : mode === "join" ? "เข้าร่วมงานนี้" : "รับงาน (Accept)";
+    : mode === "join" ? "เข้าร่วมงานนี้" : "ยืนยัน";
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
         <div class="sheet-head"><h2>${title}</h2><button id="sh-close">✕</button></div>
-        <div class="field-note">กรุณาระบุระดับแบตเตอรี่ปัจจุบันของรถ</div>
-        <label>แบตเตอรี่ %</label>
-        ${batterySliderHTML("bt-battery", 80)}
+        <div class="field-note">จะใช้รถคันที่คุณเช็คอินไว้โดยอัตโนมัติ</div>
         <button class="primary" id="bt-submit">ยืนยัน</button>
       </div>
     </div>
   `);
   document.body.appendChild(overlay);
-  wireBatterySlider(overlay, "bt-battery");
   overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#bt-submit").onclick = async ()=>{
-    const battery_level = parseInt(overlay.querySelector("#bt-battery").value || "0");
     const endpoint = mode === "self-assign" ? `/tasks/${taskId}/self-assign`
       : mode === "take-over" ? `/tasks/${taskId}/take-over`
       : mode === "join" ? `/tasks/${taskId}/join` : `/tasks/${taskId}/accept`;
@@ -2351,7 +2396,7 @@ function openBatterySheet(taskId, mode){
       id: taskId,
       key: mode,
       patch: OPTIMISTIC_PATCH[mode],
-      run: ()=> api(endpoint, {method:"POST", body: JSON.stringify({battery_level})}),
+      run: ()=> api(endpoint, {method:"POST", body: JSON.stringify({})}),
       successMsg: mode === "self-assign" ? "รับงานแล้ว" : "สำเร็จ",
     });
   };
@@ -2508,7 +2553,7 @@ async function renderAdminDashboard(main){
 
   async function loadDashboard(){
     try{
-      const ov = await api(`/dashboard/overview?period=${state.dashPeriod}`);
+      const ov = await api(`/dashboard/overview?period=${state.dashPeriod}`, {background:true});
       jobsCard.innerHTML = ""; jobsCard.appendChild(buildKpiGrid(ov, JOB_KEYS));
       perfCard.innerHTML = ""; perfCard.appendChild(buildKpiGrid(ov, PERF_KEYS));
     }catch(e){
@@ -2516,7 +2561,7 @@ async function renderAdminDashboard(main){
       perfCard.innerHTML = ""; perfCard.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`));
     }
     try{
-      const vol = await api("/dashboard/task-volume?days=7");
+      const vol = await api("/dashboard/task-volume?days=7", {background:true});
       chartCard.innerHTML = "";
       chartCard.appendChild(buildStackedBarChart(vol.series));
       const legend = el(`<div class="chip-row" style="margin-top:10px;">
@@ -2749,7 +2794,6 @@ function paintDispatch(board, driverPanel, queueBox, queueTitle){
         </div>
         <div style="text-align:right;flex:none;">
           ${waitBadge(mins)}
-          ${t.priority && t.priority !== "Normal" ? `<div style="margin-top:4px;"><span class="badge bad">${t.priority}</span></div>` : ""}
         </div>
       </div>
       <div class="dp-pickers" style="margin-top:10px;"></div>
@@ -2892,7 +2936,7 @@ function renderOperationJobs(main){
     } else if(["Assigned","In Progress","Pause"].includes(t.status)){
       actions = `<button class="btn blue" data-reassign="${t.id}">มอบหมายใหม่</button>
         <button class="btn green" data-add-driver="${t.id}">+ เพิ่มคนขับ</button>
-        <button class="btn purple" data-priority="${t.id}">ความสำคัญ</button>${actions}
+${actions}
         ${t.status !== "Assigned" ? `<button class="btn green" data-admin-complete="${t.id}">ทำเครื่องหมายเสร็จ</button>` : ""}
         <button class="btn red" data-action="cancel">ยกเลิก</button>`;
     }
@@ -2908,7 +2952,6 @@ function renderOperationJobs(main){
       catch(e){ toast(e.message); }
     };
   });
-  main.querySelectorAll("[data-priority]").forEach(b=> b.onclick = ()=> openPrioritySheet(b.dataset.priority));
   main.querySelectorAll("[data-sendback]").forEach(b=> b.onclick = ()=> openSendBackSheet(b.dataset.sendback));
   bindCardActions(main);
   bindCardClickToDetail(main);
@@ -3043,30 +3086,64 @@ function openVehicleEditSheet(vehicleId){
 }
 
 async function openAssignSheet(taskId, isReassign){
-  let selectedDriver = null;
+  // Multi-select: the admin picks the whole crew for a job in one pass and
+  // confirms once, instead of assigning one driver and then adding the rest
+  // through a second flow.
+  //
+  // Every driver is listed — not just the ones who pass the licence/zone
+  // check — because the admin asked to see everyone. Those who don't meet the
+  // conditions are still marked with the reason and still selectable; picking
+  // one just asks for confirmation first rather than being silently blocked.
+  const selected = new Set();
+  const task = findTask(taskId);
+
+  function issuesFor(d){
+    const out = [];
+    if(!d.checked_in_vehicle_id) return ["ยังไม่ได้เช็คอินรถ"];
+    if(d.driver_status !== "Available") out.push(DRIVER_STATUS_LABEL[d.driver_status] || d.driver_status);
+    const v = state.vehicles.find(x=> x.id === d.checked_in_vehicle_id);
+    const vt = v && v.vehicle_type;
+    const lic = (d.license_types || "").split(",").map(s=>s.trim()).filter(Boolean);
+    if(vt && lic.length && !lic.includes(vt)) out.push(`ไม่มีใบอนุญาตรถ ${vt}`);
+    return out;
+  }
+
+  const rows = (state.drivers || []).map(d=>{
+    const v = state.vehicles.find(x=> x.id === d.checked_in_vehicle_id);
+    return {
+      emp: d.employee_id,
+      name: d.full_name || d.employee_id,
+      vehicleType: v ? v.vehicle_type : null,
+      vehicleCode: v ? v.code : null,
+      issues: issuesFor(d),
+      canPick: !!d.checked_in_vehicle_id,
+    };
+  });
+
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>${isReassign ? "มอบหมายใหม่" : "มอบหมายงาน"} #${taskId}</h2><button id="sh-close">✕</button></div>
-        <div class="field-note">รถจะใช้คันที่คนขับเช็คอินไว้โดยอัตโนมัติ ไม่ต้องเลือกเอง</div>
-        <div id="as-selected" class="info" style="display:none;"></div>
-        <label>ETA (นาทีจากนี้ ไม่บังคับ)</label>
-        <input id="as-eta" type="number" min="1" placeholder="เช่น 20" />
-        <label>เหตุผล ${isReassign ? "(ระบุบริบท เช่น รถเสีย)" : "(ไม่บังคับ)"}</label>
-        <textarea id="as-reason" rows="2" placeholder="เช่น คนขับเดิมแจ้งรถขัดข้อง"></textarea>
-        <label>ค้นหาคนขับ</label>
-        <input id="as-driver-search" placeholder="พิมพ์ชื่อหรือรหัสพนักงาน..." />
-        <div class="suggest-box" id="as-driver-list"><b>คนขับทั้งหมด (เลือกได้แม้ไม่ว่าง)</b>
-          ${state.drivers.map(d=>{
-            const dv = state.vehicles.find(v=> v.id === d.checked_in_vehicle_id);
-            const badgeClass = d.driver_status === "Available" ? "ok" : d.driver_status === "Breakdown" ? "bad" : "warn";
-            return `<div class="suggest-item" data-driver-name="${(d.full_name||d.employee_id).toLowerCase()} ${d.employee_id.toLowerCase()}">
-              <span>${d.full_name || d.employee_id} <span class="badge ${badgeClass}">${DRIVER_STATUS_LABEL[d.driver_status]||d.driver_status}</span><br/>
-              <span style="color:var(--ink-dim)">สิทธิ์: ${d.license_types||'-'} ${dv ? '· รถ: '+dv.code : '· ยังไม่ได้เช็คอินรถ'}</span></span>
-              <button class="btn use-btn" data-pick-driver="${d.employee_id}" ${!dv ? "disabled" : ""}>เลือก</button>
-            </div>`;
-          }).join("")}
+        <div class="sheet-head"><h2>${isReassign ? "มอบหมายใหม่" : "มอบหมายงาน"}${task ? " " + task.task_code : ""}</h2><button id="sh-close">✕</button></div>
+        <div class="field-note">เลือกได้หลายคน · รถจะใช้คันที่คนขับเช็คอินไว้โดยอัตโนมัติ</div>
+        <input id="as-driver-search" placeholder="ค้นหาชื่อหรือรหัสพนักงาน..." />
+        <div class="driver-pick-list" id="as-driver-list">
+          ${rows.map(r=>`
+            <label class="driver-pick ${r.canPick ? "" : "is-blocked"}" data-search="${(r.name + " " + r.emp).toLowerCase()}">
+              <input type="checkbox" data-pick="${r.emp}" ${r.canPick ? "" : "disabled"} />
+              <span class="dp-body">
+                <span class="dp-name">${r.name}</span>
+                <span class="dp-sub">${r.vehicleType ? `${r.vehicleType}${r.vehicleCode ? " · " + r.vehicleCode : ""}` : "ยังไม่ได้เช็คอินรถ"}</span>
+                ${r.issues.length && r.canPick ? `<span class="dp-warn">⚠ ${r.issues.join(" · ")}</span>` : ""}
+              </span>
+            </label>`).join("")}
         </div>
+        <details class="as-more">
+          <summary>ตัวเลือกเพิ่มเติม</summary>
+          <label>ETA (นาทีจากนี้ ไม่บังคับ)</label>
+          <input id="as-eta" type="number" min="1" placeholder="เช่น 20" />
+          <label>เหตุผล ${isReassign ? "(ระบุบริบท เช่น รถเสีย)" : "(ไม่บังคับ)"}</label>
+          <textarea id="as-reason" rows="2" placeholder="เช่น คนขับเดิมแจ้งรถขัดข้อง"></textarea>
+        </details>
         <div id="as-eligibility"></div>
         <button class="primary" id="as-submit">${isReassign ? "ยืนยันมอบหมายใหม่" : "ยืนยันมอบหมาย"}</button>
       </div>
@@ -3076,43 +3153,60 @@ async function openAssignSheet(taskId, isReassign){
   overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
-  function pickDriver(empId){
-    const d = state.drivers.find(x=> x.employee_id === empId);
-    const dv = d && state.vehicles.find(v=> v.id === d.checked_in_vehicle_id);
-    if(!dv){ toast("คนขับคนนี้ยังไม่ได้เช็คอินรถ"); return; }
-    selectedDriver = empId;
-    const box = overlay.querySelector("#as-selected");
-    box.style.display = "block";
-    box.textContent = `เลือกแล้ว: ${d.full_name || d.employee_id} · รถ ${dv.code}`;
+  const submitBtn = overlay.querySelector("#as-submit");
+  function syncSubmit(){
+    submitBtn.textContent = selected.size
+      ? `${isReassign ? "ยืนยันมอบหมายใหม่" : "ยืนยันมอบหมาย"} (${selected.size} คน)`
+      : (isReassign ? "ยืนยันมอบหมายใหม่" : "ยืนยันมอบหมาย");
   }
-  overlay.querySelectorAll("[data-pick-driver]").forEach(b=> b.onclick = ()=> pickDriver(b.dataset.pickDriver));
+  overlay.querySelectorAll("[data-pick]").forEach(cb=>{
+    cb.onchange = ()=>{
+      if(cb.checked) selected.add(cb.dataset.pick); else selected.delete(cb.dataset.pick);
+      cb.closest(".driver-pick").classList.toggle("is-on", cb.checked);
+      syncSubmit();
+    };
+  });
   overlay.querySelector("#as-driver-search").addEventListener("input", (e)=>{
     const q = e.target.value.trim().toLowerCase();
-    overlay.querySelectorAll("#as-driver-list [data-driver-name]").forEach(row=>{
-      row.style.display = row.dataset.driverName.includes(q) ? "" : "none";
+    overlay.querySelectorAll("#as-driver-list [data-search]").forEach(row=>{
+      row.style.display = row.dataset.search.includes(q) ? "" : "none";
     });
   });
 
   async function submit(force){
-    if(!selectedDriver){ toast("กรุณาเลือกคนขับก่อน"); return; }
+    if(!selected.size){ toast("กรุณาเลือกคนขับอย่างน้อย 1 คน"); return; }
+    const picked = [...selected];
+    if(!force){
+      // Selecting someone who doesn't meet the conditions is allowed, but not
+      // by accident — name who and why before going ahead.
+      const flagged = rows.filter(r=> picked.includes(r.emp) && r.issues.length);
+      if(flagged.length){
+        const detail = flagged.map(r=> `${r.name}: ${r.issues.join(", ")}`).join("\n");
+        if(!confirm(`คนขับต่อไปนี้ไม่ตรงเงื่อนไข\n\n${detail}\n\nยืนยันมอบหมายหรือไม่?`)) return;
+        force = true;
+      }
+    }
     const body = {
-      driver_employee_id: selectedDriver,
+      driver_employee_ids: picked,
       reason: overlay.querySelector("#as-reason").value.trim(),
       force: !!force,
     };
     const etaVal = overlay.querySelector("#as-eta").value;
     if(etaVal) body.estimated_minutes = parseInt(etaVal);
+    submitBtn.disabled = true;
     try{
       await api(`/tasks/${taskId}/${isReassign ? "reassign" : "assign"}`, {method:"POST", body: JSON.stringify(body)});
       closeSheet(overlay);
-      toast(isReassign ? "มอบหมายใหม่แล้ว" : "มอบหมายแล้ว");
+      toast(isReassign ? "มอบหมายใหม่แล้ว" : `มอบหมายให้ ${picked.length} คนแล้ว`);
       await refreshAll();
+      if(typeof refreshDispatchBoard === "function") await refreshDispatchBoard();
     }catch(e){
+      submitBtn.disabled = false;
       if(e.status === 409){
         const box = overlay.querySelector("#as-eligibility");
         box.innerHTML = "";
         box.appendChild(el(`<div class="err">${e.message}</div>`));
-        const overrideBtn = el(`<button class="btn amber" style="width:100%;margin-top:8px;" id="as-force">ยืนยันมอบหมายทั้งที่ไม่ตรงเงื่อนไข</button>`);
+        const overrideBtn = el(`<button class="btn amber" style="width:100%;margin-top:8px;">ยืนยันมอบหมายทั้งที่ไม่ตรงเงื่อนไข</button>`);
         overrideBtn.onclick = ()=> submit(true);
         box.appendChild(overrideBtn);
       } else {
@@ -3120,7 +3214,7 @@ async function openAssignSheet(taskId, isReassign){
       }
     }
   }
-  overlay.querySelector("#as-submit").onclick = ()=> submit(false);
+  submitBtn.onclick = ()=> submit(false);
 }
 
 function renderOperationPeople(main){
@@ -3214,14 +3308,20 @@ function openCreateDriverSheet(){
   overlay.querySelector("#nd-submit").onclick = async ()=>{
     const types = Array.from(overlay.querySelectorAll('input[type=checkbox]:checked')).map(c=>c.value);
     try{
-      await api("/admin/drivers", {method:"POST", body: JSON.stringify({
+      const res = await api("/admin/drivers", {method:"POST", body: JSON.stringify({
         employee_id: overlay.querySelector("#nd-emp").value.trim(),
         email: overlay.querySelector("#nd-email").value.trim() || null,
         full_name: overlay.querySelector("#nd-name").value.trim(),
         initial_vehicle_types: types,
       })});
       closeSheet(overlay);
-      toast("สร้างบัญชีคนขับแล้ว"); await refreshAll();
+      // Say plainly when an employee id belonged to a deleted account: the
+      // person comes back with their old work history attached, which the
+      // admin should know rather than discover later in a report.
+      toast(res && res.reactivated
+        ? "กู้คืนบัญชีที่เคยถูกลบ พร้อมประวัติงานเดิม"
+        : "สร้างบัญชีคนขับแล้ว");
+      await refreshAll();
     }catch(e){ toast(e.message); }
   };
 }
@@ -3275,7 +3375,7 @@ function renderOperationVehicles(main){
     filtered.forEach(v=>{
       const badgeClass = v.status === "Available" ? "ok" : v.status === "Breakdown" ? "bad" : "warn";
       list.appendChild(el(`<div class="list-row">
-        <div><div class="l-main">${v.code}</div><div class="l-sub">${v.vehicle_type} · แบต ${v.battery_level ?? '-'}%</div></div>
+        <div><div class="l-main">${v.code}</div><div class="l-sub">${v.vehicle_type}</div></div>
         <div style="display:flex;align-items:center;gap:6px;">
           <span class="badge ${badgeClass}">${v.status === 'Available' ? 'ว่าง' : v.status === 'Busy' ? 'ไม่ว่าง' : v.status === 'Breakdown' ? 'ขัดข้อง' : v.status}</span>
           <button class="btn sm" data-edit-vehicle="${v.id}">แก้ไข</button>
@@ -3642,7 +3742,7 @@ function renderAdminSettings(main){
     main.appendChild(card);
     (async ()=>{
       try{
-        const data = await api("/vehicle-type-zones");
+        const data = await api("/vehicle-type-zones", {background:true});
         card.innerHTML = "";
         const table = el(`<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12.5px;">
           <thead><tr><th style="text-align:left;padding:6px;"></th>
@@ -3737,8 +3837,7 @@ function buildTaskDetailActions(t){
     const amPrimary = t.driver_employee_id === state.employee_id;
     const leaveBtn = ["Assigned","In Progress","Pause"].includes(t.status) ? `<button class="btn red" data-leave="${t.id}">ออกจากงาน</button>` : "";
     if(mine){
-      if(t.status === "Assigned" && amPrimary && !t.accepted_at) return `<button class="btn amber" data-accept="${t.id}">รับงาน</button>${isChat}${leaveBtn}`;
-      if(t.status === "Assigned" && amPrimary && t.accepted_at) return `<button class="btn green" data-action="start">เริ่มงาน</button>${isChat}${leaveBtn}`;
+      if(t.status === "Assigned" && amPrimary) return `<button class="btn green" data-action="start">เริ่มงาน</button>${isChat}${leaveBtn}`;
       if(t.status === "In Progress") return `<button class="btn green" data-action="complete">เสร็จงาน</button><button class="btn" data-pause="${t.id}">หยุดชั่วคราว</button>${isChat}${leaveBtn}`;
       if(t.status === "Pause") return `<button class="btn amber" data-action="resume">ทำงานต่อ</button>${isChat}${leaveBtn}`;
       return `${isChat}${leaveBtn}`;
@@ -3749,7 +3848,7 @@ function buildTaskDetailActions(t){
   }
   if(state.role === "ADMIN"){
     if(t.status === "Waiting") return `<button class="btn amber" data-assign="${t.id}">มอบหมายงาน</button>`;
-    if(["Assigned","In Progress","Pause"].includes(t.status)) return `<button class="btn blue" data-reassign="${t.id}">มอบหมายใหม่</button><button class="btn green" data-add-driver="${t.id}">+ เพิ่มคนขับ</button><button class="btn purple" data-priority="${t.id}">ความสำคัญ</button>${isChat}${t.status !== "Assigned" ? `<button class="btn green" data-admin-complete="${t.id}">ทำเครื่องหมายเสร็จ</button>` : ""}<button class="btn red" data-action="cancel">ยกเลิก</button>`;
+    if(["Assigned","In Progress","Pause"].includes(t.status)) return `<button class="btn blue" data-reassign="${t.id}">มอบหมายใหม่</button><button class="btn green" data-add-driver="${t.id}">+ เพิ่มคนขับ</button>${isChat}${t.status !== "Assigned" ? `<button class="btn green" data-admin-complete="${t.id}">ทำเครื่องหมายเสร็จ</button>` : ""}<button class="btn red" data-action="cancel">ยกเลิก</button>`;
     return isChat;
   }
   return "";
@@ -3759,7 +3858,6 @@ function bindTaskDetailActions(container){
   bindCardActions(container);
   container.querySelectorAll("[data-edit]").forEach(b=> b.onclick = ()=> openEditTask(b.dataset.edit));
   container.querySelectorAll("[data-photo]").forEach(b=> b.onclick = ()=> openPhotoUpload(b.dataset.photo));
-  container.querySelectorAll("[data-accept]").forEach(b=> b.onclick = ()=> openBatterySheet(b.dataset.accept, "accept"));
   container.querySelectorAll("[data-pause]").forEach(b=> b.onclick = ()=> openPauseSheet(b.dataset.pause));
   container.querySelectorAll("[data-self-assign]").forEach(b=> b.onclick = ()=> openBatterySheet(b.dataset.selfAssign, "self-assign"));
   container.querySelectorAll("[data-take-over]").forEach(b=> b.onclick = ()=> openBatterySheet(b.dataset.takeOver, "take-over"));
@@ -3781,7 +3879,6 @@ function bindTaskDetailActions(container){
       catch(e){ toast(e.message); }
     };
   });
-  container.querySelectorAll("[data-priority]").forEach(b=> b.onclick = ()=> openPrioritySheet(b.dataset.priority));
   container.querySelectorAll("[data-rate]").forEach(b=> b.onclick = ()=> openRatingSheet(b.dataset.rate));
 }
 
@@ -4019,6 +4116,17 @@ function renderTeamChat(main){
 }
 
 // ---------------- Data refresh (simple polling = "real-time enough") ----------------
+// Cheap non-cryptographic hash, just to tell "same payload" from "changed".
+function _sig(s){
+  let h = 5381;
+  for(let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return h + ":" + s.length;
+}
+
+// Even with identical data, repaint occasionally so elapsed-time labels
+// ("รอมา 12 นาที", "ติดงานมา 30 นาที") don't freeze on screen.
+const FORCE_RENDER_AFTER_MS = 120000;
+
 let _refreshAbort = null;
 async function refreshAll(opts={}){
   // One combined request instead of ~14 separate ones. The scope tells the
@@ -4045,6 +4153,7 @@ async function refreshAll(opts={}){
     Object.assign(state, d);
     state.consecutiveFailures = 0;
     state.lastUpdated = new Date();
+    state._payloadSig = _sig(JSON.stringify(d));
     hideConnBanner();
   }catch(e){
     // Superseded by a newer refresh — not a failure, and the newer one owns
@@ -4067,8 +4176,20 @@ async function refreshAll(opts={}){
     // dashboard reloads when opened, when the period changes, or via its own
     // manual/pull-to-refresh.
     const onAdminDashboard = state.role === "ADMIN" && state.tab === "dashboard";
-    if(!userIsTypingInMain() && !onAdminDashboard){
+    // Third condition, and the important one for how the app FEELS: if the
+    // payload is byte-identical to the last one we rendered, there is nothing
+    // to repaint. Most polls return unchanged data, and rebuilding the whole
+    // tab body anyway was both the jank and the cause of the extra requests —
+    // several tab renderers fetch their own data as part of rendering, so a
+    // pointless repaint also meant a pointless round-trip with the loading bar
+    // switched on. A manual refresh always repaints; so does a screen that has
+    // gone stale enough for its elapsed-time labels to be wrong.
+    const unchanged = state._payloadSig && state._payloadSig === state._renderedSig;
+    const stale = !state._lastRenderAt || (Date.now() - state._lastRenderAt) > FORCE_RENDER_AFTER_MS;
+    if(!userIsTypingInMain() && !onAdminDashboard && (opts.visible || !unchanged || stale)){
       renderContent();
+      state._renderedSig = state._payloadSig;
+      state._lastRenderAt = Date.now();
     }
     const bell = document.getElementById("bell");
     if(bell){
