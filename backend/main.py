@@ -90,6 +90,7 @@ TASK_STATUS_LABEL_TH = {
     "Waiting": "รอรับงาน", "Assigned": "มอบหมายแล้ว", "In Progress": "กำลังดำเนินการ",
     "Pause": "หยุดชั่วคราว", "Completed": "เสร็จสิ้น", "Cancelled": "ยกเลิกแล้ว",
 }
+PRIORITY_LABEL_TH = {"Normal": "ปกติ", "Urgent": "ด่วน", "Critical": "ด่วนมาก"}
 DRIVER_STATUS_LABEL_TH = {
     "Available": "ว่าง", "Busy": "ติดงาน", "Breakdown": "รถเสีย", "Offline": "ออฟไลน์",
 }
@@ -1051,7 +1052,7 @@ def check_waiting_too_long(db):
         "SELECT * FROM tasks WHERE status='Waiting' AND waiting_alert_sent=0 AND created_at<?", (cutoff,)
     ).fetchall()
     for t in rows:
-        notify_admins(db, f"Task {t['task_code']} has been waiting over {WAITING_TOO_LONG_MINUTES} min", t["id"])
+        notify_admins(db, f"งาน {t['task_code']} รอนานเกิน {WAITING_TOO_LONG_MINUTES} นาทีแล้ว", t["id"])
         db.execute("UPDATE tasks SET waiting_alert_sent=1 WHERE id=?", (t["id"],))
 
 
@@ -1698,7 +1699,7 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER"))):
             "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
             "VALUES (?,?,?,?,?)", (task_id, None, "Waiting", user["id"], now_iso()),
         )
-        notify_admins(db, f"New task {code} created by {user['employee_id']}", task_id)
+        notify_admins(db, f"งานใหม่ {code} สร้างโดย {user['employee_id']}", task_id)
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         result = task_to_dict(row, db, viewer_role=user["role"])
         available = db.execute(
@@ -1779,7 +1780,7 @@ def change_priority(task_id: int, body: PriorityBody, user=Depends(require_role(
         old = row["priority"]
         db.execute("UPDATE tasks SET priority=? WHERE id=?", (body.priority, task_id))
         audit(db, user["id"], "change_priority", f"task {row['task_code']}: {old} -> {body.priority}")
-        notify(db, row["requester_id"], f"Task {row['task_code']} priority changed to {body.priority}", task_id)
+        notify(db, row["requester_id"], f"งาน {row['task_code']} เปลี่ยนความสำคัญเป็น {PRIORITY_LABEL_TH.get(body.priority, body.priority)}", task_id)
         return {"ok": True}
 
 
@@ -1869,9 +1870,9 @@ def cancel_task(task_id: int, reason: Optional[str] = None, user=Depends(current
             "WHERE task_id=? AND assignment_status='Active'", (now_iso(), task_id),
         )
         audit(db, user["id"], "cancel_task", f"task {row['task_code']}: {reason or ''}")
-        notify(db, row["requester_id"], f"Task {row['task_code']} was cancelled", task_id)
+        notify(db, row["requester_id"], f"งาน {row['task_code']} ถูกยกเลิก", task_id)
         if row["current_driver_id"]:
-            notify(db, row["current_driver_id"], f"Task {row['task_code']} was cancelled", task_id)
+            notify(db, row["current_driver_id"], f"งาน {row['task_code']} ถูกยกเลิก", task_id)
         return {"ok": True}
 
 
@@ -1962,7 +1963,7 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
         for d in displaced:
             if d["driver_id"] == driver["id"]:
                 continue  # same driver being re-confirmed onto the task, nothing to free/notify
-            notify(db, d["driver_id"], f"You were unassigned from task {task_row['task_code']}", task_row["id"])
+            notify(db, d["driver_id"], f"คุณถูกถอดออกจากงาน {task_row['task_code']}", task_row["id"])
             free_up_driver_and_vehicle(db, d["driver_id"], d["vehicle_id"])
         if task_row["status"] == "Assigned":
             db.execute("UPDATE tasks SET accepted_at=NULL WHERE id=?", (task_row["id"],))
@@ -2003,10 +2004,10 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
             (task_row["id"], "Waiting", "Assigned", assigned_by_id, now_iso()),
         )
 
-    notify(db, driver["id"], f"Task {task_row['task_code']} assigned to you", task_row["id"])
-    notify(db, task_row["requester_id"], f"Task {task_row['task_code']} assigned to a driver", task_row["id"])
+    notify(db, driver["id"], f"คุณได้รับมอบหมายงาน {task_row['task_code']}", task_row["id"])
+    notify(db, task_row["requester_id"], f"งาน {task_row['task_code']} มอบหมายให้คนขับแล้ว", task_row["id"])
     if is_reassign:
-        notify_admins(db, f"Task {task_row['task_code']} reassigned to {driver['employee_id']}", task_row["id"])
+        notify_admins(db, f"งาน {task_row['task_code']} มอบหมายใหม่ให้ {driver['employee_id']}", task_row["id"])
 
 
 @app.post("/tasks/{task_id}/assign")
@@ -2085,7 +2086,7 @@ def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_ro
         db.execute("UPDATE tasks SET accepted_at=?, accept_battery_level=? WHERE id=?",
                    (now_iso(), body.battery_level, task_id))
         db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
-        notify_admins(db, f"Driver {user['employee_id']} self-assigned task {row['task_code']}", task_id)
+        notify_admins(db, f"คนขับ {user['employee_id']} รับงาน {row['task_code']} ด้วยตัวเอง", task_id)
         return {"ok": True}
 
 
@@ -2114,7 +2115,7 @@ def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_role
         db.execute("UPDATE tasks SET accepted_at=?, accept_battery_level=? WHERE id=?",
                    (now_iso(), body.battery_level, task_id))
         db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
-        notify_admins(db, f"Driver {user['employee_id']} took over task {row['task_code']}", task_id)
+        notify_admins(db, f"คนขับ {user['employee_id']} รับช่วงงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -2138,8 +2139,8 @@ def accept_task(task_id: int, body: AcceptBody, user=Depends(require_role("DRIVE
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if row["current_vehicle_id"]:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, row["current_vehicle_id"]))
-        notify(db, row["requester_id"], f"Driver accepted task {row['task_code']}", task_id)
-        notify_admins(db, f"Driver {user['employee_id']} accepted task {row['task_code']}", task_id)
+        notify(db, row["requester_id"], f"คนขับกดรับงาน {row['task_code']} แล้ว", task_id)
+        notify_admins(db, f"คนขับ {user['employee_id']} กดรับงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -2155,7 +2156,7 @@ def start_task(task_id: int, user=Depends(require_role("DRIVER"))):
             raise HTTPException(400, "ต้องกดรับงานก่อนจึงจะเริ่มงานได้")
         transition(db, row, "In Progress", user["id"])
         db.execute("UPDATE tasks SET started_at=? WHERE id=?", (now_iso(), task_id))
-        notify(db, row["requester_id"], f"Driver started task {row['task_code']}", task_id)
+        notify(db, row["requester_id"], f"คนขับเริ่มงาน {row['task_code']} แล้ว", task_id)
         return {"ok": True}
 
 
@@ -2184,7 +2185,7 @@ def complete_task(task_id: int, user=Depends(require_role("DRIVER"))):
         if remaining == 0:
             transition(db, row, "Completed", user["id"])
             db.execute("UPDATE tasks SET completed_at=? WHERE id=?", (now_iso(), task_id))
-            notify(db, row["requester_id"], f"Task {row['task_code']} completed", task_id)
+            notify(db, row["requester_id"], f"งาน {row['task_code']} เสร็จสิ้นแล้ว", task_id)
         else:
             # Someone else is still working; if the "primary" driver shown on the task
             # just finished, hand the primary slot to another still-active driver.
@@ -2197,8 +2198,8 @@ def complete_task(task_id: int, user=Depends(require_role("DRIVER"))):
                     db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
                                (nxt["driver_id"], nxt["vehicle_id"], task_id))
             notify(db, row["requester_id"],
-                   f"Driver {user['employee_id']} finished their part of task {row['task_code']} "
-                   f"({remaining} still working)", task_id)
+                   f"คนขับ {user['employee_id']} ทำงาน {row['task_code']} ส่วนของตนเสร็จแล้ว "
+                   f"(ยังมีคนขับอีก {remaining} คนทำอยู่)", task_id)
         return {"ok": True}
 
 
@@ -2227,7 +2228,7 @@ def admin_complete_task(task_id: int, user=Depends(require_role("ADMIN"))):
         transition(db, row, "Completed", user["id"], note="Force-completed by admin")
         db.execute("UPDATE tasks SET completed_at=? WHERE id=?", (now_iso(), task_id))
         audit(db, user["id"], "admin_complete_task", f"task {row['task_code']}")
-        notify(db, row["requester_id"], f"Task {row['task_code']} marked completed by admin", task_id)
+        notify(db, row["requester_id"], f"งาน {row['task_code']} ถูกปิดงานโดยแอดมิน", task_id)
         return {"ok": True}
 
 
@@ -2269,8 +2270,8 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_role("DRIVE
             raise HTTPException(409, "คุณเพิ่งเข้าร่วมงานนี้ไปแล้ว (อาจเกิดจากกดซ้ำ)")
         db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
         db.execute("UPDATE vehicles SET status='Busy', battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
-        notify(db, row["requester_id"], f"Driver {user['employee_id']} joined task {row['task_code']}", task_id)
-        notify_admins(db, f"Driver {user['employee_id']} joined task {row['task_code']}", task_id)
+        notify(db, row["requester_id"], f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
+        notify_admins(db, f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -2312,8 +2313,8 @@ def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_rol
             raise HTTPException(409, "คนขับคนนี้เพิ่งถูกเพิ่มเข้างานนี้ไปแล้ว (อาจเกิดจากกดซ้ำ)")
         db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
         db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
-        notify(db, driver["id"], f"You were added to task {row['task_code']}", task_id)
-        notify(db, row["requester_id"], f"Driver {driver['employee_id']} added to task {row['task_code']}", task_id)
+        notify(db, driver["id"], f"คุณถูกเพิ่มเข้างาน {row['task_code']}", task_id)
+        notify(db, row["requester_id"], f"เพิ่มคนขับ {driver['employee_id']} เข้างาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -2359,8 +2360,8 @@ def leave_task(task_id: int, user=Depends(require_role("DRIVER"))):
             if nxt:
                 db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
                            (nxt["driver_id"], nxt["vehicle_id"], task_id))
-        notify(db, row["requester_id"], f"Driver {user['employee_id']} left task {row['task_code']}", task_id)
-        notify_admins(db, f"Driver {user['employee_id']} left task {row['task_code']}", task_id)
+        notify(db, row["requester_id"], f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
+        notify_admins(db, f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -2414,8 +2415,8 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(require_role("DRIVER"
         # whole task.
         if body.category == "user":
             transition(db, row, "Pause", user["id"], note=note)
-            notify(db, row["requester_id"], f"Task {row['task_code']} paused: {body.reason}", task_id)
-            notify_admins(db, f"Task {row['task_code']} paused (user): {body.reason}", task_id)
+            notify(db, row["requester_id"], f"งาน {row['task_code']} หยุดชั่วคราว: {body.reason}", task_id)
+            notify_admins(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งผู้ขอ): {body.reason}", task_id)
             return {"ok": True}
 
         # A vehicle problem only stops the reporting driver. If someone else
@@ -2427,8 +2428,8 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(require_role("DRIVER"
         ).fetchone()["n"]
         if others == 0:
             transition(db, row, "Pause", user["id"], note=note)
-            notify(db, row["requester_id"], f"Task {row['task_code']} paused: {body.reason}", task_id)
-            notify_admins(db, f"Task {row['task_code']} paused (vehicle): {body.reason}", task_id)
+            notify(db, row["requester_id"], f"งาน {row['task_code']} หยุดชั่วคราว: {body.reason}", task_id)
+            notify_admins(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งรถ): {body.reason}", task_id)
             return {"ok": True}
 
         # Others remain active: step this driver back (like /leave) and flag
@@ -2454,10 +2455,10 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(require_role("DRIVER"
                 db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
                            (nxt["driver_id"], nxt["vehicle_id"], task_id))
         notify(db, row["requester_id"],
-               f"Driver {user['employee_id']} had a vehicle problem on task {row['task_code']} "
-               f"({body.reason}) — task continues with the remaining driver(s)", task_id)
-        notify_admins(db, f"Vehicle problem reported on task {row['task_code']} by {user['employee_id']}: "
-                          f"{body.reason} (task still In Progress, {others} driver(s) remain)", task_id)
+               f"คนขับ {user['employee_id']} แจ้งปัญหารถในงาน {row['task_code']} "
+               f"({body.reason}) — งานยังดำเนินต่อโดยคนขับที่เหลือ", task_id)
+        notify_admins(db, f"แจ้งปัญหารถในงาน {row['task_code']} โดย {user['employee_id']}: "
+                          f"{body.reason} (งานยังดำเนินการอยู่ เหลือคนขับ {others} คน)", task_id)
         return {"ok": True}
 
 
@@ -2525,7 +2526,7 @@ def post_task_message(task_id: int, body: ChatMessageBody, user=Depends(current_
             if r["driver_id"] != user["id"]:
                 others.add(r["driver_id"])
         for uid in others:
-            notify(db, uid, f"New message on task {row['task_code']}", task_id, kind="chat")
+            notify(db, uid, f"มีข้อความใหม่ในงาน {row['task_code']}", task_id, kind="chat")
         return {"ok": True}
 
 
@@ -2575,7 +2576,7 @@ def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN"
                 "SELECT id FROM users WHERE employee_id=? AND role IN ('ADMIN','DRIVER') AND deleted_at IS NULL", (emp_id,)
             ).fetchone()
             if target and target["id"] != user["id"]:
-                notify(db, target["id"], f"{user['employee_id']} mentioned you in Team Chat", kind="team_chat")
+                notify(db, target["id"], f"{user['employee_id']} กล่าวถึงคุณในแชททีม", kind="team_chat")
         return {"ok": True}
 
 
@@ -2754,7 +2755,7 @@ def set_driver_status(body: DriverStatusBody, user=Depends(require_role("DRIVER"
     with get_db() as db:
         db.execute("UPDATE users SET driver_status=? WHERE id=?", (body.status, user["id"]))
         if body.status == "Breakdown":
-            notify_admins(db, f"Driver {user['employee_id']} set status to Breakdown")
+            notify_admins(db, f"คนขับ {user['employee_id']} แจ้งสถานะรถเสีย")
         return {"ok": True}
 
 
@@ -2896,7 +2897,7 @@ def report_breakdown(body: BreakdownBody, user=Depends(require_role("DRIVER"))):
             "VALUES (?,?,?,?,?,?,?)",
             (body.target_type, target_id, label, body.description, user["id"], "Open", now_iso()),
         )
-        notify_admins(db, f"Breakdown reported: {body.target_type} {label} by {user['employee_id']}")
+        notify_admins(db, f"แจ้งเสีย: {'คนขับ' if body.target_type == 'driver' else 'รถ'} {label} โดย {user['employee_id']}")
         return {"ok": True}
 
 
@@ -2970,7 +2971,7 @@ def broadcast_notification(body: BroadcastBody, user=Depends(require_role("ADMIN
         else:
             targets = db.execute("SELECT id FROM users WHERE role=? AND deleted_at IS NULL", (body.role,)).fetchall()
         for t in targets:
-            notify(db, t["id"], f"[Admin] {message}")
+            notify(db, t["id"], f"[แอดมิน] {message}")
         audit(db, user["id"], "broadcast", f"{body.role}: {message}")
         return {"ok": True, "sent_to": len(targets)}
 
