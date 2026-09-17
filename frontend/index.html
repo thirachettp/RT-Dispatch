@@ -2606,8 +2606,10 @@ async function loadAuthenticatedImages(container){
 
 // Operation = "What is happening now?" — live jobs, people, vehicles, exceptions.
 function renderAdminOperation(main){
-  if(!state.subtab) setTab(state.tab, "jobs");
+  // Dispatching is the admin's main daily loop, so it is the landing subtab.
+  if(!state.subtab) setTab(state.tab, "dispatch");
   const subtabs = el(`<div class="subtabs">
+    <button data-s="dispatch">กระจายงาน</button>
     <button data-s="jobs">งาน</button>
     <button data-s="people">พนักงาน</button>
     <button data-s="vehicles">รถ</button>
@@ -2621,12 +2623,214 @@ function renderAdminOperation(main){
   });
   main.appendChild(subtabs);
 
-  if(state.subtab === "jobs") renderOperationJobs(main);
+  if(state.subtab === "dispatch") renderDispatchBoard(main);
+  else if(state.subtab === "jobs") renderOperationJobs(main);
   else if(state.subtab === "people") renderOperationPeople(main);
   else if(state.subtab === "vehicles") renderOperationVehicles(main);
   else if(state.subtab === "breakdowns") renderOperationBreakdowns(main);
   else if(state.subtab === "broadcast") renderOperationBroadcast(main);
   else if(state.subtab === "teamchat") renderTeamChat(main);
+}
+
+// ===================== Dispatch board =====================
+// Built around two facts from real use: the admin hands out nearly every job
+// by hand, and the two things that cost time were (a) the number of steps per
+// assignment and (b) not being able to see who is free.
+//
+// Deliberately does NOT rank or recommend anyone. Drivers who physically
+// cannot do the job (licence / zone / no vehicle) are filtered out; among
+// those who can, the admin chooses. That was an explicit product decision —
+// the system's job here is to remove impossible options, not to pick.
+
+function minsSince(iso){
+  if(!iso) return null;
+  return Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+}
+
+function waitBadge(mins){
+  const cls = mins >= 30 ? "bad" : mins >= 15 ? "warn" : "ok";
+  const txt = mins >= 60 ? `${Math.floor(mins/60)} ชม. ${mins%60} น.` : `${mins} นาที`;
+  return `<span class="badge ${cls}">รอมา ${txt}</span>`;
+}
+
+async function renderDispatchBoard(main){
+  main.appendChild(el(`<div class="section-title">คนขับตอนนี้</div>`));
+  const driverPanel = el(`<div class="card" id="dp-drivers"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(driverPanel);
+
+  const queueTitle = el(`<div class="section-title" id="dp-queue-title">คิวงานที่รอมอบหมาย</div>`);
+  main.appendChild(queueTitle);
+  const queueBox = el(`<div id="dp-queue"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(queueBox);
+
+  // Paint the previous board first: renderContent() re-runs this on every
+  // refresh cycle, and blanking to a loading state each time made the screen
+  // flash and pushed the queue around under the admin's finger.
+  const cached = state.dispatchBoard;
+  if(cached) paintDispatch(cached, driverPanel, queueBox, queueTitle);
+
+  let board;
+  try{
+    board = await api("/dispatch/board", {background: !!cached});
+  }catch(e){
+    if(!cached){
+      driverPanel.innerHTML = "";
+      driverPanel.appendChild(el(`<div class="empty">โหลดข้อมูลไม่สำเร็จ: ${e.message || ""}</div>`));
+      queueBox.innerHTML = "";
+    }
+    return;   // keep showing the last good board
+  }
+  state.dispatchBoard = board;
+  paintDispatch(board, driverPanel, queueBox, queueTitle);
+}
+
+function paintDispatch(board, driverPanel, queueBox, queueTitle){
+  const byEmp = {};
+  board.drivers.forEach(d=> byEmp[d.employee_id] = d);
+
+  // ---- who is free, and when do the rest free up ----
+  const free = board.drivers.filter(d=> d.driver_status === "Available" && d.vehicle_code);
+  const busy = board.drivers.filter(d=> d.driver_status === "Busy");
+  const out  = board.drivers.filter(d=> !free.includes(d) && !busy.includes(d));
+  driverPanel.innerHTML = "";
+  driverPanel.appendChild(el(`<div class="stat-grid" style="margin-bottom:12px;">
+    <div class="stat"><div class="n">${free.length}</div><div class="l">ว่าง</div></div>
+    <div class="stat"><div class="n">${busy.length}</div><div class="l">ติดงาน</div></div>
+    <div class="stat"><div class="n">${out.length}</div><div class="l">ยังไม่พร้อม</div></div>
+  </div>`));
+  if(free.length){
+    driverPanel.appendChild(el(`<div class="field-note" style="margin-bottom:6px;">ว่างพร้อมรับงาน</div>`));
+    driverPanel.appendChild(el(`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;">
+      ${free.map(d=>`<span class="badge ok">${d.full_name || d.employee_id} · ${d.vehicle_code}</span>`).join("")}
+    </div>`));
+  }
+  if(busy.length){
+    // The missing half of the answer: a status badge said "Busy" but never
+    // said for how long or on what, so there was no way to judge who would
+    // free up next.
+    driverPanel.appendChild(el(`<div class="field-note" style="margin-bottom:6px;">ติดงานอยู่</div>`));
+    driverPanel.appendChild(el(`<div style="font-size:12px;line-height:1.8;margin-bottom:12px;">
+      ${busy.map(d=>{
+        const m = minsSince(d.busy_since);
+        const eta = d.estimated_arrival ? ` · คาดเสร็จ ${fmtClock(new Date(d.estimated_arrival))}` : "";
+        return `<div style="display:flex;justify-content:space-between;gap:10px;">
+          <span>${d.full_name || d.employee_id}${d.vehicle_code ? " · " + d.vehicle_code : ""}</span>
+          <span style="color:var(--ink-dim);">${d.current_task_code || "-"}${m !== null ? " · " + m + " นาที" : ""}${eta}</span>
+        </div>`;
+      }).join("")}
+    </div>`));
+  }
+  if(out.length){
+    driverPanel.appendChild(el(`<div class="field-note">ยังไม่พร้อม: ${out.map(d=>
+      `${d.full_name || d.employee_id} (${d.vehicle_code ? (DRIVER_STATUS_LABEL[d.driver_status]||d.driver_status) : "ยังไม่เช็คอินรถ"})`
+    ).join(", ")}</div>`));
+  }
+
+  // ---- the queue ----
+  queueTitle.textContent = `คิวงานที่รอมอบหมาย (${board.queue.length})`;
+  queueBox.innerHTML = "";
+  if(!board.queue.length){
+    queueBox.appendChild(el(`<div class="empty">ไม่มีงานที่รอมอบหมาย</div>`));
+    return;
+  }
+
+  board.queue.forEach(entry=>{
+    const t = entry.task;
+    const mins = minsSince(t.created_at);
+    const eligible = entry.eligible.map(e=> byEmp[e]).filter(Boolean);
+    const card = el(`<div class="card" data-dp-task="${t.id}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+        <div>
+          <div style="font-weight:800;">${t.task_code}</div>
+          <div style="font-size:12px;color:var(--ink-dim);margin-top:2px;">
+            ${t.from_location} → ${t.to_location} · ${t.pallet_qty} พาเลท
+          </div>
+          <div style="font-size:12px;color:var(--ink-dim);">ผู้ขอ: ${t.requester_name || t.requester_employee_id || "-"}</div>
+        </div>
+        <div style="text-align:right;flex:none;">
+          ${waitBadge(mins)}
+          ${t.priority && t.priority !== "Normal" ? `<div style="margin-top:4px;"><span class="badge bad">${t.priority}</span></div>` : ""}
+        </div>
+      </div>
+      <div class="dp-pickers" style="margin-top:10px;"></div>
+    </div>`);
+    const pickers = card.querySelector(".dp-pickers");
+
+    if(!eligible.length){
+      // Say exactly why nobody can take it — otherwise an empty row looks
+      // like a bug and the admin has no idea what to fix.
+      const reasons = {};
+      Object.values(entry.blocked).flat().forEach(r=> reasons[r] = (reasons[r]||0) + 1);
+      const top = Object.entries(reasons).sort((a,b)=> b[1]-a[1]).slice(0,3)
+        .map(([r,n])=> `${r} (${n} คน)`).join(" · ");
+      pickers.appendChild(el(`<div class="field-note" style="color:var(--warn);">
+        ยังไม่มีคนขับที่ทำงานนี้ได้ — ${top || "ไม่มีคนขับพร้อมใช้งาน"}
+      </div>`));
+      const anyway = el(`<button class="btn" style="width:100%;margin-top:8px;">เลือกเองทั้งที่ไม่ตรงเงื่อนไข</button>`);
+      anyway.onclick = ()=> openAssignSheet(t.id, false);
+      pickers.appendChild(anyway);
+      queueBox.appendChild(card);
+      return;
+    }
+
+    pickers.appendChild(el(`<div class="field-note" style="margin-bottom:6px;">
+      มอบหมายให้ (${eligible.length} คนที่ทำงานนี้ได้)</div>`));
+    const row = el(`<div style="display:flex;flex-wrap:wrap;gap:6px;"></div>`);
+    eligible.forEach(d=>{
+      // One tap = assigned. The old path was: open sheet, scroll past ETA and
+      // reason fields, search, tap select, tap confirm, sheet closes.
+      const b = el(`<button class="btn amber" style="flex:1 1 auto;min-width:46%;">
+        ${d.full_name || d.employee_id}<br><span style="font-size:11px;opacity:.8;">${d.vehicle_code} · ${d.vehicle_type}</span>
+      </button>`);
+      b.onclick = ()=> dispatchAssign(t, d, b, card);
+      row.appendChild(b);
+    });
+    pickers.appendChild(row);
+
+    const more = el(`<button class="btn" style="width:100%;margin-top:8px;">ตัวเลือกเพิ่มเติม (ETA / เหตุผล / คนอื่น)</button>`);
+    more.onclick = ()=> openAssignSheet(t.id, false);
+    pickers.appendChild(more);
+    queueBox.appendChild(card);
+  });
+}
+
+async function dispatchAssign(task, driver, btn, card){
+  const lock = `dispatch:${task.id}`;
+  if(_inFlightActions.has(lock)) return;
+  _inFlightActions.add(lock);
+  card.querySelectorAll("button").forEach(b=> b.disabled = true);
+  btn.textContent = "กำลังมอบหมาย...";
+  try{
+    await api(`/tasks/${task.id}/assign`, {method:"POST",
+      body: JSON.stringify({driver_employee_id: driver.employee_id, force: false})});
+    toast(`มอบหมาย ${task.task_code} ให้ ${driver.full_name || driver.employee_id} แล้ว`);
+    // Stay on the board and keep going — the card for this job disappears and
+    // the next one moves up, so a run of assignments never leaves this screen.
+    card.remove();
+    await refreshDispatchBoard();
+  }catch(e){
+    card.querySelectorAll("button").forEach(b=> b.disabled = false);
+    btn.innerHTML = `${driver.full_name || driver.employee_id}<br><span style="font-size:11px;opacity:.8;">${driver.vehicle_code} · ${driver.vehicle_type}</span>`;
+    toast(e.message || "มอบหมายไม่สำเร็จ");
+    // Someone else almost certainly changed something — reload the board so
+    // the admin isn't choosing from a stale picture.
+    await refreshDispatchBoard();
+  }finally{
+    _inFlightActions.delete(lock);
+  }
+}
+
+async function refreshDispatchBoard(){
+  if(state.tab !== "operation" || state.subtab !== "dispatch") return;
+  const panel = document.getElementById("dp-drivers");
+  const box = document.getElementById("dp-queue");
+  const title = document.getElementById("dp-queue-title");
+  if(!panel || !box || !title) return;
+  try{
+    const board = await api("/dispatch/board", {background:true});
+    state.dispatchBoard = board;
+    paintDispatch(board, panel, box, title);
+  }catch(e){ /* keep the last good board on screen */ }
 }
 
 function renderOperationJobs(main){
