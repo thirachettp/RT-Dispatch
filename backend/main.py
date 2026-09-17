@@ -1155,10 +1155,38 @@ def login(body: LoginBody):
         return {"token": token, "role": row["role"], "employee_id": row["employee_id"]}
 
 
+def find_deleted_account(db, employee_id):
+    """Returns the soft-deleted row for this employee id, or None.
+    Raises if a LIVE account already holds it."""
+    row = db.execute("SELECT * FROM users WHERE employee_id=?", (employee_id,)).fetchone()
+    if row and not row["deleted_at"]:
+        return "live"
+    return row    # a deleted row, or None
+
+
+def reactivate_account(db, row, *, role, full_name, password_hash, email,
+                       cost_center=None, contact=None):
+    """Bring a soft-deleted account back. Everything operational is reset —
+    an account that was deleted mid-shift could still be pointing at a vehicle
+    or carrying a stale Busy status, and inheriting that would wedge the new
+    session."""
+    db.execute(
+        "UPDATE users SET deleted_at=NULL, role=?, full_name=?, password_hash=?, email=?, "
+        "cost_center=?, contact=?, driver_status=?, checked_in_vehicle_id=NULL WHERE id=?",
+        (role, full_name, password_hash, email, cost_center, contact,
+         "Not Checked-in" if role == "DRIVER" else None, row["id"]),
+    )
+    # Any session from before the deletion is long gone (delete clears them),
+    # but clear again in case the row was revived by another path.
+    db.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
+    return row["id"]
+
+
 @app.post("/auth/register")
 def register(body: RegisterBody):
     with get_db() as db:
-        if db.execute("SELECT 1 FROM users WHERE employee_id=?", (body.employee_id,)).fetchone():
+        existing = find_deleted_account(db, body.employee_id)
+        if existing == "live":
             raise HTTPException(400, "รหัสพนักงานนี้มีผู้ใช้งานแล้ว")
         email = validate_and_normalize_email(db, body.email)
         if not body.cost_center.isdigit():
@@ -1169,6 +1197,11 @@ def register(body: RegisterBody):
             raise HTTPException(400, "เบอร์ติดต่อไม่ถูกต้อง (ต้องเป็นเบอร์โทรไทย 9-10 หลัก)")
         if len(body.password) < MIN_PASSWORD_LENGTH:
             raise HTTPException(400, f"รหัสผ่านต้องมีอย่างน้อย {MIN_PASSWORD_LENGTH} ตัวอักษร")
+        if existing:
+            reactivate_account(db, existing, role="USER", full_name=body.full_name.strip(),
+                               password_hash=hash_password(body.password), email=email,
+                               cost_center=body.cost_center, contact=body.contact)
+            return {"ok": True, "reactivated": True}
         db.execute(
             "INSERT INTO users (employee_id, email, full_name, password_hash, role, cost_center, contact, created_at) "
             "VALUES (?,?,?,?,?,?,?,?)",
@@ -1255,23 +1288,31 @@ class NewDriverBody(BaseModel):
 @app.post("/admin/drivers")
 def create_driver(body: NewDriverBody, user=Depends(require_role("ADMIN"))):
     with get_db() as db:
-        if db.execute("SELECT 1 FROM users WHERE employee_id=?", (body.employee_id,)).fetchone():
+        existing = find_deleted_account(db, body.employee_id)
+        if existing == "live":
             raise HTTPException(400, "รหัสพนักงานนี้มีอยู่ในระบบแล้ว")
         email = validate_and_normalize_email(db, body.email)
-        cur = db.execute(
-            "INSERT INTO users (employee_id, email, full_name, password_hash, role, driver_status, created_at) "
-            "VALUES (?,?,?,?,?,?,?) RETURNING id",
-            (body.employee_id, email, body.full_name, PENDING_PASSWORD, "DRIVER", "Not Checked-in", now_iso()),
-        )
-        driver_id = cur.fetchone()["id"]
+        reactivated = False
+        if existing:
+            driver_id = reactivate_account(
+                db, existing, role="DRIVER", full_name=body.full_name,
+                password_hash=PENDING_PASSWORD, email=email)
+            reactivated = True
+        else:
+            cur = db.execute(
+                "INSERT INTO users (employee_id, email, full_name, password_hash, role, driver_status, created_at) "
+                "VALUES (?,?,?,?,?,?,?) RETURNING id",
+                (body.employee_id, email, body.full_name, PENDING_PASSWORD, "DRIVER", "Not Checked-in", now_iso()),
+            )
+            driver_id = cur.fetchone()["id"]
         for vt in body.initial_vehicle_types:
             db.execute(
                 "INSERT INTO driver_licenses (driver_id, vehicle_type, expiry_date) VALUES (?,?,NULL) "
                 "ON CONFLICT DO NOTHING",
                 (driver_id, vt),
             )
-        audit(db, user["id"], "create_driver", body.employee_id)
-        return {"ok": True}
+        audit(db, user["id"], "reactivate_driver" if reactivated else "create_driver", body.employee_id)
+        return {"ok": True, "reactivated": reactivated}
 
 
 @app.get("/admin/users")
@@ -1337,7 +1378,25 @@ def admin_delete_user(user_id: int, user=Depends(require_role("ADMIN"))):
             ).fetchone()["n"]
             if other_admins == 0:
                 raise HTTPException(400, "ลบไม่ได้ เพราะเป็น Admin คนสุดท้ายในระบบ")
-        db.execute("UPDATE users SET deleted_at=? WHERE id=?", (now_iso(), user_id))
+        if row["role"] == "DRIVER":
+            active = db.execute(
+                "SELECT tasks.task_code FROM task_assignments "
+                "JOIN tasks ON tasks.id = task_assignments.task_id "
+                "WHERE task_assignments.driver_id=? AND task_assignments.assignment_status='Active' "
+                "AND tasks.status NOT IN ('Completed','Cancelled')",
+                (user_id,),
+            ).fetchall()
+            if active:
+                codes = ", ".join(a["task_code"] for a in active)
+                raise HTTPException(
+                    400, f"ลบไม่ได้ เพราะยังมีงานที่ทำอยู่ ({codes}) — กรุณาจบงานหรือมอบหมายใหม่ก่อน")
+            # Hand the vehicle back so it doesn't stay tied to someone who is
+            # no longer in the system.
+            if row["checked_in_vehicle_id"]:
+                db.execute("UPDATE vehicles SET status='Available' WHERE id=? AND status!='Breakdown'",
+                           (row["checked_in_vehicle_id"],))
+        db.execute("UPDATE users SET deleted_at=?, checked_in_vehicle_id=NULL, "
+                   "driver_status='Not Checked-in' WHERE id=?", (now_iso(), user_id))
         db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))  # force logout everywhere
         audit(db, user["id"], "delete_user", row["employee_id"])
         return {"ok": True}
@@ -1915,10 +1974,27 @@ def resubmit_task(task_id: int, user=Depends(require_role("USER"))):
 
 
 class AssignBody(BaseModel):
-    driver_employee_id: str
+    # Single driver (the original field) OR several at once. The admin picks a
+    # whole crew on one screen now, so the first id becomes the primary driver
+    # and the rest are added to the same task as additional active assignments.
+    driver_employee_id: Optional[str] = None
+    driver_employee_ids: Optional[List[str]] = None
     reason: Optional[str] = None
     estimated_minutes: Optional[int] = None
     force: bool = False
+
+    def drivers(self) -> List[str]:
+        """Normalised, de-duplicated, order-preserving list of employee ids."""
+        raw = list(self.driver_employee_ids or [])
+        if self.driver_employee_id:
+            raw.insert(0, self.driver_employee_id)
+        seen, out = set(), []
+        for e in raw:
+            e = (e or "").strip()
+            if e and e not in seen:
+                seen.add(e)
+                out.append(e)
+        return out
 
 
 _STATUS_TH = {
@@ -1945,6 +2021,29 @@ def eligibility_issues(db, driver, vehicle, task_row) -> List[str]:
         if to_issue:
             issues.append(to_issue)
     return issues
+
+
+def _attach_extra_driver(db, task_row, driver, vehicle, actor_id, reason):
+    """Add one more Active driver to a task that already has a primary.
+    Shared by multi-driver assign and the admin 'add driver' action so the two
+    can't drift apart."""
+    if db.execute(
+        "SELECT 1 FROM task_assignments WHERE task_id=? AND driver_id=? AND assignment_status='Active'",
+        (task_row["id"], driver["id"]),
+    ).fetchone():
+        return False
+    try:
+        db.execute(
+            "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_by, assigned_at, "
+            "assignment_status, reason) VALUES (?,?,?,?,?,?,?)",
+            (task_row["id"], driver["id"], vehicle["id"], actor_id, now_iso(), "Active", reason or "มอบหมายพร้อมกันหลายคน"),
+        )
+    except IntegrityError:
+        raise HTTPException(409, f"คนขับ {driver['full_name'] or driver['employee_id']} เพิ่งถูกเพิ่มเข้างานนี้ไปแล้ว")
+    db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
+    db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
+    notify(db, driver["id"], f"คุณถูกเพิ่มเข้างาน {task_row['task_code']}", task_row["id"])
+    return True
 
 
 def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_minutes, is_reassign):
@@ -2003,6 +2102,20 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
             "VALUES (?,?,?,?,?)",
             (task_row["id"], "Waiting", "Assigned", assigned_by_id, now_iso()),
         )
+        # Work begins the moment it is handed out — there is no separate
+        # "accept" tap any more. accepted_at is still stamped because reports,
+        # the driver stats endpoint and the CSV export all read it as "when did
+        # this driver take the job"; leaving it NULL would silently break them.
+        stamp = now_iso()
+        db.execute(
+            "UPDATE tasks SET status='In Progress', accepted_at=?, started_at=? WHERE id=?",
+            (stamp, stamp, task_row["id"]),
+        )
+        db.execute(
+            "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
+            "VALUES (?,?,?,?,?)",
+            (task_row["id"], "Assigned", "In Progress", assigned_by_id, stamp),
+        )
 
     notify(db, driver["id"], f"คุณได้รับมอบหมายงาน {task_row['task_code']}", task_row["id"])
     notify(db, task_row["requester_id"], f"งาน {task_row['task_code']} มอบหมายให้คนขับแล้ว", task_row["id"])
@@ -2018,21 +2131,40 @@ def assign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADMIN
             raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("Waiting",):
             raise HTTPException(400, "งานนี้ไม่ได้อยู่ในสถานะรอรับงานแล้ว กรุณาใช้การมอบหมายใหม่แทน")
-        driver = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'",
-                             (body.driver_employee_id,)).fetchone()
-        if not driver:
-            raise HTTPException(404, "ไม่พบคนขับคนนี้")
-        if not driver["checked_in_vehicle_id"]:
-            raise HTTPException(400, "คนขับยังไม่ได้เช็คอินรถ ไม่สามารถมอบหมายงานได้")
-        vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["checked_in_vehicle_id"],)).fetchone()
-        issues = eligibility_issues(db, driver, vehicle, row)
-        if issues and not body.force:
-            raise HTTPException(409, "เงื่อนไขไม่ผ่าน: " + "; ".join(issues) +
+        emp_ids = body.drivers()
+        if not emp_ids:
+            raise HTTPException(400, "กรุณาเลือกคนขับอย่างน้อย 1 คน")
+
+        # Resolve and validate EVERY driver before writing anything. Assigning
+        # the first two and then failing on the third would leave a half-formed
+        # crew that the admin would have to unpick by hand.
+        resolved, all_issues = [], []
+        for emp in emp_ids:
+            drv = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'", (emp,)).fetchone()
+            if not drv:
+                raise HTTPException(404, f"ไม่พบคนขับ {emp}")
+            if not drv["checked_in_vehicle_id"]:
+                raise HTTPException(400, f"คนขับ {drv['full_name'] or emp} ยังไม่ได้เช็คอินรถ")
+            veh = db.execute("SELECT * FROM vehicles WHERE id=?", (drv["checked_in_vehicle_id"],)).fetchone()
+            iss = eligibility_issues(db, drv, veh, row)
+            resolved.append((drv, veh, iss))
+            if iss:
+                all_issues.append(f"{drv['full_name'] or emp}: " + "; ".join(iss))
+        if all_issues and not body.force:
+            raise HTTPException(409, "เงื่อนไขไม่ผ่าน — " + " | ".join(all_issues) +
                                  " (ยืนยันด้วย force=true เพื่อมอบหมายทั้งที่ไม่ตรงเงื่อนไข)")
-        if issues and body.force:
-            audit(db, user["id"], "manual_override_assign", f"task {row['task_code']}: {'; '.join(issues)}")
-        _do_assign(db, row, driver, vehicle, user["id"], body.reason, body.estimated_minutes, is_reassign=False)
-        return {"ok": True, "overridden_issues": issues if issues else None}
+        if all_issues and body.force:
+            audit(db, user["id"], "manual_override_assign", f"task {row['task_code']}: {' | '.join(all_issues)}")
+
+        primary_drv, primary_veh, _ = resolved[0]
+        _do_assign(db, row, primary_drv, primary_veh, user["id"], body.reason,
+                   body.estimated_minutes, is_reassign=False)
+        # The rest join the same task. _do_assign already moved it to
+        # In Progress, so these are additional crew on live work.
+        for drv, veh, _ in resolved[1:]:
+            _attach_extra_driver(db, row, drv, veh, user["id"], body.reason)
+        return {"ok": True, "assigned": [d["employee_id"] for d, _, _ in resolved],
+                "overridden_issues": all_issues or None}
 
 
 @app.post("/tasks/{task_id}/reassign")
@@ -2043,8 +2175,11 @@ def reassign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADM
             raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("Assigned", "In Progress", "Pause"):
             raise HTTPException(400, f"มอบหมายงานใหม่ไม่ได้ เพราะงานอยู่ในสถานะ {TASK_STATUS_LABEL_TH.get(row['status'], row['status'])}")
+        emp_ids = body.drivers()
+        if not emp_ids:
+            raise HTTPException(400, "กรุณาเลือกคนขับอย่างน้อย 1 คน")
         driver = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'",
-                             (body.driver_employee_id,)).fetchone()
+                             (emp_ids[0],)).fetchone()
         if not driver:
             raise HTTPException(404, "ไม่พบคนขับคนนี้")
         if not driver["checked_in_vehicle_id"]:
@@ -2057,11 +2192,16 @@ def reassign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADM
         if issues and body.force:
             audit(db, user["id"], "manual_override_reassign", f"task {row['task_code']}: {'; '.join(issues)}")
         _do_assign(db, row, driver, vehicle, user["id"], body.reason, body.estimated_minutes, is_reassign=True)
+        for extra in emp_ids[1:]:
+            drv = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'", (extra,)).fetchone()
+            if drv and drv["checked_in_vehicle_id"]:
+                veh = db.execute("SELECT * FROM vehicles WHERE id=?", (drv["checked_in_vehicle_id"],)).fetchone()
+                _attach_extra_driver(db, row, drv, veh, user["id"], body.reason)
         return {"ok": True, "overridden_issues": issues if issues else None}
 
 
 class SelfAssignBody(BaseModel):
-    battery_level: int
+    battery_level: Optional[int] = None
 
 
 @app.post("/tasks/{task_id}/self-assign")
@@ -2085,7 +2225,8 @@ def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_ro
         _do_assign(db, row, driver, vehicle, user["id"], "Self-assigned by driver", None, is_reassign=False)
         db.execute("UPDATE tasks SET accepted_at=?, accept_battery_level=? WHERE id=?",
                    (now_iso(), body.battery_level, task_id))
-        db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
+        if body.battery_level is not None:
+            db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
         notify_admins(db, f"คนขับ {user['employee_id']} รับงาน {row['task_code']} ด้วยตัวเอง", task_id)
         return {"ok": True}
 
@@ -2114,13 +2255,14 @@ def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_role
         _do_assign(db, row, driver, vehicle, user["id"], "Taken over by another driver", None, is_reassign=True)
         db.execute("UPDATE tasks SET accepted_at=?, accept_battery_level=? WHERE id=?",
                    (now_iso(), body.battery_level, task_id))
-        db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
+        if body.battery_level is not None:
+            db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
         notify_admins(db, f"คนขับ {user['employee_id']} รับช่วงงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
 class AcceptBody(BaseModel):
-    battery_level: int
+    battery_level: Optional[int] = None
 
 
 @app.post("/tasks/{task_id}/accept")
@@ -2138,7 +2280,9 @@ def accept_task(task_id: int, body: AcceptBody, user=Depends(require_role("DRIVE
             raise HTTPException(409, "งานนี้ถูกกดรับไปแล้ว หรือไม่ได้มอบหมายให้คุณ")
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if row["current_vehicle_id"]:
-            db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, row["current_vehicle_id"]))
+            if body.battery_level is not None:
+                db.execute("UPDATE vehicles SET battery_level=? WHERE id=?",
+                           (body.battery_level, row["current_vehicle_id"]))
         notify(db, row["requester_id"], f"คนขับกดรับงาน {row['task_code']} แล้ว", task_id)
         notify_admins(db, f"คนขับ {user['employee_id']} กดรับงาน {row['task_code']}", task_id)
         return {"ok": True}
@@ -2152,8 +2296,8 @@ def start_task(task_id: int, user=Depends(require_role("DRIVER"))):
             raise HTTPException(404, "ไม่พบงานนี้")
         if row["current_driver_id"] != user["id"]:
             raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
-        if row["status"] != "Assigned" or row["accepted_at"] is None:
-            raise HTTPException(400, "ต้องกดรับงานก่อนจึงจะเริ่มงานได้")
+        if row["status"] != "Assigned":
+            raise HTTPException(400, "งานนี้ไม่ได้อยู่ในสถานะรอเริ่มงาน")
         transition(db, row, "In Progress", user["id"])
         db.execute("UPDATE tasks SET started_at=? WHERE id=?", (now_iso(), task_id))
         notify(db, row["requester_id"], f"คนขับเริ่มงาน {row['task_code']} แล้ว", task_id)
@@ -2233,7 +2377,7 @@ def admin_complete_task(task_id: int, user=Depends(require_role("ADMIN"))):
 
 
 class JoinTaskBody(BaseModel):
-    battery_level: int
+    battery_level: Optional[int] = None
 
 
 @app.post("/tasks/{task_id}/join")
@@ -2269,7 +2413,11 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_role("DRIVE
         except IntegrityError:
             raise HTTPException(409, "คุณเพิ่งเข้าร่วมงานนี้ไปแล้ว (อาจเกิดจากกดซ้ำ)")
         db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
-        db.execute("UPDATE vehicles SET status='Busy', battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
+        if body.battery_level is not None:
+            db.execute("UPDATE vehicles SET status='Busy', battery_level=? WHERE id=?",
+                       (body.battery_level, vehicle["id"]))
+        else:
+            db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
         notify(db, row["requester_id"], f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
         notify_admins(db, f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
         return {"ok": True}
@@ -2871,7 +3019,7 @@ def set_driver_status(body: DriverStatusBody, user=Depends(require_role("DRIVER"
 
 class CheckInBody(BaseModel):
     vehicle_code: str
-    battery_level: int
+    battery_level: Optional[int] = None
 
 
 @app.post("/vehicles/check-in")
@@ -2882,14 +3030,16 @@ def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
             raise HTTPException(404, "ไม่พบรถคันนี้")
         if v["status"] == "Breakdown":
             raise HTTPException(400, "รถคันนี้ถูกแจ้งว่าเสีย จึงเช็คอินไม่ได้")
-        db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, v["id"]))
+        if body.battery_level is not None:
+            db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, v["id"]))
         db.execute("UPDATE users SET checked_in_vehicle_id=? WHERE id=?", (v["id"], user["id"]))
         cur = db.execute(
             "SELECT driver_status FROM users WHERE id=?", (user["id"],)
         ).fetchone()
         if cur["driver_status"] == "Not Checked-in":
             db.execute("UPDATE users SET driver_status='Available' WHERE id=?", (user["id"],))
-        audit(db, user["id"], "vehicle_check_in", f"{body.vehicle_code} battery={body.battery_level}%")
+        audit(db, user["id"], "vehicle_check_in",
+              body.vehicle_code + (f" battery={body.battery_level}%" if body.battery_level is not None else ""))
         return {"ok": True}
 
 
