@@ -2,7 +2,7 @@
 <html lang="th">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" id="viewport-meta" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="viewport" id="viewport-meta" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>SCDC · ระบบจัดการงานรถ Handling</title>
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#f5f6f8">
@@ -22,6 +22,12 @@
   code,.mono{font-family:'JetBrains Mono',monospace;}
   ::selection{background:var(--amber-dim);}
 
+  /* Stop the browser's native pull-to-refresh from reloading the whole
+     document. A reload throws away scroll position and in-flight UI state;
+     the app wires its own pull handler below that refetches data in place. */
+  html,body{overscroll-behavior-y:contain;}
+  #pull-indicator{height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;
+    font-size:12px;color:var(--ink-dim);background:var(--panel-2);transition:height .15s ease;}
   #app{max-width:520px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column;
     background:var(--bg); position:relative; border-left:1px solid var(--line); border-right:1px solid var(--line);}
   header.topbar{position:sticky;top:0;z-index:5;background:var(--bg);
@@ -29,6 +35,8 @@
   /* Manual refresh strip. Sticks directly under the header so "how fresh is
      this?" and "refresh it" are always one glance / one tap away, which is
      what makes a 30s poll interval acceptable. */
+  #notif-banner{display:flex;gap:12px;align-items:center;padding:12px 16px;
+    background:var(--warn-dim);color:var(--warn);border-bottom:1px solid var(--line);}
   #refresh-bar{position:sticky;top:57px;z-index:4;background:var(--panel);
     border-bottom:1px solid var(--line); padding:7px 16px; cursor:pointer;
     display:flex;align-items:center;justify-content:center;gap:8px;
@@ -316,7 +324,11 @@ function isValidThaiPhoneJS(value){
 // level display preferences).
 const ZOOM_PREF_KEY = "scdc_zoom_enabled";
 function isZoomEnabled(){
-  return localStorage.getItem(ZOOM_PREF_KEY) !== "false"; // enabled by default
+  // DISABLED by default: this is used one-handed on a moving vehicle, where an
+  // accidental pinch or double-tap zoom is far more likely than a deliberate
+  // one. Anyone who needs to zoom can turn it on in Profile, and that choice
+  // sticks on their device.
+  return localStorage.getItem(ZOOM_PREF_KEY) === "true";
 }
 function setZoomEnabled(enabled){
   localStorage.setItem(ZOOM_PREF_KEY, enabled ? "true" : "false");
@@ -331,33 +343,111 @@ function applyZoomPreference(){
 }
 applyZoomPreference();
 
-// Notifications default to "on" the same way zoom does: rather than making
-// people hunt for a toggle, we attempt the subscribe flow ONCE automatically
-// (which still requires the person to accept the browser's own permission
-// prompt — that part can never be skipped, browsers don't allow silently
-// granting notification permission). Whatever happens — granted, denied, or
-// dismissed — we mark it prompted and never auto-prompt again, matching
-// "turning it off should be remembered immediately and not re-asked".
+// Marks that the person has been shown the notification banner AND answered
+// it, so they aren't nagged on every launch. Written only on an explicit
+// dismissal — see maybeAutoPromptNotifications() for why a failed attempt must
+// never set it.
 const NOTIF_PROMPTED_KEY = "scdc_notif_prompted";
+
+// iOS only delivers Web Push to a PWA that has been installed to the home
+// screen AND opened from that icon. Permission granted in Safari does not
+// carry over to the installed app — it is a separate context with its own
+// permission state and its own storage. This is the single most common reason
+// notifications "just don't work" on iPhone.
+function isIOS(){
+  return /iPad|iPhone|iPod/.test(navigator.userAgent || "")
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+function isStandalone(){
+  return window.navigator.standalone === true
+    || (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+}
+function pushSupported(){
+  return ("serviceWorker" in navigator) && ("PushManager" in window) && ("Notification" in window);
+}
+// Notifications are opt-in through a visible banner, NOT an automatic prompt.
+//
+// The previous version called Notification.requestPermission() straight out of
+// bootstrap(). Two things went wrong with that:
+//   1. iOS requires the permission request to come from a user gesture. Called
+//      on page load it is refused outright, which silently burns the request.
+//   2. It wrote the "already prompted" flag BEFORE attempting, and swallowed
+//      every error, so a failed attempt permanently stopped the app from ever
+//      asking again — with no visible trace anywhere in the UI.
+// Together those meant a driver could install the app, be asked nothing, and
+// never receive a single notification.
+//
+// Now: a banner explains what they'd get and waits for a tap. The flag is only
+// written when the person actually dismisses it.
 async function maybeAutoPromptNotifications(){
   if(localStorage.getItem(NOTIF_PROMPTED_KEY)) return;
-  if(!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+  if(!pushSupported()) return;
   if(location.protocol !== "https:" && location.hostname !== "localhost") return;
-  if(Notification.permission !== "default") return; // already decided previously at the browser level
-  localStorage.setItem(NOTIF_PROMPTED_KEY, "true");
+  if(Notification.permission !== "default") return;  // already decided at the browser level
+  // On iOS there is no point asking until the app is installed — the request
+  // cannot succeed from a Safari tab. Point them at the real first step.
+  if(isIOS() && !isStandalone()){ showNotifBanner("ios-install"); return; }
   try{
     const status = await api("/push/status");
     if(!status.available || status.subscribed) return;
-    await subscribeToPush();
-  }catch(e){ /* silent — Profile page still offers the manual toggle + test */ }
+    showNotifBanner("enable");
+  }catch(e){ /* Profile page still offers the manual toggle + test */ }
+}
+
+function showNotifBanner(mode){
+  if(document.getElementById("notif-banner")) return;
+  const isInstallHint = mode === "ios-install";
+  const body = isInstallHint
+    ? `แตะปุ่มแชร์ แล้วเลือก "เพิ่มลงในหน้าจอโฮม" จากนั้นเปิดแอปจากไอคอนนั้น จึงจะเปิดแจ้งเตือนได้`
+    : `เปิดแจ้งเตือนเพื่อรับงานใหม่และข้อความทันที แม้ไม่ได้เปิดแอปค้างไว้`;
+  const banner = el(`<div id="notif-banner">
+    <div style="flex:1;">
+      <div style="font-weight:700;margin-bottom:3px;">🔔 การแจ้งเตือน</div>
+      <div style="font-size:12px;line-height:1.5;">${body}</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;flex:none;">
+      ${isInstallHint ? "" : `<button class="btn amber" id="nb-enable" style="padding:8px 12px;">เปิด</button>`}
+      <button class="btn" id="nb-dismiss" style="padding:8px 12px;">ไม่ใช่ตอนนี้</button>
+    </div>
+  </div>`);
+  const anchor = document.getElementById("main");
+  if(anchor && anchor.parentNode) anchor.parentNode.insertBefore(banner, anchor);
+  else document.body.appendChild(banner);
+
+  banner.querySelector("#nb-dismiss").onclick = ()=>{
+    // Only NOW do we record that they were asked — a dismissal is a real answer.
+    try{ localStorage.setItem(NOTIF_PROMPTED_KEY, "true"); }catch(e){}
+    banner.remove();
+  };
+  const enableBtn = banner.querySelector("#nb-enable");
+  if(enableBtn){
+    enableBtn.onclick = async ()=>{
+      enableBtn.disabled = true;
+      enableBtn.textContent = "กำลังเปิด...";
+      try{
+        // Runs inside the click handler, which is what iOS requires.
+        await subscribeToPush();
+        banner.remove();
+        toast("เปิดการแจ้งเตือนแล้ว");
+        try{ await api("/push/test", {method:"POST"}); }catch(e){}
+      }catch(e){
+        enableBtn.disabled = false;
+        enableBtn.textContent = "เปิด";
+        toast(e.message || "เปิดการแจ้งเตือนไม่สำเร็จ");
+      }
+    };
+  }
 }
 
 let state = {
   token: localStorage.getItem("scdc_token") || null,
   role: localStorage.getItem("scdc_role") || null,
   employee_id: localStorage.getItem("scdc_emp") || null,
-  tab: "tasks",
-  subtab: "",
+  // Persisted so a page reload — including the browser's own pull-to-refresh
+  // gesture, which fully reloads the document — puts the user back where they
+  // were instead of bouncing them to the first tab.
+  tab: localStorage.getItem("scdc_tab") || "tasks",
+  subtab: localStorage.getItem("scdc_subtab") || "",
   tasks: [],
   notifications: [],
   vehicles: [],
@@ -374,6 +464,8 @@ let state = {
   myStats: null,
 };
 let chatPollTimer = null;
+// Set by the admin dashboard renderer while that tab is mounted.
+let loadDashboardNow = null;
 
 const STATUS_LABEL = {
   "Waiting":"รอดำเนินการ", "Assigned":"มอบหมายแล้ว", "In Progress":"กำลังดำเนินการ",
@@ -581,6 +673,8 @@ function hideConnBanner(){
 function logout(){
   state.token=null; state.role=null; state.employee_id=null;
   localStorage.removeItem("scdc_token"); localStorage.removeItem("scdc_role"); localStorage.removeItem("scdc_emp");
+  // Don't leave one person's last tab behind for whoever logs in next.
+  localStorage.removeItem("scdc_tab"); localStorage.removeItem("scdc_subtab");
   hideConnBanner();
   render();
 }
@@ -859,7 +953,7 @@ function renderShell(){
   `);
   header.querySelector("#bell").onclick = ()=> openNotifications();
   if(isDriver){
-    header.querySelector("#brand-btn").onclick = ()=>{ state.tab = "profile"; renderContent(); };
+    header.querySelector("#brand-btn").onclick = ()=>{ setTab("profile"); renderContent(); };
     header.querySelector("#chat-menu-btn").onclick = ()=> openChatMenuSheet();
     header.querySelector("#hdr-status-btn").onclick = ()=> openDriverStatusSheet();
   }
@@ -877,9 +971,22 @@ function renderShell(){
   bar.addEventListener("keydown", (e)=>{ if(e.key === "Enter" || e.key === " ") doManualRefresh(); });
   app.appendChild(bar);
 
+  const pullIndicator = el(`<div id="pull-indicator"></div>`);
+  app.appendChild(pullIndicator);
+
   const main = el(`<main id="main"></main>`);
   app.appendChild(main);
   updateRefreshBar();
+
+  // Wired ONCE here, on the <main> element, which survives every re-render.
+  // It used to be wired inside the admin dashboard renderer, which re-ran on
+  // every poll and stacked a fresh set of touch listeners on <main> each time.
+  wirePullToRefresh(main, pullIndicator, ()=>{
+    if(state.role === "ADMIN" && state.tab === "dashboard" && typeof loadDashboardNow === "function"){
+      return loadDashboardNow();
+    }
+    return refreshNow();
+  });
 
   const tabsDef = {
     USER: [["tasks","งานของฉัน"], ["history","ประวัติ"], ["profile","โปรไฟล์"]],
@@ -899,7 +1006,7 @@ function renderShell(){
   tabs.querySelectorAll("button").forEach(b=>{
     b.onclick = ()=>{
       if(b.dataset.tab === "logout"){ logout(); return; }
-      state.tab = b.dataset.tab; state.subtab = "";
+      setTab(b.dataset.tab, "");
       renderContent();
       // Switching tabs may need a different data scope (e.g. dashboard vs
       // operation) — refresh right away so the new tab isn't stuck showing
@@ -908,7 +1015,7 @@ function renderShell(){
     };
   });
   app.appendChild(tabs);
-  if(!tabsDef.find(([k])=>k===state.tab)) state.tab = tabsDef[0][0];
+  if(!tabsDef.find(([k])=>k===state.tab)) setTab(tabsDef[0][0], "");
   renderContent();
 
   if(state.role === "USER"){
@@ -916,6 +1023,15 @@ function renderShell(){
     fab.onclick = ()=> openCreateTask();
     app.appendChild(fab);
   }
+}
+
+function setTab(tab, subtab){
+  state.tab = tab;
+  state.subtab = subtab || "";
+  try{
+    localStorage.setItem("scdc_tab", state.tab);
+    localStorage.setItem("scdc_subtab", state.subtab);
+  }catch(e){ /* private mode — navigation still works, it just won't persist */ }
 }
 
 function markActiveTab(){
@@ -1684,9 +1800,10 @@ function renderProfile(main){
 
   main.appendChild(el(`<div class="section-title">การซูมหน้าจอ</div>`));
   const zoomCard = el(`<div class="card">
-    <div class="field-note" style="margin-bottom:10px;">อนุญาตให้ซูมหน้าจอ (pinch/double-tap) — ปิดไว้จะรู้สึก
-      เหมือนแอปทั่วไปมากขึ้น ป้องกันโดนซูมพลาดตอนรีบใช้งาน แต่ถ้าใครต้องซูมเพื่ออ่านตัวหนังสือ แนะนำเปิดไว้
-      การตั้งค่านี้จำเฉพาะเครื่องนี้ ไม่หายตอนออกจากระบบแล้วเข้าใหม่ แต่จะไม่ตามไปเครื่องอื่น</div>
+    <div class="field-note" style="margin-bottom:10px;">ค่าเริ่มต้นคือ<b>ปิด</b> เพื่อไม่ให้โดนซูมพลาดตอนรีบใช้งาน
+      ถ้าต้องซูมเพื่ออ่านตัวหนังสือ กดเปิดได้
+      การตั้งค่านี้จำเฉพาะเครื่องนี้ ไม่หายตอนออกจากระบบแล้วเข้าใหม่ แต่จะไม่ตามไปเครื่องอื่น
+      (บน iPhone ถ้าเปิดผ่าน Safari ธรรมดา ระบบจะยอมให้ซูมเสมอ ปิดได้ผลเฉพาะแอปที่เพิ่มลงหน้าจอโฮมแล้ว)</div>
     <button class="btn ${isZoomEnabled() ? 'red' : 'amber'}" id="zoom-toggle" style="width:100%;">
       ${isZoomEnabled() ? 'ปิดการซูม' : 'เปิดการซูม'}
     </button>
@@ -1698,10 +1815,31 @@ function renderProfile(main){
   };
 }
 
+// Every failure mode below used to surface as the same silence. Each state is
+// now named explicitly, with the specific next step for that state, because
+// "notifications don't work" is otherwise undebuggable from the driver's side.
+function pushDiagnosticsHTML(status){
+  const rows = [
+    ["ติดตั้งลงหน้าจอโฮม", isStandalone() ? "✅ ใช่" : (isIOS() ? "❌ ยัง (จำเป็นบน iPhone)" : "— ไม่จำเป็น")],
+    ["สิทธิ์แจ้งเตือน", ("Notification" in window)
+      ? ({granted:"✅ อนุญาตแล้ว", denied:"❌ ถูกปฏิเสธ", default:"⚠️ ยังไม่ได้ถาม"}[Notification.permission] || Notification.permission)
+      : "❌ เบราว์เซอร์ไม่รองรับ"],
+    ["ลงทะเบียนกับเซิร์ฟเวอร์", status && status.subscribed ? "✅ แล้ว" : "❌ ยัง"],
+    ["เซิร์ฟเวอร์พร้อมส่ง", status && status.available ? "✅ พร้อม" : "❌ ไม่พร้อม"],
+  ];
+  return `<div style="font-size:12px;line-height:1.9;margin-bottom:10px;">
+    ${rows.map(([k,v])=>`<div style="display:flex;justify-content:space-between;gap:10px;">
+      <span style="color:var(--ink-dim);">${k}</span><span>${v}</span></div>`).join("")}
+  </div>`;
+}
+
 async function renderPushSection(pushCard){
   pushCard.innerHTML = "";
-  if(!("serviceWorker" in navigator) || !("PushManager" in window)){
+  if(!pushSupported()){
     pushCard.appendChild(el(`<div class="field-note">เบราว์เซอร์นี้ไม่รองรับการแจ้งเตือนแบบ Push</div>`));
+    if(isIOS()){
+      pushCard.appendChild(el(`<div class="field-note">บน iPhone ต้องใช้ Safari และต้อง "เพิ่มลงในหน้าจอโฮม" ก่อน แล้วเปิดแอปจากไอคอนนั้น</div>`));
+    }
     return;
   }
   if(location.protocol !== "https:" && location.hostname !== "localhost"){
@@ -1710,13 +1848,25 @@ async function renderPushSection(pushCard){
   }
   let status;
   try{ status = await api("/push/status"); }catch(e){ status = {available:false, subscribed:false}; }
+
+  pushCard.appendChild(el(pushDiagnosticsHTML(status)));
+
   if(!status.available){
-    pushCard.appendChild(el(`<div class="field-note">เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า Web Push (ต้องรันผ่าน HTTPS)</div>`));
+    pushCard.appendChild(el(`<div class="field-note">เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า Web Push</div>`));
+    return;
+  }
+  // iOS: a Safari tab can never subscribe. Say so plainly instead of showing a
+  // button that is guaranteed to fail.
+  if(isIOS() && !isStandalone()){
+    pushCard.appendChild(el(`<div class="field-note" style="color:var(--warn);">
+      บน iPhone ต้อง "เพิ่มลงในหน้าจอโฮม" ก่อน แล้ว<b>เปิดแอปจากไอคอนบนหน้าจอโฮม</b> จึงจะเปิดแจ้งเตือนได้<br>
+      (สิทธิ์ที่เคยกดอนุญาตใน Safari จะไม่ถูกนำมาใช้ ต้องกดอนุญาตใหม่ในแอปที่ติดตั้งแล้ว)
+    </div>`));
     return;
   }
   const perm = Notification.permission;
   if(perm === "denied"){
-    pushCard.appendChild(el(`<div class="field-note">คุณเคยปฏิเสธการแจ้งเตือนไว้ — ต้องไปเปิดเองในตั้งค่าเบราว์เซอร์ (Site settings → Notifications)</div>`));
+    pushCard.appendChild(el(`<div class="field-note">คุณเคยปฏิเสธการแจ้งเตือนไว้ — ต้องไปเปิดเองในตั้งค่าเครื่อง/เบราว์เซอร์ (Settings → Notifications) แล้วกลับมาเปิดใหม่ที่นี่</div>`));
     return;
   }
   const btn = el(`<button class="btn ${status.subscribed ? 'red' : 'amber'}" style="width:100%;">
@@ -1725,6 +1875,14 @@ async function renderPushSection(pushCard){
   pushCard.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">รับแจ้งเตือนแม้ปิดแอปอยู่ (มือถือ iOS ต้อง "เพิ่มลงหน้าจอโฮม" ก่อนถึงจะใช้ได้)</div>`));
   pushCard.appendChild(btn);
   const resultBox = el(`<div id="push-test-result" style="margin-top:10px;"></div>`);
+  if(status.subscribed){
+    // Subscribing successfully is not proof that delivery works — an expired
+    // VAPID signature or a revoked subscription both look identical from here
+    // until an actual send is attempted.
+    const testBtn = el(`<button class="btn" style="width:100%;margin-top:8px;">ทดสอบส่งแจ้งเตือน</button>`);
+    testBtn.onclick = ()=> testPushAndShowResult(resultBox);
+    pushCard.appendChild(testBtn);
+  }
   pushCard.appendChild(resultBox);
   btn.onclick = async ()=>{
     resultBox.innerHTML = "";
@@ -1827,7 +1985,13 @@ function renderDriverTab(main){
         };
       });
     } else {
-      const avail = state.tasks.filter(t=>t.status === "Waiting");
+      // Oldest first: /tasks comes back newest-first (right for history), but
+      // a queue of unclaimed work should be served front-to-back so the job
+      // that has been waiting longest is the one a driver sees at the top.
+      const avail = state.tasks
+        .filter(t=>t.status === "Waiting")
+        .slice()
+        .sort((a,b)=> String(a.created_at||"").localeCompare(String(b.created_at||"")));
       main.appendChild(el(`<div class="section-title">งานที่รับได้ (${avail.length})</div>`));
       main.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">กดรับงานได้ทันทีด้วยรถที่คุณเช็คอินไว้</div>`));
       if(avail.length===0) main.appendChild(el(`<div class="empty">ยังไม่มีงานว่างในขณะนี้</div>`));
@@ -1873,7 +2037,7 @@ function renderDriverTab(main){
       <div class="stat-grid" id="today-stats-grid"><div class="empty">กำลังโหลด...</div></div>
     </div>`);
     main.appendChild(statsCard);
-    statsCard.onclick = ()=>{ state.tab = "history"; renderContent(); };
+    statsCard.onclick = ()=>{ setTab("history"); renderContent(); };
     (async ()=>{
       try{
         const s = await api("/drivers/me/stats?period=day");
@@ -2017,12 +2181,12 @@ function openAdminSearchSheet(){
   function goToTask(taskId){ closeSheet(overlay); openTaskDetailSheet(taskId); }
   function goToPerson(userId){
     closeSheet(overlay);
-    state.tab = "operation"; state.subtab = "people"; renderContent();
+    setTab("operation", "people"); renderContent();
     openUserEditSheet(userId);
   }
   function goToVehicle(vehicleId){
     closeSheet(overlay);
-    state.tab = "operation"; state.subtab = "vehicles"; renderContent();
+    setTab("operation", "vehicles"); renderContent();
     openVehicleEditSheet(vehicleId);
   }
 
@@ -2094,7 +2258,7 @@ function openChatMenuSheet(){
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const list = overlay.querySelector("#chat-menu-list");
   const teamRow = el(`<div class="list-row" style="cursor:pointer;"><span>💬 <b>แชททีม</b></span><span class="field-note">Admin + คนขับ</span></div>`);
-  teamRow.onclick = ()=>{ closeSheet(overlay); state.tab = "teamchat"; renderContent(); };
+  teamRow.onclick = ()=>{ closeSheet(overlay); setTab("teamchat"); renderContent(); };
   list.appendChild(teamRow);
   if(myChats.length === 0){
     list.appendChild(el(`<div class="empty">ยังไม่มีแชทงาน</div>`));
@@ -2366,7 +2530,9 @@ async function renderAdminDashboard(main){
   }
 
   refreshRow.querySelector("#dash-refresh-btn").onclick = ()=> loadDashboard();
-  wirePullToRefresh(main, pullIndicator, ()=> loadDashboard());
+  // Exposed so the shell's single pull-to-refresh handler can drive the
+  // dashboard's own loader without re-binding listeners on every render.
+  loadDashboardNow = loadDashboard;
   await loadDashboard();
 }
 
@@ -2440,7 +2606,7 @@ async function loadAuthenticatedImages(container){
 
 // Operation = "What is happening now?" — live jobs, people, vehicles, exceptions.
 function renderAdminOperation(main){
-  if(!state.subtab) state.subtab = "jobs";
+  if(!state.subtab) setTab(state.tab, "jobs");
   const subtabs = el(`<div class="subtabs">
     <button data-s="jobs">งาน</button>
     <button data-s="people">พนักงาน</button>
@@ -2451,7 +2617,7 @@ function renderAdminOperation(main){
   </div>`);
   subtabs.querySelectorAll("button").forEach(b=>{
     b.classList.toggle("active", b.dataset.s === state.subtab);
-    b.onclick = ()=>{ state.subtab = b.dataset.s; renderContent(); };
+    b.onclick = ()=>{ setTab(state.tab, b.dataset.s); renderContent(); };
   });
   main.appendChild(subtabs);
 
@@ -3165,7 +3331,7 @@ function openUserEditSheet(userId){
 }
 
 function renderAdminSettings(main){
-  if(!state.subtab) state.subtab = "rules";
+  if(!state.subtab) setTab(state.tab, "rules");
   const subtabs = el(`<div class="subtabs">
     <button data-s="rules">กฎประเภทงาน</button>
     <button data-s="zones">โซน</button>
@@ -3175,7 +3341,7 @@ function renderAdminSettings(main){
   </div>`);
   subtabs.querySelectorAll("button").forEach(b=>{
     b.classList.toggle("active", b.dataset.s === state.subtab);
-    b.onclick = ()=>{ state.subtab = b.dataset.s; renderContent(); };
+    b.onclick = ()=>{ setTab(state.tab, b.dataset.s); renderContent(); };
   });
   main.appendChild(subtabs);
 
