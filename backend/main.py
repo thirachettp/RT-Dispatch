@@ -2584,6 +2584,116 @@ def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN"
 # Drivers / Vehicles / Check-in / Dispatch suggestion
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Dispatch board
+# ---------------------------------------------------------------------------
+
+@app.get("/dispatch/board")
+def dispatch_board(user=Depends(require_role("ADMIN"))):
+    """Everything the admin needs to hand out work, in one request.
+
+    The assign sheet used to list every driver in table order and let the admin
+    guess; eligibility_issues() only ran on submit, so a wrong guess cost a full
+    round-trip and a re-pick. This computes the same rules UP FRONT for every
+    waiting task against every driver, so the UI can simply not offer someone
+    who cannot do the job.
+
+    Cost is fixed — four queries — regardless of how many tasks or drivers there
+    are: the zone/licence tables are pulled once and the matching itself is done
+    in memory. Doing it per task would have meant a request per card.
+    """
+    with get_db() as db:
+        # --- reference data, once ---------------------------------------
+        zone_types = {}          # zone_key -> set(vehicle_type)
+        for r in db.execute("SELECT vehicle_type, zone_key FROM vehicle_type_zones").fetchall():
+            zone_types.setdefault(r["zone_key"], set()).add(r["vehicle_type"])
+        zone_names = {r["zone_key"]: r["zone_name_th"]
+                      for r in db.execute("SELECT zone_key, zone_name_th FROM zones").fetchall()}
+        licences = {}            # driver_id -> set(vehicle_type)
+        for r in db.execute("SELECT driver_id, vehicle_type FROM driver_licenses").fetchall():
+            licences.setdefault(r["driver_id"], set()).add(r["vehicle_type"])
+
+        # --- drivers, with what they are doing right now ------------------
+        driver_rows = db.execute(
+            "SELECT users.id, users.employee_id, users.full_name, users.driver_status, "
+            "users.checked_in_vehicle_id, "
+            "vehicles.code AS vehicle_code, vehicles.vehicle_type, vehicles.status AS vehicle_status, "
+            "tasks.task_code AS current_task_code, tasks.id AS current_task_id, "
+            "tasks.status AS current_task_status, tasks.estimated_arrival, "
+            "task_assignments.assigned_at AS busy_since "
+            "FROM users "
+            "LEFT JOIN vehicles ON vehicles.id = users.checked_in_vehicle_id "
+            "LEFT JOIN task_assignments ON task_assignments.driver_id = users.id "
+            "   AND task_assignments.assignment_status='Active' "
+            "LEFT JOIN tasks ON tasks.id = task_assignments.task_id "
+            "   AND tasks.status NOT IN ('Completed','Cancelled') "
+            "WHERE users.role='DRIVER' AND users.deleted_at IS NULL "
+            "ORDER BY users.full_name, users.employee_id"
+        ).fetchall()
+
+        drivers = []
+        for r in driver_rows:
+            drivers.append({
+                "id": r["id"],
+                "employee_id": r["employee_id"],
+                "full_name": r["full_name"],
+                "driver_status": r["driver_status"],
+                "vehicle_code": r["vehicle_code"],
+                "vehicle_type": r["vehicle_type"],
+                "vehicle_status": r["vehicle_status"],
+                "licenses": sorted(licences.get(r["id"], [])),
+                # "Who is free, and when will the rest be free?" — the badge
+                # alone never answered the second half.
+                "current_task_id": r["current_task_id"],
+                "current_task_code": r["current_task_code"],
+                "current_task_status": r["current_task_status"],
+                "busy_since": r["busy_since"],
+                "estimated_arrival": r["estimated_arrival"],
+            })
+
+        # --- the queue: oldest first, because that is the order it should
+        #     be handed out in (the ops list is newest-first for browsing) ---
+        tasks = db.execute(
+            "SELECT * FROM tasks WHERE status='Waiting' ORDER BY created_at ASC"
+        ).fetchall()
+        task_dicts = tasks_to_dicts(tasks, db, viewer_role="ADMIN")
+
+        def issues_for(d, t):
+            """Same rules as eligibility_issues(), evaluated from the prefetched
+            tables. Kept deliberately parallel to that function — if the two ever
+            disagree, the server-side check still wins at assign time and the
+            admin would see a 409, so this can only ever be optimistic, never
+            permissive in a way that lets a bad assignment through."""
+            out = []
+            if not d["vehicle_code"]:
+                out.append("ยังไม่ได้เช็คอินรถ")
+                return out          # nothing else can be judged without a vehicle
+            if d["driver_status"] != "Available":
+                out.append(f"คนขับ{_STATUS_TH.get(d['driver_status'], d['driver_status'])}")
+            if d["vehicle_status"] != "Available":
+                out.append(f"รถ{_STATUS_TH.get(d['vehicle_status'], d['vehicle_status'])}")
+            vt = d["vehicle_type"]
+            if vt not in (d["licenses"] or []):
+                out.append(f"ไม่มีใบอนุญาตรถ {vt}")
+            for zone in {t["from_zone"], t["to_zone"]}:
+                if vt not in zone_types.get(zone, set()):
+                    out.append(f"รถ {vt} เข้าโซน{zone_names.get(zone, zone)}ไม่ได้")
+            return out
+
+        board = []
+        for t in task_dicts:
+            eligible, blocked = [], {}
+            for d in drivers:
+                iss = issues_for(d, t)
+                if iss:
+                    blocked[d["employee_id"]] = iss
+                else:
+                    eligible.append(d["employee_id"])
+            board.append({"task": t, "eligible": eligible, "blocked": blocked})
+
+        return {"queue": board, "drivers": drivers, "server_time": now_iso()}
+
+
 @app.get("/drivers/availability-summary")
 def drivers_availability_summary(user=Depends(current_user)):
     """Aggregate counts only (no names/details) — safe to expose to USER and
