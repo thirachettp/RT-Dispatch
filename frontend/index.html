@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" id="viewport-meta" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
-<title>SCDC · ระบบจัดการงานรถ Handling</title>
+<title>CRL ForkliftDispatch — Warehouse Forklift Request &amp; Dispatch</title>
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#f5f6f8">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -90,6 +90,8 @@
   .as-more{margin:4px 0 10px;}
   .as-more summary{cursor:pointer;font-size:13px;color:var(--ink-dim);padding:6px 0;}
 
+  .app-version{font-size:11px;color:var(--ink-dim);text-align:center;
+    letter-spacing:.04em;padding:10px 0 4px;opacity:.75;}
   .brand{display:flex;align-items:center;gap:10px;}
   .logo-mark{width:28px;height:28px;border-radius:8px;background:var(--amber);display:flex;
     align-items:center;justify-content:center;flex:none;}
@@ -744,17 +746,18 @@ function renderLogin(){
   const wrap = el(`
     <div class="login-wrap">
       <div class="login-card">
-        <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;letter-spacing:.03em;">SCDC</b></div>
-        <h1>ระบบจัดการงานรถ Handling</h1>
-        <p class="sub">คลังสินค้า · รถ MHE (RT / PE / Forklift)</p>
+        <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;letter-spacing:.03em;">CRL</b></div>
+        <h1>CRL ForkliftDispatch</h1>
+        <p class="sub">Warehouse Forklift Request &amp; Dispatch</p>
         <div id="login-form">
-          <label>รหัสพนักงาน หรือ อีเมล @central.co.th</label>
-          <input id="li-emp" placeholder="รหัสพนักงาน หรือ อีเมลบริษัท" autocomplete="username" />
+          <label>ผู้ใช้งาน</label>
+          <input id="li-emp" placeholder="รหัสพนักงาน / เบอร์โทร / อีเมล @central.co.th" autocomplete="username" />
           <label>รหัสผ่าน</label>
-          <input id="li-pass" type="password" placeholder="••••••••" autocomplete="current-password" />
+          <input id="li-pass" type="password" placeholder="รหัสผ่าน" autocomplete="current-password" />
           <button class="primary" id="li-submit">เข้าสู่ระบบ</button>
           <button class="ghost" id="li-goto-register">ยังไม่มีบัญชี? สมัครสมาชิก</button>
           <div id="li-err"></div>
+          <div class="app-version">__APP_VERSION__</div>
         </div>
       </div>
     </div>
@@ -773,6 +776,11 @@ function renderLogin(){
         body: JSON.stringify({employee_id, password})});
       const data = await res.json();
       if(res.status === 428){ return renderSetPassword(employee_id); }
+      // 404 means no such account — offer registration with whatever they
+      // typed already filled in, so they don't retype it. A wrong PASSWORD
+      // (401) is a different situation entirely and must never suggest
+      // registering: the account exists and they just need it reset.
+      if(res.status === 404){ return offerRegistration(employee_id); }
       if(!res.ok){ throw new Error(data.detail || "เข้าสู่ระบบไม่สำเร็จ"); }
       state.token = data.token; state.role = data.role; state.employee_id = data.employee_id;
       localStorage.setItem("scdc_token", state.token);
@@ -785,13 +793,47 @@ function renderLogin(){
   };
 }
 
+// Works out which kind of identifier was typed, so the register form can put
+// it in the right box instead of making the person type it again.
+function classifyIdentifier(v){
+  const s = (v || "").trim();
+  if(!s) return {};
+  if(s.includes("@")) return {email: s.toLowerCase()};
+  const digits = s.replace(/\D/g, "");
+  if(digits.length >= 9 && digits.length <= 10 && /^[0-9+\-\s()]+$/.test(s)) return {contact: s};
+  return {employee_id: s};
+}
+
+function offerRegistration(identifier){
+  const guess = classifyIdentifier(identifier);
+  const what = guess.email ? "อีเมล" : guess.contact ? "เบอร์โทร" : "รหัสพนักงาน";
+  const overlay = el(`
+    <div class="sheet-overlay">
+      <div class="sheet">
+        <div class="sheet-head"><h2>ยังไม่มีบัญชีนี้</h2><button id="sh-close">✕</button></div>
+        <div class="field-note" style="line-height:1.6;">
+          ไม่พบบัญชีที่ใช้${what} <b>${identifier}</b> ในระบบ<br>
+          ต้องการสมัครสมาชิกด้วย${what}นี้หรือไม่
+        </div>
+        <button class="primary" id="or-go">สมัครสมาชิก</button>
+        <button class="btn" id="or-cancel" style="width:100%;margin-top:8px;">แก้ไขข้อมูลที่กรอก</button>
+      </div>
+    </div>`);
+  document.body.appendChild(overlay);
+  const close = ()=> closeSheet(overlay);
+  overlay.querySelector("#sh-close").onclick = close;
+  overlay.querySelector("#or-cancel").onclick = close;
+  overlay.onclick = (e)=>{ if(e.target === overlay) close(); };
+  overlay.querySelector("#or-go").onclick = ()=>{ close(); renderRegister(guess); };
+}
+
 function renderSetPassword(prefillEmp){
   const app = document.getElementById("app");
   app.innerHTML = "";
   const wrap = el(`
     <div class="login-wrap">
       <div class="login-card">
-        <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;">SCDC</b></div>
+        <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;">CRL</b></div>
         <h1>ตั้งรหัสผ่านของคุณ</h1>
         <p class="sub">บัญชีนี้ถูกสร้างโดย Admin กรุณาตั้งรหัสผ่านเพื่อเริ่มใช้งาน</p>
         <label>รหัสพนักงาน</label>
@@ -823,15 +865,15 @@ function renderSetPassword(prefillEmp){
   };
 }
 
-function renderRegister(){
+function renderRegister(prefill = {}){
   const app = document.getElementById("app");
   app.innerHTML = "";
   const wrap = el(`
     <div class="login-wrap">
       <div class="login-card">
-        <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;">SCDC</b></div>
-        <h1>สมัครสมาชิก (ผู้ขอใช้งาน)</h1>
-        <p class="sub">บัญชี Driver ต้องให้ Admin เป็นผู้สร้างให้เท่านั้น</p>
+        <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;">CRL</b></div>
+        <h1>สมัครสมาชิก</h1>
+        <p class="sub">CRL ForkliftDispatch</p>
         <label>รหัสพนักงาน</label><input id="rg-emp" />
         <div class="grid2">
           <div><label>ชื่อ</label><input id="rg-first" placeholder="สมชาย" /></div>
@@ -843,6 +885,8 @@ function renderRegister(){
         <label>Cost Center (5 หลัก)</label><input id="rg-cc" maxlength="5" placeholder="82899" />
         <label>เบอร์ติดต่อ</label><input id="rg-contact" placeholder="081-234-5678" />
         <div id="rg-contact-err"></div>
+        <label>รหัสเชิญ (ไม่บังคับ)</label>
+        <input id="rg-invite" placeholder="ใส่เฉพาะกรณีที่ได้รับรหัสมาเพื่อสมัครเป็นคนขับ" />
         <button class="primary" id="rg-submit">สมัครสมาชิก</button>
         <button class="ghost" id="rg-back">กลับไปหน้าเข้าสู่ระบบ</button>
         <div id="rg-err"></div>
@@ -850,6 +894,10 @@ function renderRegister(){
     </div>
   `);
   app.appendChild(wrap);
+  // Carry over whatever they already typed on the login screen.
+  if(prefill.employee_id) wrap.querySelector("#rg-emp").value = prefill.employee_id;
+  if(prefill.email) wrap.querySelector("#rg-email").value = prefill.email;
+  if(prefill.contact) wrap.querySelector("#rg-contact").value = prefill.contact;
   wirePhoneAutoFormat(wrap.querySelector("#rg-contact"));
   wrap.querySelector("#rg-contact").addEventListener("blur", ()=>{
     const errBox = wrap.querySelector("#rg-contact-err");
@@ -878,15 +926,20 @@ function renderRegister(){
     const firstName = wrap.querySelector("#rg-first").value.trim();
     const lastName = wrap.querySelector("#rg-last").value.trim();
     try{
-      await api("/auth/register", {method:"POST", body: JSON.stringify({
+      const res = await api("/auth/register", {method:"POST", body: JSON.stringify({
         employee_id: wrap.querySelector("#rg-emp").value.trim(),
         email: email || null,
         full_name: [firstName, lastName].filter(Boolean).join(" "),
         password: password,
+        first_name: firstName,
+        last_name: lastName,
         cost_center: wrap.querySelector("#rg-cc").value.trim(),
         contact: contact.trim(),
+        invite_code: wrap.querySelector("#rg-invite").value.trim() || null,
       })});
-      toast("สมัครสมาชิกสำเร็จ! กรุณาเข้าสู่ระบบ");
+      toast(res && res.license
+        ? `สมัครสำเร็จ — ได้สิทธิ์คนขับ (ใบอนุญาต ${res.license})`
+        : "สมัครสมาชิกสำเร็จ! กรุณาเข้าสู่ระบบ");
       renderLogin();
     }catch(e){ errBox.appendChild(el(`<div class="err">${e.message}</div>`)); }
   };
@@ -903,7 +956,7 @@ async function renderForcedCheckin(){
   const wrap = el(`
     <div class="login-wrap">
       <div class="login-card" style="max-width:420px;">
-        <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;">SCDC</b></div>
+        <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;">CRL</b></div>
         <h1>เช็คอินรถก่อนเริ่มงาน</h1>
         <p class="sub">คุณ ${state.employee_id} ยังไม่ได้ขึ้นรถ กรุณาเลือกรถก่อนใช้งานระบบ</p>
         <label>เลือกรถที่ยังไม่มีคนขับ</label>
@@ -1027,7 +1080,7 @@ function renderShell(){
   const tabsDef = {
     USER: [["tasks","งานของฉัน"], ["history","ประวัติ"], ["profile","โปรไฟล์"]],
     DRIVER: [["available","งานของฉัน"], ["history","ประวัติ"], ["profile","โปรไฟล์"]],
-    ADMIN: [["dashboard","แดชบอร์ด"], ["operation","ปฏิบัติการ"], ["settings","ตั้งค่า"], ["profile","โปรไฟล์"]],
+    ADMIN: [["dashboard","แดชบอร์ด"], ["operation","ปฏิบัติการ"], ["settings","จัดการระบบ"], ["profile","โปรไฟล์"]],
   }[state.role];
 
   if(!tabsDef){
@@ -1141,7 +1194,7 @@ function taskCard(t, actionsHtml, opts={}){
       </div>
       ${t.blocked_reason ? `<div class="blocked-banner">⚠️ ถูกตีกลับ: ${t.blocked_reason}</div>` : ""}
       <div class="route">${t.from_location}<span class="arrow">→</span>${t.to_location}
-        <span class="route-type">(${t.task_type})</span></div>
+</div>
       <div class="fact-strip">${facts}</div>
       ${t.photo_url ? `<img class="thumb" data-photo-url="${t.photo_url}" />` : ""}
       ${actionsHtml ? `<div class="card-actions">${actionsHtml}</div>` : ""}
@@ -3635,9 +3688,9 @@ function openUserEditSheet(userId){
 }
 
 function renderAdminSettings(main){
-  if(!state.subtab) setTab(state.tab, "rules");
+  if(!state.subtab) setTab(state.tab, "system");
   const subtabs = el(`<div class="subtabs">
-    <button data-s="rules">กฎประเภทงาน</button>
+    <button data-s="system">ตั้งค่าระบบ</button>
     <button data-s="zones">โซน</button>
     <button data-s="matrix">เมทริกซ์รถ-โซน</button>
     <button data-s="vehicletypes">ประเภทรถ</button>
@@ -3649,45 +3702,126 @@ function renderAdminSettings(main){
   });
   main.appendChild(subtabs);
 
-  if(state.subtab === "rules"){
-    main.appendChild(el(`<div class="section-title">กฎกำหนดประเภทงาน (โซนต้นทาง → โซนปลายทาง → ประเภทงาน)</div>`));
-    const zoneName = (key)=>{ const z = state.zones.find(x=>x.zone_key===key); return z ? z.zone_name_th : key; };
-    const list = el(`<div class="card"></div>`);
-    state.taskRules.forEach(r=>{
-      list.appendChild(el(`<div class="list-row">
-        <span>${zoneName(r.from_zone)} → ${zoneName(r.to_zone)}</span>
-        <span style="display:flex;align-items:center;gap:8px;"><b>${r.task_type}</b><button class="btn sm red" data-del-rule="${r.id}">ลบ</button></span>
-      </div>`));
-    });
-    if(state.taskRules.length===0) list.appendChild(el(`<div class="empty">ยังไม่มีกฎ</div>`));
-    main.appendChild(list);
-    list.querySelectorAll("[data-del-rule]").forEach(b=>{
-      b.onclick = async ()=>{
-        if(!confirm("ยืนยันลบกฎนี้?")) return;
-        try{ await api(`/task-rules/${b.dataset.delRule}`, {method:"DELETE"}); toast("ลบกฎแล้ว"); await refreshAll(); }
-        catch(e){ toast(e.message); }
+  if(state.subtab === "system"){
+    // Everything an admin can change without a redeploy: the registration
+    // invite codes and the rack location layout. The layout lives here rather
+    // than in code because the warehouse defines its own ranges, and new
+    // aisles appear over time.
+    const box = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+    main.appendChild(box);
+    (async ()=>{
+      let cfg;
+      try{ cfg = await api("/admin/config", {background:true}); }
+      catch(e){ box.innerHTML = ""; box.appendChild(el(`<div class="err">${e.message}</div>`)); return; }
+      const v = cfg.values;
+      box.innerHTML = "";
+
+      box.appendChild(el(`<div class="section-title" style="margin-top:0;">รหัสเชิญสมัครเป็นคนขับ</div>`));
+      box.appendChild(el(`<div class="field-note" style="margin-bottom:8px;">
+        ใครก็ตามที่รู้รหัสนี้จะสมัครเป็นคนขับได้ทันที เปลี่ยนได้ที่นี่หากรหัสหลุด
+        และระบบจะแจ้งเตือนแอดมินทุกครั้งที่มีคนใช้รหัสสมัคร</div>`));
+      box.appendChild(el(`<label>รหัสเชิญ — ใบอนุญาต PE</label><input id="cfg-pe" value="${v.invite_code_pe || ""}" />`));
+      box.appendChild(el(`<label>รหัสเชิญ — ใบอนุญาต RT</label><input id="cfg-rt" value="${v.invite_code_rt || ""}" />`));
+
+      box.appendChild(el(`<div class="section-title">รูปแบบรหัสตำแหน่งชั้นวาง</div>`));
+      box.appendChild(el(`<div class="field-note" style="margin-bottom:8px;">
+        รหัสมี 7 ตัว: Aisle 3 ตัว + Bay 2 หลัก + Level 1 ตัว + Slot 1 หลัก (เช่น ABA03A2)<br>
+        ช่วงที่กรอกด้านล่างคือช่วงที่ระบบจะยอมรับ</div>`));
+      const ranges = [
+        ["Aisle", "rack_aisle_from", "rack_aisle_to", "AAA", "ABH"],
+        ["Bay", "rack_bay_from", "rack_bay_to", "01", "40"],
+        ["Level", "rack_level_from", "rack_level_to", "A", "G"],
+        ["Slot", "rack_slot_from", "rack_slot_to", "1", "5"],
+      ];
+      ranges.forEach(([label, kf, kt, ef, et])=>{
+        box.appendChild(el(`<label>${label}</label>
+          <div class="grid2">
+            <div><input id="cfg-${kf}" value="${v[kf] || ""}" placeholder="ตั้งแต่ ${ef}" /></div>
+            <div><input id="cfg-${kt}" value="${v[kt] || ""}" placeholder="ถึง ${et}" /></div>
+          </div>`));
+      });
+
+      box.appendChild(el(`<label>ตัวอักษรตัวแรกของ Aisle → ประเภทชั้นวาง</label>`));
+      box.appendChild(el(`<div class="field-note" style="margin-bottom:6px;">
+        รูปแบบ <b>A=DOUBLE_DEEP,B=SELECTIVE_RACK</b> — เพิ่มตัวอักษรใหม่ได้เรื่อยๆ คั่นด้วยจุลภาค</div>`));
+      box.appendChild(el(`<input id="cfg-rack_prefix_map" value="${v.rack_prefix_map || ""}" />`));
+
+      // Try a code against the CURRENT saved settings before committing to
+      // them — a layout that rejects real locations would stop every request
+      // from being created.
+      box.appendChild(el(`<div class="section-title">ทดสอบรหัสตำแหน่ง</div>`));
+      const testRow = el(`<div class="grid2">
+        <div><input id="cfg-test" placeholder="เช่น ABA03A2" /></div>
+        <div><button class="btn" id="cfg-test-btn" style="width:100%;">ตรวจสอบ</button></div>
+      </div>`);
+      box.appendChild(testRow);
+      const testOut = el(`<div id="cfg-test-out" style="margin-top:6px;"></div>`);
+      box.appendChild(testOut);
+      testRow.querySelector("#cfg-test-btn").onclick = async ()=>{
+        const code = box.querySelector("#cfg-test").value.trim();
+        if(!code) return;
+        try{
+          const res = await api(`/rack/validate?code=${encodeURIComponent(code)}`, {background:true});
+          testOut.innerHTML = "";
+          testOut.appendChild(el(res.ok
+            ? `<div class="field-note" style="color:var(--ok);">✅ ใช้ได้ — Aisle ${res.parsed.aisle} · Bay ${res.parsed.bay} · Level ${res.parsed.level} · Slot ${res.parsed.slot} · ${res.parsed.zone_key}</div>`
+            : `<div class="err">${res.error}</div>`));
+        }catch(e){ toast(e.message); }
       };
-    });
-    const zoneOptions = state.zones.map(z=>`<option value="${z.zone_key}">${z.zone_name_th}</option>`).join("");
-    const form = el(`<div class="card">
-      <div class="grid3">
-        <div><label>โซนต้นทาง</label><select id="tr-from">${zoneOptions}</select></div>
-        <div><label>โซนปลายทาง</label><select id="tr-to">${zoneOptions}</select></div>
-        <div><label>ประเภทงาน</label><input id="tr-type" placeholder="Picking" /></div>
-      </div>
-      <button class="primary" id="tr-submit">บันทึกกฎ</button>
-    </div>`);
-    form.querySelector("#tr-submit").onclick = async ()=>{
+
+      const saveBtn = el(`<button class="primary" style="width:100%;margin-top:14px;">บันทึกการตั้งค่า</button>`);
+      saveBtn.onclick = async ()=>{
+        const values = {invite_code_pe: box.querySelector("#cfg-pe").value.trim(),
+                        invite_code_rt: box.querySelector("#cfg-rt").value.trim(),
+                        rack_prefix_map: box.querySelector("#cfg-rack_prefix_map").value.trim()};
+        ranges.forEach(([, kf, kt])=>{
+          values[kf] = box.querySelector(`#cfg-${kf}`).value.trim();
+          values[kt] = box.querySelector(`#cfg-${kt}`).value.trim();
+        });
+        saveBtn.disabled = true;
+        try{
+          await api("/admin/config", {method:"PUT", body: JSON.stringify({values})});
+          toast("บันทึกการตั้งค่าแล้ว");
+        }catch(e){ toast(e.message); }
+        finally{ saveBtn.disabled = false; }
+      };
+      box.appendChild(saveBtn);
+
+      // Phone and email only became login identifiers in this build, so any
+      // pre-existing account sharing one is now ambiguous. Surface it instead
+      // of letting someone discover it when they can't log in.
+      const dupPhone = cfg.duplicates.phone || [], dupEmail = cfg.duplicates.email || [];
+      if(dupPhone.length || dupEmail.length){
+        const warn = el(`<div class="card" style="margin-top:14px;">
+          <div class="section-title" style="margin-top:0;color:var(--warn);">⚠️ ข้อมูลซ้ำที่ต้องแก้</div>
+          <div class="field-note" style="margin-bottom:8px;">
+            เบอร์โทรและอีเมลใช้ล็อกอินได้แล้ว บัญชีที่ใช้ซ้ำกันจะทำให้ระบบไม่รู้ว่าควรเข้าเป็นใคร
+            กรุณาแก้ให้เหลือบัญชีละหนึ่งค่า</div>
+          ${[...dupPhone.map(d=>["เบอร์", d]), ...dupEmail.map(d=>["อีเมล", d])].map(([kind, d])=>
+            `<div style="font-size:12px;line-height:1.8;margin-bottom:6px;">
+              <b>${kind} ${d.value}</b> — ใช้ร่วมกัน ${d.count} บัญชี:
+              ${d.users.map(u=>`${u.full_name || ""} (${u.employee_id})`).join(", ")}
+            </div>`).join("")}
+        </div>`);
+        main.appendChild(warn);
+      }
+
+      // Where this deployment runs and how far it is from the database.
       try{
-        await api("/task-rules", {method:"POST", body: JSON.stringify({
-          from_zone: form.querySelector("#tr-from").value,
-          to_zone: form.querySelector("#tr-to").value,
-          task_type: form.querySelector("#tr-type").value.trim(),
-        })});
-        toast("บันทึกกฎแล้ว"); await refreshAll();
-      }catch(e){ toast(e.message); }
-    };
-    main.appendChild(form);
+        const d = await api("/admin/diagnostics", {background:true});
+        main.appendChild(el(`<div class="card" style="margin-top:14px;">
+          <div class="section-title" style="margin-top:0;">สถานะระบบ</div>
+          <div style="font-size:12px;line-height:1.9;">
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--ink-dim);">เวอร์ชัน</span><span>${d.version}</span></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--ink-dim);">Region ที่ประมวลผล</span><span>${d.function_region || "-"}</span></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--ink-dim);">ฐานข้อมูล</span><span>${d.database_host || d.database_backend}</span></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--ink-dim);">เวลาต่อฐานข้อมูล</span><span>${d.connect_ms} ms</span></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--ink-dim);">เวลา query</span><span>${d.query_ms} ms</span></div>
+            <div style="display:flex;justify-content:space-between;font-weight:700;"><span>รวม</span><span>${d.total_ms} ms — ${d.verdict}</span></div>
+          </div>
+        </div>`));
+      }catch(e){ /* diagnostics are informational only */ }
+    })();
   } else if(state.subtab === "zones"){
     main.appendChild(el(`<div class="section-title">โซนทั้งหมด</div>`));
     main.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">ไม่ต้องสร้างรหัสตำแหน่งทีละอัน — กำหนดแค่รูปแบบ (pattern) ของโซน ระบบจะตรวจสอบรหัสที่พิมพ์เข้ามาอัตโนมัติ</div>`));
