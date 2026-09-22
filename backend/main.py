@@ -81,7 +81,58 @@ WAITING_TOO_LONG_MINUTES = 15
 IN_PROGRESS_OVERDUE_MINUTES = 60
 PENDING_PASSWORD = "PENDING"
 MIN_PASSWORD_LENGTH = 6
-VAPID_CLAIM_SUB = "mailto:admin@scdc.local"
+VAPID_CLAIM_SUB = "mailto:admin@scdc.local"   # legacy fallback only — see resolve_vapid_subject()
+
+
+# Apple's push service validates the VAPID "sub" (contact) claim and answers
+# 403 BadJwtToken unless it is a real mailto: address or https: URL on a real
+# domain. Google's push service doesn't check it, which is why push worked on
+# Android while failing on every iPhone. The legacy value above uses ".local",
+# a reserved domain that can never resolve, so it is never used for Apple.
+_UNUSABLE_SUFFIXES = (".local", ".localhost", ".invalid", ".test", ".example", ".internal")
+
+
+def _subject_host(subject: str):
+    s = (subject or "").strip()
+    if s.startswith("mailto:"):
+        addr = s[len("mailto:"):]
+        return addr.rsplit("@", 1)[1].lower() if "@" in addr else None
+    if s.startswith("https://"):
+        return s[len("https://"):].split("/")[0].split(":")[0].lower() or None
+    return None
+
+
+def subject_is_usable(subject: str) -> bool:
+    host = _subject_host(subject)
+    if not host or "." not in host or host == "localhost":
+        return False
+    return not host.endswith(_UNUSABLE_SUFFIXES)
+
+
+def resolve_vapid_subject():
+    """First usable contact from: VAPID_SUBJECT, then this deployment's own
+    public URL (Vercel sets these automatically). Returns (subject, source).
+
+    A bare email in VAPID_SUBJECT is accepted and given its mailto: prefix —
+    a missing scheme is an easy slip in a dashboard, and it fails exactly as
+    silently as a bad domain does.
+    """
+    raw = (os.environ.get("VAPID_SUBJECT") or "").strip()
+    if raw and "@" in raw and not raw.startswith(("mailto:", "https://")):
+        raw = "mailto:" + raw
+    candidates = [
+        (raw, "VAPID_SUBJECT"),
+        ("https://" + os.environ["VERCEL_PROJECT_PRODUCTION_URL"]
+         if os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") else "", "VERCEL_PROJECT_PRODUCTION_URL"),
+        ("https://" + os.environ["VERCEL_URL"] if os.environ.get("VERCEL_URL") else "", "VERCEL_URL"),
+    ]
+    for value, source in candidates:
+        if value and subject_is_usable(value):
+            return value, source
+    return VAPID_CLAIM_SUB, "fallback (ใช้กับ iPhone ไม่ได้)"
+
+
+VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 
 # ---------------------------------------------------------------------------
 # Build version — BUMP THIS ON EVERY RELEASE.
@@ -89,7 +140,7 @@ VAPID_CLAIM_SUB = "mailto:admin@scdc.local"
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.260922.1606"
+APP_VERSION = "TTLOD.260922.1646"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -172,39 +223,50 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
     payload = json.dumps({"title": title, "body": body, "url": url})
 
     def _one(s):
-        """Returns (sent?, subscription_id_to_delete_or_None)."""
+        """Returns (sent?, subscription_id_to_delete_or_None, (status, reason) or None)."""
         try:
             webpush(
                 subscription_info={"endpoint": s["endpoint"], "keys": {"p256dh": s["p256dh"], "auth": s["auth"]}},
                 data=payload,
                 vapid_private_key=vapid,
-                vapid_claims={"sub": VAPID_CLAIM_SUB},
+                vapid_claims={"sub": VAPID_SUBJECT},
                 ttl=60,
             )
             log.info("Web push sent to user %s (subscription %s)", user_id, s["id"])
-            return True, None
+            return True, None, None
         except WebPushException as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            if status in (404, 410, 403):
-                # 404/410 = subscription gone. 403 almost always means the
-                # push service rejected our VAPID signature outright (e.g.
-                # "BadJwtToken") — this happens if the VAPID key ever changed
-                # after this subscription was created, making it permanently
-                # unusable. None of these are worth retrying, so clean them up
-                # automatically instead of failing silently forever; the user
-                # just needs to re-enable notifications once in Profile to
-                # get a fresh subscription.
-                log.info("Web push subscription %s for user %s is invalid (status %s) — removing it. "
-                         "They'll need to toggle notifications off/on again in Profile.", s["id"], user_id, status)
-                return False, s["id"]
-            log.warning("Web push failed for subscription %s (user %s): %s", s["id"], user_id, e)
-            return False, None
+            resp = getattr(e, "response", None)
+            status = getattr(resp, "status_code", None)
+            reason = None
+            try:
+                reason = (resp.json() or {}).get("reason")
+            except Exception:
+                try:
+                    reason = (resp.text or "").strip()[:120] or None
+                except Exception:
+                    reason = None
+            # Only a subscription that is genuinely dead is deleted:
+            #   404/410             — the browser dropped it
+            #   403 VapidPkHashMismatch — it was made for a different server key
+            # A 403 BadJwtToken is different: it means OUR signature was
+            # refused (Apple rejects an unusable VAPID subject this way). The
+            # subscription is fine. The previous version deleted it anyway and
+            # told the person to switch notifications off and on — which could
+            # never work, since every new subscription hit the same 403 and was
+            # deleted too.
+            if status in (404, 410) or (status == 403 and reason == "VapidPkHashMismatch"):
+                log.info("Push subscription %s for user %s is dead (%s %s) — removing it",
+                         s["id"], user_id, status, reason)
+                return False, s["id"], (status, reason)
+            log.warning("Web push refused for subscription %s (user %s): %s %s",
+                        s["id"], user_id, status, reason)
+            return False, None, (status, reason)
         except Exception as e:
             # Most commonly: the server has no outbound internet access to reach
             # the browser's push relay (fcm.googleapis.com / Mozilla autopush /
             # Apple push) — very possible on a LAN-only office deployment.
             log.warning("Web push error for subscription %s (user %s): %s", s["id"], user_id, e)
-            return False, None
+            return False, None, (None, str(e)[:120])
 
     # Devices are pushed to CONCURRENTLY. Each webpush() is a blocking HTTPS
     # call out to FCM/Mozilla/Apple; done in sequence, a user with three
@@ -213,24 +275,38 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
     # not safe to share) — failures come back as ids and are deleted below,
     # on this thread.
     sent = 0
-    stale = []
-    if len(subs) == 1:
-        ok, bad = _one(subs[0])
+    stale, errors = [], []
+    results = [_one(subs[0])] if len(subs) == 1 else None
+    if results is None:
+        with ThreadPoolExecutor(max_workers=min(8, len(subs))) as pool:
+            results = list(pool.map(_one, subs))
+    for ok, bad, err in results:
         sent += 1 if ok else 0
         if bad:
             stale.append(bad)
-    else:
-        with ThreadPoolExecutor(max_workers=min(8, len(subs))) as pool:
-            for ok, bad in pool.map(_one, subs):
-                sent += 1 if ok else 0
-                if bad:
-                    stale.append(bad)
+        if err:
+            errors.append({"status": err[0], "reason": err[1]})
     for sub_id in stale:
         db.execute("DELETE FROM push_subscriptions WHERE id=?", (sub_id,))
-    return {
-        "attempted": len(subs), "sent": sent,
-        "reason": None if sent else "ส่งไม่สำเร็จทุกอุปกรณ์ที่เปิดแจ้งเตือนไว้ — ลองปิดแล้วเปิดใหม่อีกครั้ง",
-    }
+    return {"attempted": len(subs), "sent": sent, "errors": errors,
+            "reason": None if sent else _explain_push_failure(errors)}
+
+
+def _explain_push_failure(errors) -> str:
+    """Turn the push service's answer into something a person can act on.
+    "Try switching it off and on" is only offered when it can actually help."""
+    reasons = {e.get("reason") for e in errors}
+    statuses = {e.get("status") for e in errors}
+    if "BadJwtToken" in reasons:
+        return ("Apple ปฏิเสธลายเซ็นของเซิร์ฟเวอร์ (BadJwtToken) — เป็นปัญหาการตั้งค่าฝั่งเซิร์ฟเวอร์ "
+                "ปิด-เปิดแจ้งเตือนใหม่จะไม่ช่วย กรุณาแจ้งผู้ดูแลระบบให้ตั้งค่า VAPID_SUBJECT")
+    if "VapidPkHashMismatch" in reasons or statuses & {404, 410}:
+        return "การลงทะเบียนแจ้งเตือนบนเครื่องนี้หมดอายุแล้ว — กรุณาปิดแล้วเปิดแจ้งเตือนใหม่อีกครั้ง"
+    if None in statuses:
+        return "เซิร์ฟเวอร์ติดต่อบริการแจ้งเตือนไม่ได้ (" + "; ".join(
+            str(e.get("reason")) for e in errors if e.get("status") is None)[:120] + ")"
+    detail = ", ".join(f"{e.get('status')} {e.get('reason') or ''}".strip() for e in errors)
+    return f"บริการแจ้งเตือนปฏิเสธการส่ง ({detail})"
 
 
 # --------------------------------------------------------------------------
@@ -1647,10 +1723,21 @@ def change_password(body: ChangePasswordBody, user=Depends(current_user)):
 
 @app.get("/me")
 def me(user=Depends(current_user)):
-    return {"employee_id": user["employee_id"], "role": user["role"], "id": user["id"],
-            "full_name": user["full_name"], "contact": user["contact"], "cost_center": user["cost_center"],
-            "email": user["email"],
-            "driver_status": user["driver_status"], "checked_in_vehicle_id": user["checked_in_vehicle_id"]}
+    out = {"employee_id": user["employee_id"], "role": user["role"], "id": user["id"],
+           "full_name": user["full_name"], "contact": user["contact"], "cost_center": user["cost_center"],
+           "email": user["email"],
+           "driver_status": user["driver_status"], "checked_in_vehicle_id": user["checked_in_vehicle_id"]}
+    if user["role"] == "DRIVER":
+        # Read-only on the driver's own profile; only an admin changes these.
+        with get_db() as db:
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            out["licenses"] = [
+                {"vehicle_type": r["vehicle_type"], "expiry_date": r["expiry_date"],
+                 "valid": (not r["expiry_date"]) or r["expiry_date"] >= today}
+                for r in db.execute("SELECT vehicle_type, expiry_date FROM driver_licenses "
+                                    "WHERE driver_id=? ORDER BY vehicle_type", (user["id"],)).fetchall()
+            ]
+    return out
 
 
 @app.put("/me")
@@ -3338,6 +3425,11 @@ def admin_diagnostics(user=Depends(require_role("ADMIN"))):
         "query_ms": round(query_ms, 1),
         "total_ms": round(total, 1),
         "verdict": verdict,
+        # So an admin can confirm push will reach iPhones without needing to
+        # read server logs: Apple refuses anything but a real contact address.
+        "vapid_subject": VAPID_SUBJECT,
+        "vapid_subject_source": VAPID_SUBJECT_SOURCE,
+        "vapid_subject_ios_ok": subject_is_usable(VAPID_SUBJECT),
     }
 
 
@@ -3606,7 +3698,10 @@ def vehicles_available_for_checkin(user=Depends(require_role("DRIVER"))):
             "AND checked_in_vehicle_id IS NOT NULL AND id != ?) ORDER BY code",
             (user["id"],),
         ).fetchall()
-        return [dict(r) for r in rows]
+        # Only vehicles this driver is licensed for — offering the rest would
+        # just be a list of buttons that all end in an error.
+        allowed = valid_license_types(db, user["id"])
+        return [dict(r) for r in rows if r["vehicle_type"] in allowed]
 
 
 class DriverStatusBody(BaseModel):
@@ -3629,6 +3724,15 @@ class CheckInBody(BaseModel):
     battery_level: Optional[int] = None
 
 
+def valid_license_types(db, driver_id) -> set:
+    """Vehicle types this driver may operate TODAY. A licence with no expiry
+    is permanent; one past its expiry date no longer counts."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    rows = db.execute("SELECT vehicle_type, expiry_date FROM driver_licenses WHERE driver_id=?",
+                      (driver_id,)).fetchall()
+    return {r["vehicle_type"] for r in rows if not r["expiry_date"] or r["expiry_date"] >= today}
+
+
 @app.post("/vehicles/check-in")
 def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
     with get_db() as db:
@@ -3639,6 +3743,15 @@ def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
             raise HTTPException(400, "รถคันนี้ถูกปลดระวางแล้ว ไม่สามารถเช็คอินได้")
         if v["status"] == "Breakdown":
             raise HTTPException(400, "รถคันนี้ถูกแจ้งว่าเสีย จึงเช็คอินไม่ได้")
+        # No licence for this type, no boarding. Checked here rather than only
+        # at assignment, so a driver can never be sitting in a vehicle they
+        # aren't allowed to operate.
+        allowed = valid_license_types(db, user["id"])
+        if v["vehicle_type"] not in allowed:
+            have = ", ".join(sorted(allowed)) or "ไม่มี"
+            raise HTTPException(
+                403, f"คุณไม่มีใบอนุญาตขับรถประเภท {v['vehicle_type']} (ใบอนุญาตที่มี: {have}) "
+                     f"กรุณาติดต่อแอดมิน")
         if body.battery_level is not None:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, v["id"]))
         db.execute("UPDATE users SET checked_in_vehicle_id=? WHERE id=?", (v["id"], user["id"]))
