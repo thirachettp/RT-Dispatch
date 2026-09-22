@@ -92,6 +92,23 @@
 
   .app-version{font-size:11px;color:var(--ink-dim);text-align:center;
     letter-spacing:.04em;padding:10px 0 4px;opacity:.75;}
+  /* Assign sheet: task details block + per-vehicle-type groups. */
+  .as-detail{background:var(--panel-2);border-radius:12px;padding:12px 14px;margin-bottom:12px;}
+  .as-code{display:flex;align-items:center;justify-content:space-between;gap:8px;
+    font-weight:800;font-size:14px;margin-bottom:6px;}
+  .as-route{font-size:15px;font-weight:800;line-height:1.45;margin-bottom:8px;}
+  .as-route .arrow{margin:0 6px;color:var(--ink-dim);font-weight:500;}
+  .as-d{display:flex;justify-content:space-between;gap:12px;font-size:12px;line-height:1.9;}
+  .as-d span{color:var(--ink-dim);flex:none;}
+  .as-d b{text-align:right;font-weight:600;word-break:break-word;}
+  .as-group{margin-top:12px;}
+  .as-group-head{display:flex;justify-content:space-between;align-items:center;
+    font-weight:800;font-size:13px;margin-bottom:6px;}
+  .as-count{font-size:12px;font-weight:600;color:var(--ink-dim);background:var(--panel-2);
+    padding:3px 10px;border-radius:999px;}
+  .as-count.on{color:#fff;background:var(--blue);}
+  #as-submit:disabled{opacity:.55;cursor:not-allowed;}
+
   .brand{display:flex;align-items:center;gap:10px;}
   .logo-mark{width:28px;height:28px;border-radius:8px;background:var(--amber);display:flex;
     align-items:center;justify-content:center;flex:none;}
@@ -574,6 +591,89 @@ function wireDualSlider(container, id, min, max){
   };
 }
 function fmtTime(iso){ if(!iso) return "-"; const d=new Date(iso); return d.toLocaleString('th-TH',{hour:'2-digit',minute:'2-digit',day:'2-digit',month:'2-digit'}); }
+// Phones are stored as digits only (so login and uniqueness can compare them);
+// this puts the familiar dashes back for display.
+function fmtPhone(p){
+  const d = String(p || "").replace(/\D/g, "");
+  if(d.length === 10) return `${d.slice(0,3)}-${d.slice(3,6)}-${d.slice(6)}`;
+  if(d.length === 9) return `${d.slice(0,2)}-${d.slice(2,5)}-${d.slice(5)}`;
+  return p || "-";
+}
+
+function minutesAgo(iso){
+  if(!iso) return null;
+  return Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+}
+
+function fmtDuration(mins){
+  if(mins === null || mins === undefined) return "-";
+  if(mins < 60) return `${mins} นาที`;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return m ? `${h} ชม. ${m} นาที` : `${h} ชม.`;
+}
+
+// Each driver's current vehicle and live task, worked out from data the page
+// already holds — so the panel adds no extra request to every refresh.
+function driverSnapshot(){
+  const vehById = {};
+  (state.vehicles || []).forEach(v=> vehById[v.id] = v);
+  const liveTaskByDriver = {};
+  (state.tasks || []).forEach(t=>{
+    if(["Completed","Cancelled","Waiting"].includes(t.status)) return;
+    (t.drivers || []).forEach(d=>{ if(!liveTaskByDriver[d.employee_id]) liveTaskByDriver[d.employee_id] = t; });
+  });
+  return (state.drivers || []).map(d=>{
+    const v = vehById[d.checked_in_vehicle_id];
+    const t = liveTaskByDriver[d.employee_id];
+    return {
+      emp: d.employee_id,
+      name: d.full_name || d.employee_id,
+      status: d.driver_status,
+      vehicleType: v ? v.vehicle_type : null,
+      vehicleCode: v ? v.code : null,
+      licenses: (d.license_types || "").split(",").map(s=>s.trim()).filter(Boolean),
+      task: t || null,
+      busyMins: t ? minutesAgo(t.started_at || t.accepted_at || t.created_at) : null,
+    };
+  });
+}
+
+function renderDriversNowPanel(container){
+  const snap = driverSnapshot();
+  const free = snap.filter(d=> d.status === "Available" && d.vehicleCode);
+  const busy = snap.filter(d=> d.status === "Busy");
+  const out  = snap.filter(d=> !free.includes(d) && !busy.includes(d));
+
+  const panel = el(`<div class="card"></div>`);
+  panel.appendChild(el(`<div class="section-title" style="margin-top:0;">คนขับตอนนี้</div>`));
+  panel.appendChild(el(`<div class="stat-grid" style="margin-bottom:10px;">
+    <div class="stat"><div class="n">${free.length}</div><div class="l">ว่าง</div></div>
+    <div class="stat"><div class="n">${busy.length}</div><div class="l">ติดงาน</div></div>
+    <div class="stat"><div class="n">${out.length}</div><div class="l">ยังไม่พร้อม</div></div>
+  </div>`));
+
+  if(free.length){
+    panel.appendChild(el(`<div class="field-note" style="margin-bottom:6px;">ว่างพร้อมรับงาน</div>`));
+    panel.appendChild(el(`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;">
+      ${free.map(d=>`<span class="badge ok">${d.name} · ${d.vehicleType} ${d.vehicleCode}</span>`).join("")}
+    </div>`));
+  }
+  if(busy.length){
+    panel.appendChild(el(`<div class="field-note" style="margin-bottom:6px;">ติดงานอยู่</div>`));
+    panel.appendChild(el(`<div style="font-size:12px;line-height:1.9;margin-bottom:10px;">
+      ${busy.map(d=>`<div style="display:flex;justify-content:space-between;gap:10px;">
+        <span>${d.name}${d.vehicleCode ? ` · ${d.vehicleType} ${d.vehicleCode}` : ""}</span>
+        <span style="color:var(--ink-dim);white-space:nowrap;">${d.task ? d.task.task_code : "-"} · ${fmtDuration(d.busyMins)}</span>
+      </div>`).join("")}
+    </div>`));
+  }
+  if(out.length){
+    panel.appendChild(el(`<div class="field-note">ยังไม่พร้อม: ${out.map(d=>
+      `${d.name} (${d.vehicleCode ? (DRIVER_STATUS_LABEL[d.status] || d.status) : "ยังไม่เช็คอินรถ"})`).join(", ")}</div>`));
+  }
+  container.appendChild(panel);
+}
+
 function fmtClock(date){ return date ? date.toLocaleTimeString('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : "-"; }
 
 // Generic pull-to-refresh: only engages when the page is already scrolled to
@@ -1182,7 +1282,7 @@ function taskCard(t, actionsHtml, opts={}){
     cardFact(ICO.clock, "วันที่/เวลา", fmtTime(t.created_at)),
     driverLabel ? cardFact(ICO.truck, "คนขับ", driverLabel + (t.vehicle_code ? ` · ${t.vehicle_code}` : "")) : "",
     showRequester ? cardFact(ICO.user, "ผู้ขอ", t.requester_name || t.requester_employee_id || "-") : "",
-    showRequester ? cardFact(ICO.phone, "ติดต่อ", t.requester_contact || "-") : "",
+    showRequester ? cardFact(ICO.phone, "ติดต่อ", fmtPhone(t.requester_contact)) : "",
     t.rating ? cardFact(ICO.star, "คะแนน", "★".repeat(t.rating) + "☆".repeat(5 - t.rating)) : "",
   ].filter(Boolean).join("");
 
@@ -2705,9 +2805,12 @@ async function loadAuthenticatedImages(container){
 // Operation = "What is happening now?" — live jobs, people, vehicles, exceptions.
 function renderAdminOperation(main){
   // Dispatching is the admin's main daily loop, so it is the landing subtab.
-  if(!state.subtab) setTab(state.tab, "dispatch");
+  // "dispatch" was folded into "jobs". Anyone whose last-visited subtab was
+  // saved as "dispatch" (or anything else no longer offered) would otherwise
+  // land on a blank page, because no branch below matches it.
+  const OPS_SUBTABS = ["jobs", "people", "vehicles", "breakdowns", "broadcast", "teamchat"];
+  if(!OPS_SUBTABS.includes(state.subtab)) setTab(state.tab, "jobs");
   const subtabs = el(`<div class="subtabs">
-    <button data-s="dispatch">กระจายงาน</button>
     <button data-s="jobs">งาน</button>
     <button data-s="people">พนักงาน</button>
     <button data-s="vehicles">รถ</button>
@@ -2721,8 +2824,7 @@ function renderAdminOperation(main){
   });
   main.appendChild(subtabs);
 
-  if(state.subtab === "dispatch") renderDispatchBoard(main);
-  else if(state.subtab === "jobs") renderOperationJobs(main);
+  if(state.subtab === "jobs") renderOperationJobs(main);
   else if(state.subtab === "people") renderOperationPeople(main);
   else if(state.subtab === "vehicles") renderOperationVehicles(main);
   else if(state.subtab === "breakdowns") renderOperationBreakdowns(main);
@@ -2933,6 +3035,10 @@ async function refreshDispatchBoard(){
 function renderOperationJobs(main){
   if(!state.opsJobFilter) state.opsJobFilter = {status:"", overdue:false};
 
+  // Who is free, and who frees up when — the first thing needed before
+  // handing out work, so it sits above the queue.
+  renderDriversNowPanel(main);
+
   const activeTasks = state.tasks.filter(t=> !["Completed","Cancelled"].includes(t.status));
   const overdueCount = activeTasks.filter(t=>{
     const now = Date.now();
@@ -2979,7 +3085,10 @@ function renderOperationJobs(main){
       return false;
     });
   }
-  main.appendChild(el(`<div class="section-title">งาน (${tasks.length})</div>`));
+  // Oldest first: work should be handed out front-to-back, so the job that
+  // has waited longest is the one at the top.
+  tasks.sort((a,b)=> String(a.created_at||"").localeCompare(String(b.created_at||"")));
+  main.appendChild(el(`<div class="section-title">งาน (${tasks.length}) · เก่าสุดก่อน</div>`));
   if(tasks.length === 0) main.appendChild(el(`<div class="empty">ไม่พบงานตามตัวกรอง</div>`));
   tasks.forEach(t=>{
     let actions = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
@@ -3139,122 +3248,168 @@ function openVehicleEditSheet(vehicleId){
 }
 
 async function openAssignSheet(taskId, isReassign){
-  // Multi-select: the admin picks the whole crew for a job in one pass and
-  // confirms once, instead of assigning one driver and then adding the rest
-  // through a second flow.
+  // Layout, top to bottom:
+  //   1. everything about the job, so nobody assigns blind
+  //   2. drivers grouped by the vehicle they're checked into — RT, then PE
+  //   3. a confirm button that states the result ("RT 1 คัน · PE 2 คัน")
   //
-  // Every driver is listed — not just the ones who pass the licence/zone
-  // check — because the admin asked to see everyone. Those who don't meet the
-  // conditions are still marked with the reason and still selectable; picking
-  // one just asks for confirmation first rather than being silently blocked.
-  const selected = new Set();
+  // Choosing a driver IS choosing a vehicle, so the count per type is simply
+  // how many are ticked in that group. There is deliberately no "how many RT"
+  // number box: that would require the system to pick the people, and the
+  // admin chooses who does the work — the system only groups and warns.
   const task = findTask(taskId);
+  const snap = driverSnapshot();
+  const selected = new Set();
 
   function issuesFor(d){
+    if(!d.vehicleCode) return ["ยังไม่ได้เช็คอินรถ"];
     const out = [];
-    if(!d.checked_in_vehicle_id) return ["ยังไม่ได้เช็คอินรถ"];
-    if(d.driver_status !== "Available") out.push(DRIVER_STATUS_LABEL[d.driver_status] || d.driver_status);
-    const v = state.vehicles.find(x=> x.id === d.checked_in_vehicle_id);
-    const vt = v && v.vehicle_type;
-    const lic = (d.license_types || "").split(",").map(s=>s.trim()).filter(Boolean);
-    if(vt && lic.length && !lic.includes(vt)) out.push(`ไม่มีใบอนุญาตรถ ${vt}`);
+    if(d.status !== "Available") out.push(d.status === "Busy" && d.task
+      ? `ติดงาน ${d.task.task_code} (${fmtDuration(d.busyMins)})`
+      : (DRIVER_STATUS_LABEL[d.status] || d.status));
+    // Same rule as the server: no matching licence row means not eligible.
+    // (Skipping the check when a driver has NO licences at all — as the older
+    // sheet did — let the admin pick someone the server then rejected.)
+    if(!d.licenses.includes(d.vehicleType)) out.push(`ไม่มีใบอนุญาต ${d.vehicleType}`);
     return out;
   }
+  const rows = snap.map(d=> ({...d, issues: issuesFor(d)}));
 
-  const rows = (state.drivers || []).map(d=>{
-    const v = state.vehicles.find(x=> x.id === d.checked_in_vehicle_id);
-    return {
-      emp: d.employee_id,
-      name: d.full_name || d.employee_id,
-      vehicleType: v ? v.vehicle_type : null,
-      vehicleCode: v ? v.code : null,
-      issues: issuesFor(d),
-      canPick: !!d.checked_in_vehicle_id,
-    };
-  });
+  // Within each group, available drivers first — the likely picks — then
+  // everyone else. Alphabetical inside that, so the list doesn't reshuffle
+  // itself between refreshes.
+  const byReadiness = (a, b)=> (a.issues.length - b.issues.length) || a.name.localeCompare(b.name, "th");
+  const groups = [
+    {key: "RT", title: "RT — รถยก", rows: rows.filter(r=> r.vehicleType === "RT").sort(byReadiness)},
+    {key: "PE", title: "PE — รถลาก", rows: rows.filter(r=> r.vehicleType === "PE").sort(byReadiness)},
+  ];
+  const unready = rows.filter(r=> !r.vehicleType).sort(byReadiness);
+
+  const t = task || {};
+  const waitMins = minutesAgo(t.created_at);
+  const current = (t.drivers || []).map(d=> d.full_name || d.employee_id).join(", ");
+  const detail = (label, value)=> value ? `<div class="as-d"><span>${label}</span><b>${value}</b></div>` : "";
+
+  const rowHTML = (r, disabled)=> `
+    <label class="driver-pick ${disabled ? "is-blocked" : ""}" data-search="${(r.name + " " + r.emp).toLowerCase()}">
+      <input type="checkbox" data-pick="${r.emp}" data-type="${r.vehicleType || ""}" ${disabled ? "disabled" : ""} />
+      <span class="dp-body">
+        <span class="dp-name">${r.name}</span>
+        <span class="dp-sub">${r.vehicleCode ? `${r.vehicleType} ${r.vehicleCode}` : "ยังไม่ได้เช็คอินรถ"}</span>
+        ${r.issues.length && !disabled ? `<span class="dp-warn">⚠ ${r.issues.join(" · ")}</span>` : ""}
+      </span>
+    </label>`;
 
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>${isReassign ? "มอบหมายใหม่" : "มอบหมายงาน"}${task ? " " + task.task_code : ""}</h2><button id="sh-close">✕</button></div>
-        <div class="field-note">เลือกได้หลายคน · รถจะใช้คันที่คนขับเช็คอินไว้โดยอัตโนมัติ</div>
-        <input id="as-driver-search" placeholder="ค้นหาชื่อหรือรหัสพนักงาน..." />
-        <div class="driver-pick-list" id="as-driver-list">
-          ${rows.map(r=>`
-            <label class="driver-pick ${r.canPick ? "" : "is-blocked"}" data-search="${(r.name + " " + r.emp).toLowerCase()}">
-              <input type="checkbox" data-pick="${r.emp}" ${r.canPick ? "" : "disabled"} />
-              <span class="dp-body">
-                <span class="dp-name">${r.name}</span>
-                <span class="dp-sub">${r.vehicleType ? `${r.vehicleType}${r.vehicleCode ? " · " + r.vehicleCode : ""}` : "ยังไม่ได้เช็คอินรถ"}</span>
-                ${r.issues.length && r.canPick ? `<span class="dp-warn">⚠ ${r.issues.join(" · ")}</span>` : ""}
-              </span>
-            </label>`).join("")}
+        <div class="sheet-head"><h2>${isReassign ? "มอบหมายใหม่" : "มอบหมายงาน"}</h2><button id="sh-close">✕</button></div>
+
+        <div class="as-detail">
+          <div class="as-code">${t.task_code || ""} <span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status || ""}</span></div>
+          <div class="as-route">${t.from_location || "-"} <span class="arrow">→</span> ${t.to_location || "-"}</div>
+          ${detail("จำนวนพาเลท", t.pallet_qty)}
+          ${detail("สร้างคำขอเมื่อ", t.created_at ? `${fmtTime(t.created_at)} (${fmtDuration(waitMins)}ที่แล้ว)` : "")}
+          ${t.request_type === "Booking" ? detail("นัดหมาย", fmtTime(t.scheduled_at)) : ""}
+          ${detail("ผู้ขอ", t.requester_name || t.requester_employee_id)}
+          ${detail("ติดต่อ", t.requester_contact ? fmtPhone(t.requester_contact) : "")}
+          ${detail("หมายเหตุ", t.remark)}
+          ${isReassign ? detail("คนขับตอนนี้", current || "-") : ""}
         </div>
+
+        <input id="as-driver-search" placeholder="ค้นหาชื่อหรือรหัสพนักงาน..." />
+
+        ${groups.map(g=> `
+          <div class="as-group" data-group="${g.key}">
+            <div class="as-group-head"><span>${g.title}</span><span class="as-count" data-count="${g.key}">ยังไม่เลือก</span></div>
+            ${g.rows.length
+              ? `<div class="driver-pick-list">${g.rows.map(r=> rowHTML(r, false)).join("")}</div>`
+              : `<div class="field-note" style="padding:6px 2px;">ไม่มีคนขับที่เช็คอินรถ ${g.key} อยู่</div>`}
+          </div>`).join("")}
+
+        ${unready.length ? `
+          <details class="as-more">
+            <summary>ยังไม่เช็คอินรถ (${unready.length} คน) — มอบหมายไม่ได้</summary>
+            <div class="driver-pick-list">${unready.map(r=> rowHTML(r, true)).join("")}</div>
+          </details>` : ""}
+
         <details class="as-more">
-          <summary>ตัวเลือกเพิ่มเติม</summary>
+          <summary>ตัวเลือกเพิ่มเติม (ETA / เหตุผล)</summary>
           <label>ETA (นาทีจากนี้ ไม่บังคับ)</label>
           <input id="as-eta" type="number" min="1" placeholder="เช่น 20" />
           <label>เหตุผล ${isReassign ? "(ระบุบริบท เช่น รถเสีย)" : "(ไม่บังคับ)"}</label>
           <textarea id="as-reason" rows="2" placeholder="เช่น คนขับเดิมแจ้งรถขัดข้อง"></textarea>
         </details>
+
         <div id="as-eligibility"></div>
-        <button class="primary" id="as-submit">${isReassign ? "ยืนยันมอบหมายใหม่" : "ยืนยันมอบหมาย"}</button>
+        <button class="primary" id="as-submit" disabled>เลือกคนขับอย่างน้อย 1 คน</button>
       </div>
-    </div>
-  `);
+    </div>`);
   document.body.appendChild(overlay);
   overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   const submitBtn = overlay.querySelector("#as-submit");
-  function syncSubmit(){
-    submitBtn.textContent = selected.size
-      ? `${isReassign ? "ยืนยันมอบหมายใหม่" : "ยืนยันมอบหมาย"} (${selected.size} คน)`
-      : (isReassign ? "ยืนยันมอบหมายใหม่" : "ยืนยันมอบหมาย");
+  function counts(){
+    const c = {RT: 0, PE: 0};
+    overlay.querySelectorAll("[data-pick]:checked").forEach(cb=>{ if(c[cb.dataset.type] !== undefined) c[cb.dataset.type]++; });
+    return c;
+  }
+  function sync(){
+    const c = counts();
+    Object.entries(c).forEach(([k, n])=>{
+      const tag = overlay.querySelector(`[data-count="${k}"]`);
+      if(tag){ tag.textContent = n ? `เลือกแล้ว ${n} คัน` : "ยังไม่เลือก"; tag.classList.toggle("on", n > 0); }
+    });
+    const parts = Object.entries(c).filter(([, n])=> n).map(([k, n])=> `${k} ${n} คัน`);
+    submitBtn.disabled = parts.length === 0;
+    submitBtn.textContent = parts.length
+      ? `${isReassign ? "มอบหมายใหม่" : "มอบหมาย"} · ${parts.join(" · ")}`
+      : "เลือกคนขับอย่างน้อย 1 คน";
   }
   overlay.querySelectorAll("[data-pick]").forEach(cb=>{
     cb.onchange = ()=>{
       if(cb.checked) selected.add(cb.dataset.pick); else selected.delete(cb.dataset.pick);
       cb.closest(".driver-pick").classList.toggle("is-on", cb.checked);
-      syncSubmit();
+      sync();
     };
   });
   overlay.querySelector("#as-driver-search").addEventListener("input", (e)=>{
     const q = e.target.value.trim().toLowerCase();
-    overlay.querySelectorAll("#as-driver-list [data-search]").forEach(row=>{
+    overlay.querySelectorAll("[data-search]").forEach(row=>{
       row.style.display = row.dataset.search.includes(q) ? "" : "none";
     });
   });
 
   async function submit(force){
     if(!selected.size){ toast("กรุณาเลือกคนขับอย่างน้อย 1 คน"); return; }
-    const picked = [...selected];
+    // RT first, then PE, so the primary driver is predictable.
+    const order = {RT: 0, PE: 1};
+    const picked = [...selected].sort((a, b)=>{
+      const ra = rows.find(r=> r.emp === a), rb = rows.find(r=> r.emp === b);
+      return (order[ra && ra.vehicleType] ?? 9) - (order[rb && rb.vehicleType] ?? 9);
+    });
     if(!force){
-      // Selecting someone who doesn't meet the conditions is allowed, but not
-      // by accident — name who and why before going ahead.
       const flagged = rows.filter(r=> picked.includes(r.emp) && r.issues.length);
       if(flagged.length){
-        const detail = flagged.map(r=> `${r.name}: ${r.issues.join(", ")}`).join("\n");
-        if(!confirm(`คนขับต่อไปนี้ไม่ตรงเงื่อนไข\n\n${detail}\n\nยืนยันมอบหมายหรือไม่?`)) return;
+        const detailTxt = flagged.map(r=> `${r.name}: ${r.issues.join(", ")}`).join("\n");
+        if(!confirm(`คนขับต่อไปนี้ไม่ตรงเงื่อนไข\n\n${detailTxt}\n\nยืนยันมอบหมายหรือไม่?`)) return;
         force = true;
       }
     }
-    const body = {
-      driver_employee_ids: picked,
-      reason: overlay.querySelector("#as-reason").value.trim(),
-      force: !!force,
-    };
+    const body = {driver_employee_ids: picked, reason: overlay.querySelector("#as-reason").value.trim(), force: !!force};
     const etaVal = overlay.querySelector("#as-eta").value;
     if(etaVal) body.estimated_minutes = parseInt(etaVal);
+    const c = counts();
     submitBtn.disabled = true;
     try{
       await api(`/tasks/${taskId}/${isReassign ? "reassign" : "assign"}`, {method:"POST", body: JSON.stringify(body)});
       closeSheet(overlay);
-      toast(isReassign ? "มอบหมายใหม่แล้ว" : `มอบหมายให้ ${picked.length} คนแล้ว`);
+      toast(`มอบหมาย ${t.task_code || ""} แล้ว — ` +
+            Object.entries(c).filter(([, n])=> n).map(([k, n])=> `${k} ${n} คัน`).join(", "));
       await refreshAll();
-      if(typeof refreshDispatchBoard === "function") await refreshDispatchBoard();
     }catch(e){
-      submitBtn.disabled = false;
+      sync();
       if(e.status === 409){
         const box = overlay.querySelector("#as-eligibility");
         box.innerHTML = "";
@@ -3268,6 +3423,7 @@ async function openAssignSheet(taskId, isReassign){
     }
   }
   submitBtn.onclick = ()=> submit(false);
+  sync();
 }
 
 function renderOperationPeople(main){
@@ -3720,8 +3876,8 @@ function renderAdminSettings(main){
       box.appendChild(el(`<div class="field-note" style="margin-bottom:8px;">
         ใครก็ตามที่รู้รหัสนี้จะสมัครเป็นคนขับได้ทันที เปลี่ยนได้ที่นี่หากรหัสหลุด
         และระบบจะแจ้งเตือนแอดมินทุกครั้งที่มีคนใช้รหัสสมัคร</div>`));
-      box.appendChild(el(`<label>รหัสเชิญ — ใบอนุญาต PE</label><input id="cfg-pe" value="${v.invite_code_pe || ""}" />`));
-      box.appendChild(el(`<label>รหัสเชิญ — ใบอนุญาต RT</label><input id="cfg-rt" value="${v.invite_code_rt || ""}" />`));
+      box.appendChild(el(`<div><label>รหัสเชิญ — ใบอนุญาต PE</label><input id="cfg-pe" value="${v.invite_code_pe || ""}" /></div>`));
+      box.appendChild(el(`<div><label>รหัสเชิญ — ใบอนุญาต RT</label><input id="cfg-rt" value="${v.invite_code_rt || ""}" /></div>`));
 
       box.appendChild(el(`<div class="section-title">รูปแบบรหัสตำแหน่งชั้นวาง</div>`));
       box.appendChild(el(`<div class="field-note" style="margin-bottom:8px;">
@@ -3734,11 +3890,11 @@ function renderAdminSettings(main){
         ["Slot", "rack_slot_from", "rack_slot_to", "1", "5"],
       ];
       ranges.forEach(([label, kf, kt, ef, et])=>{
-        box.appendChild(el(`<label>${label}</label>
+        box.appendChild(el(`<div><label>${label}</label>
           <div class="grid2">
             <div><input id="cfg-${kf}" value="${v[kf] || ""}" placeholder="ตั้งแต่ ${ef}" /></div>
             <div><input id="cfg-${kt}" value="${v[kt] || ""}" placeholder="ถึง ${et}" /></div>
-          </div>`));
+          </div></div>`));
       });
 
       box.appendChild(el(`<label>ตัวอักษรตัวแรกของ Aisle → ประเภทชั้นวาง</label>`));
@@ -3771,6 +3927,10 @@ function renderAdminSettings(main){
 
       const saveBtn = el(`<button class="primary" style="width:100%;margin-top:14px;">บันทึกการตั้งค่า</button>`);
       saveBtn.onclick = async ()=>{
+        const need = ["#cfg-pe", "#cfg-rt", "#cfg-rack_prefix_map",
+                      ...ranges.flatMap(([, kf, kt])=> [`#cfg-${kf}`, `#cfg-${kt}`])];
+        const missing = need.filter(sel=> !box.querySelector(sel));
+        if(missing.length){ toast("หน้าตั้งค่าโหลดไม่ครบ กรุณารีเฟรชแล้วลองใหม่"); return; }
         const values = {invite_code_pe: box.querySelector("#cfg-pe").value.trim(),
                         invite_code_rt: box.querySelector("#cfg-rt").value.trim(),
                         rack_prefix_map: box.querySelector("#cfg-rack_prefix_map").value.trim()};
