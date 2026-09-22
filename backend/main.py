@@ -89,7 +89,7 @@ VAPID_CLAIM_SUB = "mailto:admin@scdc.local"
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.260922.1119"
+APP_VERSION = "TTLOD.260922.1442"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -994,6 +994,22 @@ def ensure_columns():
             if added:
                 log.info("Schema updated: added %s", ", ".join(added))
 
+            # Phone numbers were stored as typed/displayed ("081-234-5678").
+            # Login and the uniqueness check compare digits only, so every
+            # legacy number must be reduced to digits once, or phone login
+            # silently fails for all pre-existing accounts.
+            legacy = db.execute(
+                "SELECT id, contact FROM users WHERE contact IS NOT NULL AND contact != ''"
+            ).fetchall()
+            fixed = 0
+            for r in legacy:
+                digits = normalize_phone(r["contact"])
+                if digits != r["contact"]:
+                    db.execute("UPDATE users SET contact=? WHERE id=?", (digits, r["id"]))
+                    fixed += 1
+            if fixed:
+                log.info("Normalised %d legacy phone number(s) to digits", fixed)
+
             # Split legacy single-field names into first/last ONCE, at the
             # first space. Names with three words keep everything after the
             # first space as the surname, which is the least-wrong split for
@@ -1588,21 +1604,23 @@ def update_me(body: ProfileUpdateBody, user=Depends(current_user)):
         if not body.full_name.strip():
             raise HTTPException(400, "ชื่อ-นามสกุลต้องไม่เว้นว่าง")
         fields["full_name"] = body.full_name.strip()
-    if body.contact is not None:
-        if not valid_thai_phone(body.contact):
-            raise HTTPException(400, "เบอร์ติดต่อไม่ถูกต้อง (ต้องเป็นเบอร์โทรไทย 9-10 หลัก)")
-        fields["contact"] = body.contact
+    # contact is validated inside the DB block below — it needs a uniqueness
+    # check now that phone numbers are a login identifier.
     if body.cost_center is not None:
         if user["role"] != "USER":
             raise HTTPException(400, "เฉพาะบัญชีผู้ขอใช้งานเท่านั้นที่มี Cost center")
         if not body.cost_center.isdigit() or len(body.cost_center) != 5:
             raise HTTPException(400, "Cost center ต้องเป็นตัวเลข 5 หลัก")
         fields["cost_center"] = body.cost_center
-    if not fields and body.email is None:
+    if not fields and body.email is None and body.contact is None:
         return {"ok": True}
     with get_db() as db:
         if body.email is not None:
             fields["email"] = validate_and_normalize_email(db, body.email, exclude_user_id=user["id"])
+        if body.contact is not None:
+            # Digits only, the same form register and login use. Storing the
+            # dashed display form here is what made phone login fail.
+            fields["contact"] = validate_and_normalize_contact(db, body.contact, exclude_user_id=user["id"])
         if not fields:
             return {"ok": True}
         set_clause = ", ".join(f"{k}=?" for k in fields.keys())
@@ -3122,6 +3140,15 @@ def put_admin_config(body: ConfigBody, user=Depends(require_role("ADMIN"))):
         unknown = [k for k in body.values if k not in CONFIG_DEFAULTS]
         if unknown:
             raise HTTPException(400, "ตั้งค่าที่ไม่รู้จัก: " + ", ".join(unknown))
+        # Invite codes: the PE code is checked first at registration, so if both
+        # were identical every invite signup would silently become PE and RT
+        # would be unobtainable. An empty code would let anyone in.
+        pe = str(body.values.get("invite_code_pe", get_config(db, "invite_code_pe"))).strip()
+        rt = str(body.values.get("invite_code_rt", get_config(db, "invite_code_rt"))).strip()
+        if not pe or not rt:
+            raise HTTPException(400, "รหัสเชิญต้องไม่เว้นว่าง")
+        if pe == rt:
+            raise HTTPException(400, "รหัสเชิญ PE และ RT ต้องไม่ซ้ำกัน")
         for k, v in body.values.items():
             set_config(db, k, str(v).strip())
         # Fail loudly if the new layout can't validate its own example, rather
@@ -4226,11 +4253,14 @@ else:
 
 @app.get("/healthz")
 def healthz():
-    # version first so a curl against a deployment tells you what is running
     """Plain diagnostics endpoint that never touches the DB at import time —
     so even if startup init failed, this still answers and tells you WHY,
-    turning an opaque 500 into a readable message."""
+    turning an opaque 500 into a readable message.
+
+    `version` comes first: opening /healthz is the one check of which build is
+    live that no page cache, service worker or stale tab can get wrong."""
     return {
+        "version": APP_VERSION,
         "ok": _STARTUP_ERROR is None and _IMPORT_ERROR is None,
         "startup_error": _STARTUP_ERROR,
         "import_error": _IMPORT_ERROR,
