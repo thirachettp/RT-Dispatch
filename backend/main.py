@@ -89,7 +89,7 @@ VAPID_CLAIM_SUB = "mailto:admin@scdc.local"
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.260922.1442"
+APP_VERSION = "TTLOD.260922.1606"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -787,6 +787,7 @@ CREATE TABLE IF NOT EXISTS task_messages (
     task_id INTEGER NOT NULL REFERENCES tasks(id),
     sender_id INTEGER NOT NULL REFERENCES users(id),
     message TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'user',
     created_at TEXT NOT NULL
 );
 
@@ -967,6 +968,10 @@ NEW_COLUMNS = [
     ("users", "last_name", "TEXT", None),
     ("vehicles", "supports_double_deep", "INTEGER NOT NULL DEFAULT 0", None),
     ("vehicles", "retired_at", "TEXT", None),
+    # 'user' for a person's message, 'system' for automatic status updates.
+    # sender_id stays the person whose action caused it, so history is never
+    # anonymous even for automatic lines.
+    ("task_messages", "kind", "TEXT NOT NULL DEFAULT 'user'", None),
 ]
 
 
@@ -1289,6 +1294,55 @@ ALLOWED_TRANSITIONS = {
 }
 
 
+def person_label(db, user_id) -> str:
+    """How a person is named in the task chat: 'คุณ' + first name, falling back
+    to the full name and then the employee id."""
+    u = db.execute("SELECT first_name, full_name, employee_id, role FROM users WHERE id=?",
+                   (user_id,)).fetchone()
+    if not u:
+        return "ระบบ"
+    name = (u["first_name"] or "").strip() or (u["full_name"] or "").strip() or u["employee_id"]
+    return "แอดมิน" if u["role"] == "ADMIN" else f"คุณ{name}"
+
+
+def post_system_message(db, task_id: int, actor_id: int, text: str):
+    """An automatic line in the task chat. Deliberately does NOT notify anyone:
+    every event that posts one already sends its own notification, and a second
+    "new chat message" ping for the same event would just be noise."""
+    db.execute(
+        "INSERT INTO task_messages (task_id, sender_id, message, kind, created_at) VALUES (?,?,?,?,?)",
+        (task_id, actor_id, text, "system", now_iso()),
+    )
+
+
+_PAUSE_SIDE_TH = {"user": "ฝั่งผู้ขอ", "vehicle": "ฝั่งรถ"}
+
+
+def _status_change_text(db, from_status, to_status, actor_id, note):
+    who = person_label(db, actor_id)
+    if to_status == "In Progress" and from_status == "Pause":
+        return f"{who} แก้ไขเหตุขัดข้องแล้ว — งานดำเนินการต่อ"
+    if to_status == "In Progress":
+        return f"{who} เริ่มงาน"
+    if to_status == "Pause":
+        text = f"{who} แจ้งปัญหา"
+        if note:
+            m = re.match(r"\[(\w+)\]\s*(.*)", note)
+            if m:
+                side, reason = _PAUSE_SIDE_TH.get(m.group(1), m.group(1)), m.group(2)
+                text += f" ({side}): {reason}"
+            else:
+                text += f": {note}"
+        return text
+    if to_status == "Completed":
+        return f"งานเสร็จสิ้นเรียบร้อย — ปิดงานโดย{who}"
+    if to_status == "Cancelled":
+        return f"{who} ยกเลิกงาน" + (f": {note}" if note else "")
+    if to_status == "Waiting":
+        return "ไม่มีคนขับเหลืออยู่ในงาน — งานกลับเข้าคิวรอมอบหมาย"
+    return None
+
+
 def transition(db, task_row, to_status: str, changed_by: int, note: str = None):
     from_status = task_row["status"]
     if to_status not in ALLOWED_TRANSITIONS.get(from_status, set()):
@@ -1299,6 +1353,10 @@ def transition(db, task_row, to_status: str, changed_by: int, note: str = None):
         "VALUES (?,?,?,?,?,?)",
         (task_row["id"], from_status, to_status, changed_by, now_iso(), note),
     )
+    # Every status change goes through here, so the chat timeline can't miss one.
+    text = _status_change_text(db, from_status, to_status, changed_by, note)
+    if text:
+        post_system_message(db, task_row["id"], changed_by, text)
 
 
 def notify(db, user_id: int, message: str, task_id: Optional[int] = None, kind: str = "task"):
@@ -2397,6 +2455,9 @@ def _attach_extra_driver(db, task_row, driver, vehicle, actor_id, reason):
     db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
     db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
     notify(db, driver["id"], f"คุณถูกเพิ่มเข้างาน {task_row['task_code']}", task_row["id"])
+    post_system_message(db, task_row["id"], driver["id"],
+                        f"{person_label(db, driver['id'])} ได้รับงานนี้เรียบร้อย "
+                        f"({vehicle['vehicle_type']} {vehicle['code']})")
     return True
 
 
@@ -2465,6 +2526,9 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
             "UPDATE tasks SET status='In Progress', accepted_at=?, started_at=? WHERE id=?",
             (stamp, stamp, task_row["id"]),
         )
+        post_system_message(db, task_row["id"], driver["id"],
+                            f"{person_label(db, driver['id'])} ได้รับงานนี้เรียบร้อย "
+                            f"({vehicle['vehicle_type']} {vehicle['code']})")
         db.execute(
             "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
             "VALUES (?,?,?,?,?)",
@@ -2695,9 +2759,54 @@ def complete_task(task_id: int, user=Depends(require_role("DRIVER"))):
                 if nxt:
                     db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
                                (nxt["driver_id"], nxt["vehicle_id"], task_id))
+            post_system_message(db, task_id, user["id"],
+                                f"{person_label(db, user['id'])} ทำส่วนของตนเสร็จแล้ว "
+                                f"(ยังมีคนขับทำอยู่อีก {remaining} คน)")
             notify(db, row["requester_id"],
                    f"คนขับ {user['employee_id']} ทำงาน {row['task_code']} ส่วนของตนเสร็จแล้ว "
                    f"(ยังมีคนขับอีก {remaining} คนทำอยู่)", task_id)
+        return {"ok": True}
+
+
+def _close_task_for_everyone(db, row, actor, note):
+    """Finish a task on behalf of everyone still working on it: close every
+    active assignment and hand the drivers and vehicles back. Shared by the
+    admin override and the requester's own "done" button so the two can't
+    leave the fleet in different states."""
+    if row["status"] not in ("In Progress", "Pause"):
+        raise HTTPException(
+            400, f"ยืนยันงานเสร็จไม่ได้ในสถานะ {TASK_STATUS_LABEL_TH.get(row['status'], row['status'])} "
+                 f"(งานที่ยังไม่เริ่ม ใช้ 'ยกเลิก' แทน)")
+    active_rows = db.execute(
+        "SELECT * FROM task_assignments WHERE task_id=? AND assignment_status='Active'", (row["id"],)
+    ).fetchall()
+    for a in active_rows:
+        db.execute("UPDATE task_assignments SET unassigned_at=?, assignment_status='Completed' WHERE id=?",
+                   (now_iso(), a["id"]))
+        free_up_driver_and_vehicle(db, a["driver_id"], a["vehicle_id"])
+    transition(db, row, "Completed", actor["id"], note=note)
+    db.execute("UPDATE tasks SET completed_at=? WHERE id=?", (now_iso(), row["id"]))
+    return [a["driver_id"] for a in active_rows]
+
+
+@app.post("/tasks/{task_id}/requester-complete")
+def requester_complete_task(task_id: int, user=Depends(require_role("USER"))):
+    """The person who asked for the work confirms it's done.
+
+    They're the one who can see the pallets arrived, so waiting for every
+    driver to tap "done" separately shouldn't hold the job open. Drivers are
+    told, and their vehicles are freed straight away.
+    """
+    with get_db() as db:
+        row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบงานนี้")
+        if row["requester_id"] != user["id"]:
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
+        drivers = _close_task_for_everyone(db, row, user, note="Confirmed complete by requester")
+        for d in drivers:
+            notify(db, d, f"ผู้ขอยืนยันงาน {row['task_code']} เสร็จแล้ว", task_id)
+        notify_admins(db, f"ผู้ขอยืนยันงาน {row['task_code']} เสร็จแล้ว", task_id)
         return {"ok": True}
 
 
@@ -2709,22 +2818,7 @@ def admin_complete_task(task_id: int, user=Depends(require_role("ADMIN"))):
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
             raise HTTPException(404, "ไม่พบงานนี้")
-        if row["status"] not in ("In Progress", "Pause"):
-            raise HTTPException(
-                400, f"ทำเครื่องหมายเสร็จไม่ได้ในสถานะ {row['status']} "
-                     f"(งานที่ยังไม่เริ่ม ใช้ 'ยกเลิก' หรือ 'มอบหมายใหม่' แทน)"
-            )
-        active_rows = db.execute(
-            "SELECT * FROM task_assignments WHERE task_id=? AND assignment_status='Active'", (task_id,)
-        ).fetchall()
-        for a in active_rows:
-            db.execute(
-                "UPDATE task_assignments SET unassigned_at=?, assignment_status='Completed' WHERE id=?",
-                (now_iso(), a["id"]),
-            )
-            free_up_driver_and_vehicle(db, a["driver_id"], a["vehicle_id"])
-        transition(db, row, "Completed", user["id"], note="Force-completed by admin")
-        db.execute("UPDATE tasks SET completed_at=? WHERE id=?", (now_iso(), task_id))
+        _close_task_for_everyone(db, row, user, note="Force-completed by admin")
         audit(db, user["id"], "admin_complete_task", f"task {row['task_code']}")
         notify(db, row["requester_id"], f"งาน {row['task_code']} ถูกปิดงานโดยแอดมิน", task_id)
         return {"ok": True}
@@ -2772,6 +2866,7 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_role("DRIVE
                        (body.battery_level, vehicle["id"]))
         else:
             db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
+        post_system_message(db, task_id, user["id"], f"{person_label(db, user['id'])} เข้าร่วมงาน")
         notify(db, row["requester_id"], f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
         notify_admins(db, f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
         return {"ok": True}
@@ -2862,6 +2957,7 @@ def leave_task(task_id: int, user=Depends(require_role("DRIVER"))):
             if nxt:
                 db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
                            (nxt["driver_id"], nxt["vehicle_id"], task_id))
+        post_system_message(db, task_id, user["id"], f"{person_label(db, user['id'])} ออกจากงาน")
         notify(db, row["requester_id"], f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
         notify_admins(db, f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
         return {"ok": True}
@@ -2948,6 +3044,14 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(require_role("DRIVER"
             "VALUES ('vehicle',?,?,?,?,?,?)",
             (my_assignment["vehicle_id"], vehicle_row["code"] if vehicle_row else "", body.reason, user["id"], "Open", now_iso()),
         )
+        # The job keeps running without them, so there is no status change —
+        # but a driver dropping out is exactly what the requester needs to see
+        # in the timeline, or they're left wondering where one of the crew went.
+        post_system_message(
+            db, task_id, user["id"],
+            f"{person_label(db, user['id'])} แจ้งปัญหารถ"
+            f"{' ' + vehicle_row['code'] if vehicle_row else ''}: {body.reason} "
+            f"— ออกจากงาน งานดำเนินต่อโดยคนขับที่เหลือ ({others} คน)")
         if row["current_driver_id"] == user["id"]:
             nxt = db.execute(
                 "SELECT * FROM task_assignments WHERE task_id=? AND assignment_status='Active' "
@@ -2965,18 +3069,37 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(require_role("DRIVER"
 
 
 @app.post("/tasks/{task_id}/resume")
-def resume_task(task_id: int, user=Depends(require_role("DRIVER"))):
+def resume_task(task_id: int, user=Depends(current_user)):
+    """Clear a problem and carry on.
+
+    Either side of the job can do this: a driver on the task, the requester who
+    raised it, or an admin. A problem is often the requester's to fix (goods
+    not ready, bay blocked), and making them wait for the driver to tap it was
+    the bottleneck.
+    """
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
             raise HTTPException(404, "ไม่พบงานนี้")
-        my_assignment = db.execute(
+        if row["status"] != "Pause":
+            raise HTTPException(400, "งานนี้ไม่ได้อยู่ในสถานะขัดข้อง")
+        allowed = user["role"] == "ADMIN" or (
+            user["role"] == "USER" and row["requester_id"] == user["id"]
+        ) or bool(db.execute(
             "SELECT 1 FROM task_assignments WHERE task_id=? AND driver_id=? AND assignment_status='Active'",
             (task_id, user["id"]),
-        ).fetchone()
-        if not my_assignment:
+        ).fetchone())
+        if not allowed:
             raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         transition(db, row, "In Progress", user["id"])
+        # The drivers need to know they can carry on, whoever cleared it.
+        for a in db.execute(
+            "SELECT driver_id FROM task_assignments WHERE task_id=? AND assignment_status='Active'", (task_id,)
+        ).fetchall():
+            if a["driver_id"] != user["id"]:
+                notify(db, a["driver_id"], f"งาน {row['task_code']} แก้ไขเหตุขัดข้องแล้ว ทำงานต่อได้", task_id)
+        if row["requester_id"] != user["id"]:
+            notify(db, row["requester_id"], f"งาน {row['task_code']} แก้ไขเหตุขัดข้องแล้ว", task_id)
         return {"ok": True}
 
 
@@ -2999,7 +3122,7 @@ def get_task_messages(task_id: int, user=Depends(current_user)):
         rows = db.execute(
             "SELECT task_messages.*, users.employee_id AS sender_employee_id, users.role AS sender_role "
             "FROM task_messages JOIN users ON users.id = task_messages.sender_id "
-            "WHERE task_id=? ORDER BY created_at", (task_id,)
+            "WHERE task_id=? ORDER BY created_at, task_messages.id", (task_id,)
         ).fetchall()
         return [dict(r) for r in rows]
 
