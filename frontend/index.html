@@ -123,6 +123,11 @@
   .copy-phone{color:var(--blue);text-decoration:none;font-weight:700;}
   .copy-hint{font-size:10px;color:var(--ink-dim);font-weight:400;margin-left:4px;}
 
+  .vp-search{margin:6px 0 2px;}
+  .lic-row{display:flex;justify-content:space-between;align-items:center;gap:10px;
+    padding:8px 0;border-bottom:1px solid var(--line);}
+  .lic-row:last-of-type{border-bottom:none;}
+  .copy-code{color:var(--blue);text-decoration:none;font-weight:800;}
   .brand{display:flex;align-items:center;gap:10px;}
   .logo-mark{width:28px;height:28px;border-radius:8px;background:var(--amber);display:flex;
     align-items:center;justify-content:center;flex:none;}
@@ -1059,6 +1064,56 @@ function renderRegister(prefill = {}){
   };
 }
 
+// Thai names so a driver can type either "RT" or "รถยก" to find a vehicle.
+const VEHICLE_TYPE_TH = {RT: "รถยก", PE: "รถลาก"};
+
+// Searchable list of vehicles the driver may board. Type a vehicle code
+// (WH-01), a type (RT / PE) or its Thai name (รถยก / รถลาก) to narrow it down.
+function mountVehiclePicker(host, vehicles, onSelect, opts={}){
+  const search = el(`<input class="vp-search" placeholder="พิมพ์ชื่อรถ หรือประเภทรถ เช่น WH-01, RT, รถลาก" />`);
+  const list = el(`<div class="vehicle-pick-list"></div>`);
+  host.appendChild(search);
+  host.appendChild(list);
+  let selected = opts.initial || null;
+
+  function draw(q){
+    list.innerHTML = "";
+    const needle = (q || "").trim().toLowerCase();
+    const shown = vehicles.filter(v=>{
+      if(!needle) return true;
+      return [v.code, v.vehicle_type, VEHICLE_TYPE_TH[v.vehicle_type] || ""]
+        .some(s=> String(s).toLowerCase().includes(needle));
+    });
+    if(!shown.length){
+      list.appendChild(el(`<div class="empty">ไม่พบรถที่ตรงกับ "${q}"</div>`));
+      return;
+    }
+    shown.forEach(v=>{
+      const item = el(`<div class="vehicle-pick-item ${selected === v.code ? "selected" : ""}">
+        <div><div class="vp-main">${v.code}</div><div class="vp-sub">${v.vehicle_type} · ${VEHICLE_TYPE_TH[v.vehicle_type] || ""}${v.supports_double_deep ? " · Double Deep" : ""}</div></div>
+        ${opts.currentCode === v.code ? `<span class="badge ok">รถปัจจุบัน</span>` : ""}
+      </div>`);
+      item.onclick = ()=>{
+        selected = v.code;
+        list.querySelectorAll(".vehicle-pick-item").forEach(x=> x.classList.toggle("selected", x === item));
+        onSelect(v.code);
+      };
+      list.appendChild(item);
+    });
+  }
+  search.addEventListener("input", ()=> draw(search.value));
+  draw("");
+  return {get selected(){ return selected; }};
+}
+
+// Why the list might be empty — no licence is a very different problem from
+// every licensed vehicle being taken, and the driver needs to know which.
+function emptyVehicleMessage(){
+  const lic = ((state.me && state.me.licenses) || []).filter(l=> l.valid).map(l=> l.vehicle_type);
+  if(!lic.length) return "คุณยังไม่มีใบอนุญาตขับรถ จึงยังขึ้นรถไม่ได้ กรุณาติดต่อแอดมิน";
+  return `ไม่มีรถ ${lic.join(" / ")} ว่างในขณะนี้ กรุณาติดต่อแอดมิน`;
+}
+
 // ---------------- Forced vehicle check-in (Driver, every fresh login) ----------------
 async function renderForcedCheckin(){
   const app = document.getElementById("app");
@@ -1066,6 +1121,10 @@ async function renderForcedCheckin(){
   app.innerHTML = "";
   let vehicles = [];
   try{ vehicles = await api("/vehicles/available-for-checkin", {background:true}); }catch(e){ toast(e.message); }
+  // The licence list decides what the empty-list message says.
+  if(!(state.me && state.me.licenses)){
+    try{ state.me = await api("/me", {background:true}); }catch(e){ /* message falls back to generic */ }
+  }
   let selected = null;
   const wrap = el(`
     <div class="login-wrap">
@@ -1073,9 +1132,9 @@ async function renderForcedCheckin(){
         <div class="mark"><div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg></div><b style="font-size:15px;">CRL</b></div>
         <h1>เช็คอินรถก่อนเริ่มงาน</h1>
         <p class="sub">คุณ ${state.employee_id} ยังไม่ได้ขึ้นรถ กรุณาเลือกรถก่อนใช้งานระบบ</p>
-        <label>เลือกรถที่ยังไม่มีคนขับ</label>
-        <div class="vehicle-pick-list" id="fc-list">
-          ${vehicles.length === 0 ? '<div class="empty">ไม่มีรถว่างในขณะนี้ กรุณาติดต่อ Admin</div>' : ''}
+        <label>เลือกรถ (แสดงเฉพาะรถที่คุณมีใบอนุญาตและยังว่าง)</label>
+        <div id="fc-list">
+          ${vehicles.length === 0 ? `<div class="empty">${emptyVehicleMessage()}</div>` : ''}
         </div>
         <button class="primary" id="fc-submit">ยืนยันเช็คอิน</button>
         <button class="ghost" id="fc-logout">ออกจากระบบ</button>
@@ -1084,17 +1143,7 @@ async function renderForcedCheckin(){
     </div>
   `);
   app.appendChild(wrap);
-  const list = wrap.querySelector("#fc-list");
-  vehicles.forEach(v=>{
-    const item = el(`<div class="vehicle-pick-item" data-id="${v.id}">
-      <div><div class="vp-main">${v.code}</div><div class="vp-sub">${v.vehicle_type}</div></div>
-    </div>`);
-    item.onclick = ()=>{
-      selected = v.code;
-      list.querySelectorAll(".vehicle-pick-item").forEach(x=> x.classList.toggle("selected", x===item));
-    };
-    list.appendChild(item);
-  });
+  if(vehicles.length) mountVehiclePicker(wrap.querySelector("#fc-list"), vehicles, code=> { selected = code; });
   wrap.querySelector("#fc-logout").onclick = ()=> logout();
   wrap.querySelector("#fc-submit").onclick = async ()=>{
     const errBox = wrap.querySelector("#fc-err"); errBox.innerHTML = "";
@@ -1443,7 +1492,6 @@ function renderUserTab(main){
       let actions = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
       if(t.status === "Waiting"){
         actions = `<button class="btn" data-edit="${t.id}">แก้ไข</button>
-          <button class="btn" data-photo="${t.id}">เพิ่มรูป</button>
           ${t.blocked_reason ? `<button class="btn amber" data-resubmit="${t.id}">ส่งใหม่</button>` : ""}
           ${actions}
           <button class="btn red" data-action="cancel">ยกเลิก</button>`;
@@ -1967,6 +2015,23 @@ function renderProfile(main){
     <div class="meta-row"><span>สิทธิ์การใช้งาน: <b>${state.role}</b> <span class="field-note">(แก้ไขไม่ได้)</span></span></div>
   </div>`));
 
+  if(state.role === "DRIVER"){
+    // Read-only: licences are granted and changed by an admin, never here.
+    const lic = (state.me && state.me.licenses) || [];
+    main.appendChild(el(`<div class="section-title">ใบอนุญาตขับรถ</div>`));
+    main.appendChild(el(`<div class="card">
+      ${lic.length ? lic.map(l=> `<div class="lic-row">
+          <div><b>${l.vehicle_type}</b> <span class="field-note">${VEHICLE_TYPE_TH[l.vehicle_type] || ""}</span></div>
+          <div style="text-align:right;">
+            <span class="badge ${l.valid ? "ok" : "bad"}">${l.valid ? "ใช้ได้" : "หมดอายุ"}</span>
+            <div class="field-note">${l.expiry_date ? "หมดอายุ " + l.expiry_date : "ถาวร"}</div>
+          </div>
+        </div>`).join("")
+        : `<div class="empty" style="padding:6px 0;">ยังไม่มีใบอนุญาต — ขึ้นรถไม่ได้จนกว่าแอดมินจะเพิ่มให้</div>`}
+      <div class="field-note" style="margin-top:6px;">แก้ไขได้เฉพาะแอดมิน</div>
+    </div>`));
+  }
+
   main.appendChild(el(`<div class="section-title">แก้ไขข้อมูลส่วนตัว</div>`));
   const me = state.me || {};
   const pf = el(`<div class="card">
@@ -2334,8 +2399,8 @@ function openVehicleCheckSheet(){
       <div class="sheet">
         <div class="sheet-head"><h2>เช็คอิน / เช็คเอาท์รถ</h2><button id="sh-close">✕</button></div>
         <div class="field-note" style="margin-bottom:10px;">${meVehicle ? 'รถปัจจุบัน: <b>'+meVehicle.code+'</b>' : 'ยังไม่ได้เช็คอินรถ'}</div>
-        <label>เลือกรถ (แสดงเฉพาะรถที่ยังไม่มีคนขับ)</label>
-        <select id="vc-vehicle"><option value="">กำลังโหลด...</option></select>
+        <label>เลือกรถ (แสดงเฉพาะรถที่คุณมีใบอนุญาตและยังว่าง)</label>
+        <div id="vc-picker"><div class="empty">กำลังโหลด...</div></div>
         <div class="grid2" style="margin-top:10px;">
           <button class="btn amber" id="vc-checkin">เช็คอิน</button>
           <button class="btn red" id="vc-checkout" ${meVehicle ? '' : 'disabled'}>เช็คเอาท์</button>
@@ -2346,18 +2411,21 @@ function openVehicleCheckSheet(){
   document.body.appendChild(overlay);
   overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
+  let picked = null;
   (async ()=>{
+    const host = overlay.querySelector("#vc-picker");
     try{
-      const opts = await api("/vehicles/available-for-checkin");
-      const select = overlay.querySelector("#vc-vehicle");
-      select.innerHTML = "";
-      if(meVehicle) select.appendChild(el(`<option value="${meVehicle.code}">${meVehicle.code} (รถปัจจุบันของฉัน)</option>`));
-      opts.forEach(v=> select.appendChild(el(`<option value="${v.code}">${v.code} · ${v.vehicle_type}</option>`)));
-      if(select.options.length === 0) select.appendChild(el(`<option value="">ไม่มีรถว่าง</option>`));
-    }catch(e){ /* ignore */ }
+      const opts = await api("/vehicles/available-for-checkin", {background:true});
+      host.innerHTML = "";
+      // The vehicle they're in already stays pickable at the top.
+      const list = opts.slice();
+      if(meVehicle && !list.some(v=> v.code === meVehicle.code)) list.unshift(meVehicle);
+      if(!list.length){ host.appendChild(el(`<div class="empty">${emptyVehicleMessage()}</div>`)); return; }
+      mountVehiclePicker(host, list, code=> { picked = code; }, {currentCode: meVehicle && meVehicle.code});
+    }catch(e){ host.innerHTML = ""; host.appendChild(el(`<div class="err">${e.message}</div>`)); }
   })();
   overlay.querySelector("#vc-checkin").onclick = async ()=>{
-    const vehicle_code = overlay.querySelector("#vc-vehicle").value;
+    const vehicle_code = picked;
     if(!vehicle_code){ toast("กรุณาเลือกรถ"); return; }
     try{
       await api("/vehicles/check-in", {method:"POST", body: JSON.stringify({
@@ -3995,6 +4063,9 @@ function renderAdminSettings(main){
             <div style="display:flex;justify-content:space-between;"><span style="color:var(--ink-dim);">เวลาต่อฐานข้อมูล</span><span>${d.connect_ms} ms</span></div>
             <div style="display:flex;justify-content:space-between;"><span style="color:var(--ink-dim);">เวลา query</span><span>${d.query_ms} ms</span></div>
             <div style="display:flex;justify-content:space-between;font-weight:700;"><span>รวม</span><span>${d.total_ms} ms — ${d.verdict}</span></div>
+            <div style="display:flex;justify-content:space-between;gap:10px;margin-top:6px;"><span style="color:var(--ink-dim);">แจ้งเตือน iPhone</span>
+              <span style="text-align:right;">${d.vapid_subject_ios_ok ? "✅ พร้อม" : "❌ ใช้ไม่ได้ — ต้องตั้ง VAPID_SUBJECT"}<br>
+              <span class="field-note">${d.vapid_subject} (${d.vapid_subject_source})</span></span></div>
           </div>
         </div>`));
       }catch(e){ /* diagnostics are informational only */ }
@@ -4138,7 +4209,7 @@ function buildTaskDetailActions(t){
   const isChat = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
   const dupBtn = `<button class="btn" data-duplicate="${t.id}">สร้างงานจากงานนี้</button>`;
   if(state.role === "USER"){
-    if(t.status === "Waiting") return `<button class="btn" data-edit="${t.id}">แก้ไข</button><button class="btn" data-photo="${t.id}">เพิ่มรูป</button>${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
+    if(t.status === "Waiting") return `<button class="btn" data-edit="${t.id}">แก้ไข</button>${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
     if(t.status === "Assigned") return `${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
     // The requester can clear a problem and confirm the job is done — they are
     // usually the one who can see whether the goods arrived.
@@ -4351,7 +4422,7 @@ function chatDetailsHTML(t){
   const waited = minutesAgo(t.created_at);
   const crew = (t.drivers || []).map(d=> `${d.full_name || d.employee_id}${d.vehicle_code ? ` (${d.vehicle_code})` : ""}`).join(", ");
   return `<div class="as-detail">
-    <div class="as-code">${t.task_code} <span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span></div>
+    <div class="as-code"><span><a href="#" class="copy-code" data-code="${t.task_code}">${t.task_code}</a> <span class="copy-hint">กดเพื่อคัดลอก</span></span> <span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span></div>
     <div class="as-route">${t.from_location} <span class="arrow">→</span> ${t.to_location}</div>
     ${row("จำนวนพาเลท", t.pallet_qty)}
     ${row("สร้างคำขอเมื่อ", t.created_at ? `${fmtTime(t.created_at)} (${fmtDuration(waited)}ที่แล้ว)` : "")}
@@ -4400,6 +4471,13 @@ async function openChatSheet(taskId){
           if(e.target.closest("button")) setTimeout(()=>{ lastCount = -2; loadMessages(); loadTask(); }, 900);
         }, true);
       }
+      top.querySelectorAll(".copy-code").forEach(a=>{
+        a.onclick = async (e)=>{
+          e.preventDefault();
+          try{ await navigator.clipboard.writeText(a.dataset.code); toast(`คัดลอก ${a.dataset.code} แล้ว`); }
+          catch(_){ toast(a.dataset.code); }
+        };
+      });
       top.querySelectorAll(".copy-phone").forEach(a=>{
         a.onclick = async (e)=>{
           e.preventDefault();
