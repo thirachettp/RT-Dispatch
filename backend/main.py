@@ -83,6 +83,14 @@ PENDING_PASSWORD = "PENDING"
 MIN_PASSWORD_LENGTH = 6
 VAPID_CLAIM_SUB = "mailto:admin@scdc.local"
 
+# ---------------------------------------------------------------------------
+# Build version — BUMP THIS ON EVERY RELEASE.
+# Format: TTLOD.yymmdd.hhmm, using Bangkok time at the moment the build is cut.
+# This is the single source of truth: the number is substituted into the page
+# when index.html is served, so the frontend can't drift out of step with it.
+# ---------------------------------------------------------------------------
+APP_VERSION = "TTLOD.260917.2231"
+
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
 # the server doesn't leak an English status word into a Thai-only UI.
@@ -95,7 +103,7 @@ DRIVER_STATUS_LABEL_TH = {
     "Available": "ว่าง", "Busy": "ติดงาน", "Breakdown": "รถเสีย", "Offline": "ออฟไลน์",
 }
 
-app = FastAPI(title="SCDC Vehicle Handling Task Management (MVP)")
+app = FastAPI(title="CRL ForkliftDispatch", description="Warehouse Forklift Request & Dispatch")
 
 # /app-data returns a large JSON document on every refresh and was being sent
 # uncompressed. It is highly repetitive JSON, so gzip typically cuts it by
@@ -466,6 +474,144 @@ def valid_thai_phone(contact: str) -> bool:
     return bool(re.match(r"^0\d{8,9}$", digits))
 
 
+# ---------------------------------------------------------------------------
+# App configuration
+# ---------------------------------------------------------------------------
+# Anything an admin should be able to change without a redeploy lives here.
+# Kept in app_config (a key/value table) rather than environment variables so
+# it survives a deploy and can be edited from inside the product.
+CONFIG_DEFAULTS = {
+    # Registration invite codes. Whoever types one of these while registering
+    # gets that driver licence immediately, so they are changeable — if one
+    # leaks, an admin rotates it in จัดการระบบ instead of waiting for a build.
+    "invite_code_pe": "driver_pe_82640",
+    "invite_code_rt": "driver_rt_82640",
+    # Rack location layout. The warehouse defines its own ranges, so nothing
+    # here is hard-coded in the validator — it all reads from these values.
+    "rack_aisle_from": "AAA",
+    "rack_aisle_to": "ABH",
+    "rack_bay_from": "01",
+    "rack_bay_to": "40",
+    "rack_level_from": "A",
+    "rack_level_to": "G",
+    "rack_slot_from": "1",
+    "rack_slot_to": "5",
+    # First letter of the aisle -> which racking it is. Extra letters can be
+    # added here as new aisles appear, without touching code.
+    "rack_prefix_map": "A=DOUBLE_DEEP,B=SELECTIVE_RACK",
+}
+
+
+def get_config(db, key: str) -> str:
+    row = db.execute("SELECT value FROM app_config WHERE key=?", (key,)).fetchone()
+    if row and row["value"] is not None:
+        return row["value"]
+    return CONFIG_DEFAULTS.get(key, "")
+
+
+def set_config(db, key: str, value: str):
+    db.execute(
+        "INSERT INTO app_config (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def _rack_prefix_map(db) -> dict:
+    out = {}
+    for part in (get_config(db, "rack_prefix_map") or "").split(","):
+        if "=" in part:
+            letter, zone = part.split("=", 1)
+            letter = letter.strip().upper()
+            if letter:
+                out[letter] = zone.strip().upper()
+    return out
+
+
+def rack_layout(db) -> dict:
+    """Everything the location validator and the UI need, in one shape."""
+    return {
+        "aisle_from": get_config(db, "rack_aisle_from").upper(),
+        "aisle_to": get_config(db, "rack_aisle_to").upper(),
+        "bay_from": int(get_config(db, "rack_bay_from") or 1),
+        "bay_to": int(get_config(db, "rack_bay_to") or 40),
+        "level_from": get_config(db, "rack_level_from").upper(),
+        "level_to": get_config(db, "rack_level_to").upper(),
+        "slot_from": int(get_config(db, "rack_slot_from") or 1),
+        "slot_to": int(get_config(db, "rack_slot_to") or 5),
+        "prefix_map": _rack_prefix_map(db),
+    }
+
+
+def parse_rack_code(code: str, layout: dict):
+    """Validate a rack location against the configured layout.
+
+    Format is fixed at Aisle(3) + Bay(2) + Level(1) + Slot(1), e.g. ABA03A2.
+    The RANGES are not fixed — they come from settings — which is why this is
+    a parser rather than one big regex: a wrong code can then say exactly
+    which part is out of range instead of just "invalid format".
+
+    Returns (parsed_dict, error_message). Exactly one is ever non-None.
+    """
+    code = (code or "").strip().upper()
+    if len(code) != 7:
+        return None, "รหัสตำแหน่งต้องมี 7 ตัวอักษร เช่น ABA03A2"
+    aisle, bay_s, level, slot_s = code[0:3], code[3:5], code[5], code[6]
+
+    if not aisle.isalpha():
+        return None, f"Aisle ต้องเป็นตัวอักษร 3 ตัว (ได้รับ '{aisle}')"
+    if not (layout["aisle_from"] <= aisle <= layout["aisle_to"]):
+        return None, f"Aisle '{aisle}' อยู่นอกช่วง {layout['aisle_from']}-{layout['aisle_to']}"
+
+    if not bay_s.isdigit():
+        return None, f"Bay ต้องเป็นตัวเลข 2 หลัก (ได้รับ '{bay_s}')"
+    bay = int(bay_s)
+    if not (layout["bay_from"] <= bay <= layout["bay_to"]):
+        return None, f"Bay {bay_s} อยู่นอกช่วง {layout['bay_from']:02d}-{layout['bay_to']:02d}"
+
+    if not level.isalpha() or not (layout["level_from"] <= level <= layout["level_to"]):
+        return None, f"Level '{level}' อยู่นอกช่วง {layout['level_from']}-{layout['level_to']}"
+
+    if not slot_s.isdigit():
+        return None, f"Slot ต้องเป็นตัวเลข (ได้รับ '{slot_s}')"
+    slot = int(slot_s)
+    if not (layout["slot_from"] <= slot <= layout["slot_to"]):
+        return None, f"Slot {slot_s} อยู่นอกช่วง {layout['slot_from']}-{layout['slot_to']}"
+
+    rack_zone = layout["prefix_map"].get(aisle[0])
+    if not rack_zone:
+        known = ", ".join(sorted(layout["prefix_map"])) or "ยังไม่ได้ตั้งค่า"
+        return None, f"ยังไม่ได้กำหนดว่าตัวอักษร '{aisle[0]}' เป็นชั้นวางประเภทใด (ที่กำหนดไว้: {known})"
+
+    return {"code": code, "aisle": aisle, "bay": bay, "level": level,
+            "slot": slot, "zone_key": rack_zone}, None
+
+
+def normalize_phone(phone: Optional[str]) -> Optional[str]:
+    """Digits only, so 08-1234-5678 and 0812345678 are the same number for
+    both uniqueness and login."""
+    if not phone:
+        return None
+    digits = re.sub(r"\D", "", phone)
+    return digits or None
+
+
+def validate_and_normalize_contact(db, contact: Optional[str], exclude_user_id: Optional[int] = None) -> Optional[str]:
+    """Phone numbers are now a login identifier, so they must be unique —
+    otherwise the system can't tell which account a number belongs to."""
+    if not contact:
+        return None
+    digits = normalize_phone(contact)
+    if not digits or not (9 <= len(digits) <= 10):
+        raise HTTPException(400, "เบอร์ติดต่อไม่ถูกต้อง (ต้องเป็นเบอร์โทรไทย 9-10 หลัก)")
+    existing = db.execute(
+        "SELECT id FROM users WHERE contact=? AND deleted_at IS NULL", (digits,)
+    ).fetchone()
+    if existing and existing["id"] != exclude_user_id:
+        raise HTTPException(400, "เบอร์นี้มีผู้ใช้งานแล้ว หากเป็นเบอร์ของคุณโปรดติดต่อ Admin")
+    return digits
+
+
 def validate_and_normalize_email(db, email: Optional[str], exclude_user_id: Optional[int] = None) -> Optional[str]:
     """Shared by register/profile-edit/driver-creation/admin-edit so the
     @central.co.th + uniqueness rules are enforced identically everywhere an
@@ -475,7 +621,9 @@ def validate_and_normalize_email(db, email: Optional[str], exclude_user_id: Opti
     email = email.strip().lower()
     if not email.endswith("@central.co.th"):
         raise HTTPException(400, "อีเมลต้องเป็นโดเมน @central.co.th เท่านั้น")
-    existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+    existing = db.execute(
+        "SELECT id FROM users WHERE email=? AND deleted_at IS NULL", (email,)
+    ).fetchone()
     if existing and existing["id"] != exclude_user_id:
         raise HTTPException(400, "อีเมลนี้มีผู้ใช้งานแล้ว")
     return email
@@ -491,7 +639,13 @@ CREATE TABLE IF NOT EXISTS vehicles (
     code TEXT UNIQUE NOT NULL,
     vehicle_type TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'Available',
-    battery_level INTEGER
+    battery_level INTEGER,
+    -- RT is one vehicle type with a sub-capability rather than two types:
+    -- the licence doesn't distinguish them, only which racking they can reach.
+    supports_double_deep INTEGER NOT NULL DEFAULT 0,
+    -- Retired vehicles stay in the table so historical tasks and assignments
+    -- still resolve; they're just hidden from anything operational.
+    retired_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -499,6 +653,8 @@ CREATE TABLE IF NOT EXISTS users (
     employee_id TEXT UNIQUE NOT NULL,
     email TEXT,
     full_name TEXT,
+    first_name TEXT,
+    last_name TEXT,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK(role IN ('USER','DRIVER','ADMIN')),
     cost_center TEXT,
@@ -799,6 +955,65 @@ def _postgres_schema() -> str:
     )
 
 
+# Columns this build needs that older databases won't have.
+#
+# migrate_db() below only ever runs on SQLite — on Postgres, init_db() applies
+# SCHEMA only when the database is FRESH, so a live production database would
+# never receive a new column. Everything here therefore runs on every boot for
+# BOTH backends, checking first and adding only what's missing.
+NEW_COLUMNS = [
+    # (table, column, type, backfill SQL or None)
+    ("users", "first_name", "TEXT", None),
+    ("users", "last_name", "TEXT", None),
+    ("vehicles", "supports_double_deep", "INTEGER NOT NULL DEFAULT 0", None),
+    ("vehicles", "retired_at", "TEXT", None),
+]
+
+
+def _column_exists(db, table, column):
+    if IS_POSTGRES:
+        return bool(db.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?",
+            (table, column),
+        ).fetchone())
+    return column in [r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def ensure_columns():
+    """Add any missing columns, on either backend, then backfill them once."""
+    try:
+        with get_db() as db:
+            added = []
+            for table, col, coltype, _ in NEW_COLUMNS:
+                try:
+                    if not _column_exists(db, table, col):
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+                        added.append(f"{table}.{col}")
+                except Exception as e:
+                    log.warning("Could not add column %s.%s: %s", table, col, e)
+            if added:
+                log.info("Schema updated: added %s", ", ".join(added))
+
+            # Split legacy single-field names into first/last ONCE, at the
+            # first space. Names with three words keep everything after the
+            # first space as the surname, which is the least-wrong split for
+            # Thai names and is editable in Profile afterwards.
+            if _column_exists(db, "users", "first_name"):
+                rows = db.execute(
+                    "SELECT id, full_name FROM users WHERE first_name IS NULL AND full_name IS NOT NULL"
+                ).fetchall()
+                for r in rows:
+                    parts = (r["full_name"] or "").strip().split(" ", 1)
+                    first = parts[0] if parts else ""
+                    last = parts[1].strip() if len(parts) > 1 else ""
+                    db.execute("UPDATE users SET first_name=?, last_name=? WHERE id=?",
+                               (first, last, r["id"]))
+                if rows:
+                    log.info("Backfilled first/last name for %d user(s)", len(rows))
+    except Exception as e:
+        log.warning("ensure_columns skipped: %s", e)
+
+
 def migrate_db():
     """Best-effort auto-migration for SQLite databases created by an older
     version of this app, so a schema change doesn't force deleting existing
@@ -850,6 +1065,64 @@ def migrate_db():
             log.info("Migrated database: added EMPTY_PALLET zone")
 
 
+# ---------------------------------------------------------------------------
+# Master Forklift
+# ---------------------------------------------------------------------------
+# The real fleet. RT is a SINGLE vehicle type — the licence doesn't distinguish
+# Selective from Double Deep — with supports_double_deep marking which units can
+# reach the deeper racking. Anything not in this list is retired rather than
+# deleted, because historical tasks and assignments still point at those rows.
+MASTER_FLEET = (
+    [(f"WH-PE-{i:03d}", "PE", 0) for i in range(1, 11)]        # WH-PE-001 .. WH-PE-010
+    + [(f"WH-{i:02d}", "RT", 0) for i in range(1, 11)]          # WH-01 .. WH-10  (Selective)
+    + [(f"WH-{i:02d}", "RT", 1) for i in range(11, 14)]         # WH-11 .. WH-13  (Double Deep)
+)
+MASTER_CODES = {code for code, _, _ in MASTER_FLEET}
+
+
+def sync_master_fleet(db):
+    """Make the vehicles table match MASTER_FLEET.
+
+    Runs every boot and is idempotent. Deliberately does three separate things
+    so a half-applied state can't happen:
+      1. insert vehicles that don't exist yet
+      2. correct the type / double-deep flag on ones that do
+      3. retire everything else (never DELETE — see above)
+    A retired vehicle that reappears in the master list is un-retired, so
+    fixing a mistake is just a matter of correcting the list.
+    """
+    existing = {r["code"]: r for r in db.execute("SELECT * FROM vehicles").fetchall()}
+    added = corrected = retired = 0
+
+    for code, vtype, dd in MASTER_FLEET:
+        row = existing.get(code)
+        if row is None:
+            db.execute(
+                "INSERT INTO vehicles (code, vehicle_type, status, supports_double_deep, retired_at) "
+                "VALUES (?,?,?,?,NULL)", (code, vtype, "Available", dd))
+            added += 1
+        elif (row["vehicle_type"] != vtype
+              or (row["supports_double_deep"] or 0) != dd
+              or row["retired_at"] is not None):
+            db.execute(
+                "UPDATE vehicles SET vehicle_type=?, supports_double_deep=?, retired_at=NULL WHERE id=?",
+                (vtype, dd, row["id"]))
+            corrected += 1
+
+    for code, row in existing.items():
+        if code not in MASTER_CODES and row["retired_at"] is None:
+            # Don't strand a driver who is checked into a vehicle that just
+            # left the fleet — they'd be stuck unable to check out.
+            db.execute("UPDATE users SET checked_in_vehicle_id=NULL, driver_status='Not Checked-in' "
+                       "WHERE checked_in_vehicle_id=?", (row["id"],))
+            db.execute("UPDATE vehicles SET retired_at=?, status='Retired' WHERE id=?",
+                       (now_iso(), row["id"]))
+            retired += 1
+
+    if added or corrected or retired:
+        log.info("Master fleet synced: %d added, %d corrected, %d retired", added, corrected, retired)
+
+
 def seed_master_data(db):
     """Master/reference data (vehicle types, zones, the type<->zone matrix,
     task rules). Split out from user seeding and made idempotent PER TABLE so
@@ -859,9 +1132,8 @@ def seed_master_data(db):
     if not db.execute("SELECT 1 FROM vehicle_types LIMIT 1").fetchone():
         db.execute(
             "INSERT INTO vehicle_types (type_key, type_name_th, description) VALUES "
-            "('RT','รถ Reach Truck','ยกสินค้าขึ้นชั้นวางสูง'),"
-            "('PE','รถ Pallet Truck (ไฟฟ้า)','ลากพาเลทระยะสั้น'),"
-            "('FORKLIFT','รถโฟล์คลิฟท์','ยกของทั่วไป')"
+            "('RT','RT - รถยก','ยกสินค้าขึ้นชั้นวาง (บางคันเข้า Double Deep ได้)'),"
+            "('PE','PE - รถลาก','ลากพาเลทระยะสั้น')"
         )
         log.info("Seeded master data: vehicle_types")
 
@@ -882,7 +1154,7 @@ def seed_master_data(db):
         # Default: every vehicle type can work every zone. Admin narrows this
         # down later via the vehicle-type <-> zone matrix in Settings.
         zone_keys = ["CONCRETE_YARD", "GATE", "SORT_YARD", "MEZZANINE", "SELECTIVE_RACK", "DOUBLE_DEEP"]
-        for vt in ("RT", "PE", "FORKLIFT"):
+        for vt in ("RT", "PE"):
             for zk in zone_keys:
                 db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) ON CONFLICT DO NOTHING", (vt, zk))
         log.info("Seeded master data: vehicle_type_zones")
@@ -936,9 +1208,15 @@ def seed(db):
 # Task type inference (data-driven: zones + task_rules tables)
 # ---------------------------------------------------------------------------
 
+# Task types (Transfer / Putaway / ...) were removed from the product. The
+# column is kept and filled with a constant rather than dropped: dropping a
+# NOT NULL column on a live Postgres database mid-deploy is a far bigger risk
+# than an unused field, and old rows keep their original value for reporting.
+TASK_TYPE_PLACEHOLDER = "-"
+
+
 def infer_task_type(db, from_zone: str, to_zone: str) -> str:
-    row = db.execute("SELECT task_type FROM task_rules WHERE from_zone=? AND to_zone=?", (from_zone, to_zone)).fetchone()
-    return row["task_type"] if row else "Transfer"
+    return TASK_TYPE_PLACEHOLDER
 
 
 def validate_location_string(db, zone_key: str, value: str) -> str:
@@ -1072,7 +1350,9 @@ def task_chat_allowed(db, task_row, user) -> bool:
 # ---------------------------------------------------------------------------
 
 class LoginBody(BaseModel):
-    employee_id: str  # accepts either an employee ID or a @central.co.th email — see login()
+    # Accepts an employee ID, a phone number, or a @central.co.th email.
+    # The field keeps its old name so existing clients keep working.
+    employee_id: str
     password: str
 
 
@@ -1080,9 +1360,16 @@ class RegisterBody(BaseModel):
     employee_id: str
     email: Optional[str] = None
     full_name: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     password: str
     cost_center: str = Field(..., min_length=5, max_length=5)
     contact: str
+    # Optional invite code. A valid one registers the person as a driver with
+    # the matching licence straight away; an invalid one is a hard error rather
+    # than being ignored, so a typo can't quietly create a plain user who then
+    # wonders why they have no driver menu.
+    invite_code: Optional[str] = None
 
 
 class SetPasswordBody(BaseModel):
@@ -1128,10 +1415,19 @@ def require_role(*roles):
 def login(body: LoginBody):
     identifier = body.employee_id.strip()
     with get_db() as db:
+        # One field, three ways in. Phone is matched on digits only so the
+        # formatting someone types never decides whether they can log in.
+        phone = normalize_phone(identifier)
         row = db.execute(
-            "SELECT * FROM users WHERE employee_id=? OR email=?", (identifier, identifier)
+            "SELECT * FROM users WHERE deleted_at IS NULL AND "
+            "(employee_id=? OR LOWER(email)=LOWER(?) OR (contact IS NOT NULL AND contact=?))",
+            (identifier, identifier, phone or "\x00"),
         ).fetchone()
-        if not row or row["deleted_at"]:
+        if not row:
+            # 404 specifically means "no such account" — the frontend uses this
+            # to offer registration with what they typed already filled in.
+            # A wrong PASSWORD returns 401 instead and tells them to contact an
+            # admin, so the two cases can never be confused.
             raise HTTPException(404, "ยังไม่มีบัญชีนี้ โปรดสมัครสมาชิก")
         if row["password_hash"] == PENDING_PASSWORD:
             raise HTTPException(428, "เข้าสู่ระบบครั้งแรก กรุณาตั้งรหัสผ่าน")
@@ -1193,22 +1489,54 @@ def register(body: RegisterBody):
             raise HTTPException(400, "Cost center ต้องเป็นตัวเลข 5 หลัก")
         if not body.full_name.strip():
             raise HTTPException(400, "กรุณากรอกชื่อ-นามสกุล")
-        if not valid_thai_phone(body.contact):
-            raise HTTPException(400, "เบอร์ติดต่อไม่ถูกต้อง (ต้องเป็นเบอร์โทรไทย 9-10 หลัก)")
+        contact = validate_and_normalize_contact(db, body.contact)
         if len(body.password) < MIN_PASSWORD_LENGTH:
             raise HTTPException(400, f"รหัสผ่านต้องมีอย่างน้อย {MIN_PASSWORD_LENGTH} ตัวอักษร")
+
+        # The invite code decides the role. Resolved before anything is
+        # written, so a bad code costs nothing.
+        role, licence = "USER", None
+        if body.invite_code:
+            code = body.invite_code.strip()
+            if code and code == get_config(db, "invite_code_pe"):
+                role, licence = "DRIVER", "PE"
+            elif code and code == get_config(db, "invite_code_rt"):
+                role, licence = "DRIVER", "RT"
+            else:
+                raise HTTPException(400, "รหัสเชิญไม่ถูกต้อง")
+
+        full_name = body.full_name.strip()
+        first = (body.first_name or "").strip() or full_name.split(" ", 1)[0]
+        last = (body.last_name or "").strip() or (
+            full_name.split(" ", 1)[1].strip() if " " in full_name else "")
+
         if existing:
-            reactivate_account(db, existing, role="USER", full_name=body.full_name.strip(),
-                               password_hash=hash_password(body.password), email=email,
-                               cost_center=body.cost_center, contact=body.contact)
-            return {"ok": True, "reactivated": True}
-        db.execute(
-            "INSERT INTO users (employee_id, email, full_name, password_hash, role, cost_center, contact, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (body.employee_id, email, body.full_name.strip(), hash_password(body.password), "USER",
-             body.cost_center, body.contact, now_iso()),
-        )
-        return {"ok": True}
+            user_id = reactivate_account(
+                db, existing, role=role, full_name=full_name,
+                password_hash=hash_password(body.password), email=email,
+                cost_center=body.cost_center, contact=contact)
+        else:
+            cur = db.execute(
+                "INSERT INTO users (employee_id, email, full_name, first_name, last_name, "
+                "password_hash, role, driver_status, cost_center, contact, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+                (body.employee_id, email, full_name, first, last,
+                 hash_password(body.password), role,
+                 "Not Checked-in" if role == "DRIVER" else None,
+                 body.cost_center, contact, now_iso()),
+            )
+            user_id = cur.fetchone()["id"]
+        db.execute("UPDATE users SET first_name=?, last_name=? WHERE id=?", (first, last, user_id))
+
+        if licence:
+            # Permanent licence (no expiry), as specified for invite-code drivers.
+            db.execute("INSERT INTO driver_licenses (driver_id, vehicle_type) VALUES (?,?) "
+                       "ON CONFLICT DO NOTHING", (user_id, licence))
+            # Anyone who knows the code can make themselves a driver, so every
+            # use is announced instead of happening silently.
+            notify_admins(db, f"{body.employee_id} สมัครเป็นคนขับด้วยรหัสเชิญ (ใบอนุญาต {licence})")
+            audit(db, user_id, "register_with_invite_code", f"{body.employee_id} -> DRIVER {licence}")
+        return {"ok": True, "reactivated": bool(existing), "role": role, "license": licence}
 
 
 @app.post("/auth/set-password")
@@ -1512,7 +1840,7 @@ def delete_zone(zone_key: str, user=Depends(require_role("ADMIN"))):
 def get_vehicle_type_zones(user=Depends(require_role("ADMIN"))):
     with get_db() as db:
         vehicle_types = [r["vehicle_type"] for r in db.execute(
-            "SELECT DISTINCT vehicle_type FROM vehicles ORDER BY vehicle_type"
+            "SELECT DISTINCT vehicle_type FROM vehicles WHERE retired_at IS NULL ORDER BY vehicle_type"
         ).fetchall()]
         zones = [dict(r) for r in db.execute("SELECT zone_key, zone_name_th FROM zones ORDER BY sort_order, id").fetchall()]
         rows = db.execute("SELECT vehicle_type, zone_key FROM vehicle_type_zones").fetchall()
@@ -2736,6 +3064,125 @@ def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN"
 # Dispatch board
 # ---------------------------------------------------------------------------
 
+class ConfigBody(BaseModel):
+    values: dict
+
+
+@app.get("/admin/config")
+def get_admin_config(user=Depends(require_role("ADMIN"))):
+    """Everything editable from จัดการระบบ, plus a duplicate report.
+
+    The duplicate report matters because phone and email only became login
+    identifiers in this build. Any pre-existing account that shares one with
+    another account is now ambiguous at login, and the admin needs to see that
+    list BEFORE it bites someone — the app can't guess which account is right.
+    """
+    with get_db() as db:
+        values = {k: get_config(db, k) for k in CONFIG_DEFAULTS}
+        dup_phone = db.execute(
+            "SELECT contact, COUNT(*) n FROM users "
+            "WHERE deleted_at IS NULL AND contact IS NOT NULL AND contact != '' "
+            "GROUP BY contact HAVING COUNT(*) > 1"
+        ).fetchall()
+        dup_email = db.execute(
+            "SELECT LOWER(email) e, COUNT(*) n FROM users "
+            "WHERE deleted_at IS NULL AND email IS NOT NULL AND email != '' "
+            "GROUP BY LOWER(email) HAVING COUNT(*) > 1"
+        ).fetchall()
+
+        def who(col, val):
+            return [dict(r) for r in db.execute(
+                f"SELECT employee_id, full_name FROM users WHERE {col}=? AND deleted_at IS NULL",
+                (val,)).fetchall()]
+
+        return {
+            "values": values,
+            "defaults": CONFIG_DEFAULTS,
+            "rack_layout": rack_layout(db),
+            "duplicates": {
+                "phone": [{"value": r["contact"], "count": r["n"], "users": who("contact", r["contact"])}
+                          for r in dup_phone],
+                "email": [{"value": r["e"], "count": r["n"], "users": who("LOWER(email)", r["e"])}
+                          for r in dup_email],
+            },
+        }
+
+
+@app.put("/admin/config")
+def put_admin_config(body: ConfigBody, user=Depends(require_role("ADMIN"))):
+    with get_db() as db:
+        unknown = [k for k in body.values if k not in CONFIG_DEFAULTS]
+        if unknown:
+            raise HTTPException(400, "ตั้งค่าที่ไม่รู้จัก: " + ", ".join(unknown))
+        for k, v in body.values.items():
+            set_config(db, k, str(v).strip())
+        # Fail loudly if the new layout can't validate its own example, rather
+        # than letting every location entry break silently afterwards.
+        layout = rack_layout(db)
+        sample = (layout["aisle_from"] + f"{layout['bay_from']:02d}"
+                  + layout["level_from"] + str(layout["slot_from"]))
+        parsed, err = parse_rack_code(sample, layout)
+        if err:
+            raise HTTPException(400, f"ค่าที่ตั้งใช้ไม่ได้ — ตัวอย่าง {sample} ไม่ผ่าน: {err}")
+        audit(db, user["id"], "update_config", ", ".join(sorted(body.values)))
+        return {"ok": True, "rack_layout": layout, "sample": sample}
+
+
+@app.get("/rack/validate")
+def rack_validate(code: str, user=Depends(current_user)):
+    """Used by the location picker so the person sees the same verdict the
+    server will give, before they submit."""
+    with get_db() as db:
+        parsed, err = parse_rack_code(code, rack_layout(db))
+        return {"ok": err is None, "error": err, "parsed": parsed}
+
+
+@app.get("/admin/diagnostics")
+def admin_diagnostics(user=Depends(require_role("ADMIN"))):
+    """Where this deployment runs, and how far it is from its database.
+
+    The region NAMES are only a label — what actually matters is the measured
+    round-trip, which is why that is taken here rather than inferred from the
+    connection string. Bangkok to a database in the same region is single-digit
+    to low-tens of milliseconds; anything in the hundreds means the function
+    and the database are on different continents, and no amount of query
+    tuning will make up the difference.
+    """
+    import time as _t
+
+    # Connect + query separately: a slow connect with a fast query points at
+    # network distance, while both slow points at a loaded database.
+    t0 = _t.perf_counter()
+    with _new_db_connection() as probe:
+        connect_ms = (_t.perf_counter() - t0) * 1000
+        t1 = _t.perf_counter()
+        probe.execute("SELECT 1").fetchone()
+        query_ms = (_t.perf_counter() - t1) * 1000
+
+    db_host = None
+    if DATABASE_URL:
+        try:
+            db_host = DATABASE_URL.split("@", 1)[1].split("/", 1)[0].split("?")[0]
+        except Exception:
+            db_host = None
+
+    total = connect_ms + query_ms
+    verdict = ("อยู่ภูมิภาคเดียวกัน" if total < 50
+               else "คนละภูมิภาคแต่ใกล้กัน" if total < 150
+               else "คนละทวีป — ควรย้ายให้อยู่ภูมิภาคเดียวกัน")
+
+    return {
+        "version": APP_VERSION,
+        "function_region": os.environ.get("VERCEL_REGION") or os.environ.get("AWS_REGION"),
+        "database_host": db_host,          # host only — never the credentials
+        "database_backend": "postgres" if IS_POSTGRES else "sqlite",
+        "connect_ms": round(connect_ms, 1),
+        "query_ms": round(query_ms, 1),
+        "total_ms": round(total, 1),
+        "verdict": verdict,
+    }
+
+
 @app.get("/dispatch/board")
 def dispatch_board(user=Depends(require_role("ADMIN"))):
     """Everything the admin needs to hand out work, in one request.
@@ -2770,7 +3217,7 @@ def dispatch_board(user=Depends(require_role("ADMIN"))):
             "tasks.status AS current_task_status, tasks.estimated_arrival, "
             "task_assignments.assigned_at AS busy_since "
             "FROM users "
-            "LEFT JOIN vehicles ON vehicles.id = users.checked_in_vehicle_id "
+            "LEFT JOIN vehicles ON vehicles.id = users.checked_in_vehicle_id AND vehicles.retired_at IS NULL "
             "LEFT JOIN task_assignments ON task_assignments.driver_id = users.id "
             "   AND task_assignments.assignment_status='Active' "
             "LEFT JOIN tasks ON tasks.id = task_assignments.task_id "
@@ -2919,10 +3366,12 @@ def delete_vehicle_type(type_key: str, user=Depends(require_role("ADMIN"))):
         return {"ok": True}
 
 
+# Everything operational filters retired vehicles out; only reports and
+# historical lookups ever see them.
 @app.get("/vehicles")
 def list_vehicles(user=Depends(current_user)):
     with get_db() as db:
-        rows = db.execute("SELECT * FROM vehicles").fetchall()
+        rows = db.execute("SELECT * FROM vehicles WHERE retired_at IS NULL ORDER BY code").fetchall()
         return [dict(r) for r in rows]
 
 
@@ -2994,7 +3443,7 @@ def vehicles_available_for_checkin(user=Depends(require_role("DRIVER"))):
     """Vehicles nobody else is currently checked into (excludes Breakdown too)."""
     with get_db() as db:
         rows = db.execute(
-            "SELECT * FROM vehicles WHERE status != 'Breakdown' AND id NOT IN "
+            "SELECT * FROM vehicles WHERE retired_at IS NULL AND status != 'Breakdown' AND id NOT IN "
             "(SELECT checked_in_vehicle_id FROM users WHERE role='DRIVER' "
             "AND checked_in_vehicle_id IS NOT NULL AND id != ?) ORDER BY code",
             (user["id"],),
@@ -3028,6 +3477,8 @@ def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
         v = db.execute("SELECT * FROM vehicles WHERE code=?", (body.vehicle_code,)).fetchone()
         if not v:
             raise HTTPException(404, "ไม่พบรถคันนี้")
+        if v["retired_at"]:
+            raise HTTPException(400, "รถคันนี้ถูกปลดระวางแล้ว ไม่สามารถเช็คอินได้")
         if v["status"] == "Breakdown":
             raise HTTPException(400, "รถคันนี้ถูกแจ้งว่าเสีย จึงเช็คอินไม่ได้")
         if body.battery_level is not None:
@@ -3361,7 +3812,6 @@ def app_data(scope: str = "core", user=Depends(current_user)):
             out["vehicleTypes"] = list_vehicle_types(user)
             out["breakdowns"] = list_breakdowns(user)
             out["zones"] = list_zones(user)
-            out["taskRules"] = list_task_rules(user)
             out["teamChatMessages"] = get_team_chat_messages(user)
             out["teamChatParticipants"] = team_chat_participants(user)
             if scope == "admin_dash":
@@ -3744,6 +4194,12 @@ try:
         # /healthz report the import error as the root cause.
         raise RuntimeError(f"Postgres driver import failed: {_IMPORT_ERROR}")
     init_db()
+    ensure_columns()
+    try:
+        with get_db() as _db:
+            sync_master_fleet(_db)
+    except Exception as e:
+        log.warning("Master fleet sync skipped: %s", e)
     ensure_indexes()
     ensure_vapid_keys()
 except Exception as e:
@@ -3762,6 +4218,7 @@ else:
 
 @app.get("/healthz")
 def healthz():
+    # version first so a curl against a deployment tells you what is running
     """Plain diagnostics endpoint that never touches the DB at import time —
     so even if startup init failed, this still answers and tells you WHY,
     turning an opaque 500 into a readable message."""
@@ -3830,9 +4287,29 @@ except RuntimeError as e:
     log.warning("Could not mount /static (%s) — the SPA frontend won't be served, but the API will still respond", e)
 
 
+_INDEX_HTML = None
+
+
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+    """Serves the app shell with the build version substituted in.
+
+    Read once and held in memory — the file doesn't change between deploys,
+    and on serverless each cold start re-reads it anyway.
+
+    Deliberately no-cache: the whole point of a visible version is that the
+    person's screen matches the build that's live. A cached shell would keep
+    showing (and running) the previous one.
+    """
+    global _INDEX_HTML
+    if _INDEX_HTML is None:
+        try:
+            with open(os.path.join(FRONTEND_DIR, "index.html"), encoding="utf-8") as f:
+                _INDEX_HTML = f.read().replace("__APP_VERSION__", APP_VERSION)
+        except OSError:
+            return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+    return Response(content=_INDEX_HTML, media_type="text/html; charset=utf-8",
+                    headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/service-worker.js")
