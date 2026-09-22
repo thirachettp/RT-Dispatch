@@ -1418,11 +1418,19 @@ def login(body: LoginBody):
         # One field, three ways in. Phone is matched on digits only so the
         # formatting someone types never decides whether they can log in.
         phone = normalize_phone(identifier)
-        row = db.execute(
-            "SELECT * FROM users WHERE deleted_at IS NULL AND "
-            "(employee_id=? OR LOWER(email)=LOWER(?) OR (contact IS NOT NULL AND contact=?))",
-            (identifier, identifier, phone or "\x00"),
-        ).fetchone()
+        # Only add the phone clause when there's actually a number to match.
+        # (An earlier version passed a NUL character as a "matches nothing"
+        # placeholder; SQLite accepts that, but PostgreSQL rejects any string
+        # containing NUL outright, so every login without digits — including
+        # "admin" — crashed with a 500 in production.)
+        sql = ("SELECT * FROM users WHERE deleted_at IS NULL AND "
+               "(employee_id=? OR LOWER(email)=LOWER(?)")
+        params = [identifier, identifier]
+        if phone:
+            sql += " OR contact=?"
+            params.append(phone)
+        sql += ")"
+        row = db.execute(sql, tuple(params)).fetchone()
         if not row:
             # 404 specifically means "no such account" — the frontend uses this
             # to offer registration with what they typed already filled in.
@@ -4246,10 +4254,17 @@ def emergency_reset_admin_password(body: AdminResetBody):
     normal running system. Resets the password of the earliest-created admin
     account. Set the env var, call this once, then delete the env var (or
     leave it — it's still safe, but removing it closes the hatch)."""
-    reset_secret = os.environ.get("ADMIN_RESET_SECRET")
+    def _clean(s):
+        # Values pasted into a hosting dashboard very often pick up a trailing
+        # space or newline, or get typed with quote marks around them. Those
+        # are never meant to be part of the secret, and an exact comparison
+        # would reject the right secret with an unhelpful "Invalid secret".
+        return (s or "").strip().strip('"').strip("'").strip()
+
+    reset_secret = _clean(os.environ.get("ADMIN_RESET_SECRET"))
     if not reset_secret:
         raise HTTPException(404, "Not found")
-    if not hmac.compare_digest(body.secret, reset_secret):
+    if not hmac.compare_digest(_clean(body.secret).encode(), reset_secret.encode()):
         raise HTTPException(403, "Invalid secret")
     if len(body.new_password) < MIN_PASSWORD_LENGTH:
         raise HTTPException(400, f"รหัสผ่านต้องมีอย่างน้อย {MIN_PASSWORD_LENGTH} ตัวอักษร")
