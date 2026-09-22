@@ -109,6 +109,20 @@
   .as-count.on{color:#fff;background:var(--blue);}
   #as-submit:disabled{opacity:.55;cursor:not-allowed;}
 
+  /* Task chat: full height, details pinned above the log. */
+  .sheet.sheet-full{height:92vh;max-height:92vh;display:flex;flex-direction:column;}
+  .sheet-full .chat-log{flex:1;min-height:0;overflow-y:auto;}
+  #chat-top{flex:none;max-height:45vh;overflow-y:auto;}
+  .chat-card{padding:10px 12px;margin:0 0 10px;}
+  .chat-card .card-actions{margin-top:0;padding-top:0;border-top:none;}
+  .chat-sys{display:flex;flex-direction:column;align-items:center;gap:2px;margin:10px auto;
+    max-width:88%;text-align:center;}
+  .chat-sys span{background:var(--panel-2);color:var(--ink-dim);font-size:12px;
+    padding:6px 12px;border-radius:999px;line-height:1.5;}
+  .chat-sys em{font-style:normal;font-size:10px;color:var(--ink-dim);opacity:.7;}
+  .copy-phone{color:var(--blue);text-decoration:none;font-weight:700;}
+  .copy-hint{font-size:10px;color:var(--ink-dim);font-weight:400;margin-left:4px;}
+
   .brand{display:flex;align-items:center;gap:10px;}
   .logo-mark{width:28px;height:28px;border-radius:8px;background:var(--amber);display:flex;
     align-items:center;justify-content:center;flex:none;}
@@ -2777,7 +2791,10 @@ function bindCardClickToDetail(container){
     card.style.cursor = "pointer";
     card.addEventListener("click", (e)=>{
       if(e.target.closest("button")) return;
-      openTaskDetailSheet(card.dataset.id);
+      // Tapping a job opens its conversation, with every detail of the job at
+      // the top — the chat is where status changes are announced, so it is
+      // the one place that tells the whole story.
+      openChatSheet(card.dataset.id);
     });
   });
   loadAuthenticatedImages(container);
@@ -4123,6 +4140,10 @@ function buildTaskDetailActions(t){
   if(state.role === "USER"){
     if(t.status === "Waiting") return `<button class="btn" data-edit="${t.id}">แก้ไข</button><button class="btn" data-photo="${t.id}">เพิ่มรูป</button>${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
     if(t.status === "Assigned") return `${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
+    // The requester can clear a problem and confirm the job is done — they are
+    // usually the one who can see whether the goods arrived.
+    if(t.status === "Pause") return `<button class="btn amber" data-resolve="${t.id}">แก้ไขเหตุขัดข้อง</button><button class="btn green" data-req-complete="${t.id}">ยืนยันงานเสร็จ</button>${isChat}`;
+    if(t.status === "In Progress") return `<button class="btn green" data-req-complete="${t.id}">ยืนยันงานเสร็จ</button>${isChat}`;
     if(t.status === "Completed" && !t.rating) return `<button class="btn amber" data-rate="${t.id}">ให้คะแนน</button>${isChat}${dupBtn}`;
     return isChat + dupBtn;
   }
@@ -4150,6 +4171,32 @@ function buildTaskDetailActions(t){
 
 function bindTaskDetailActions(container){
   bindCardActions(container);
+  container.querySelectorAll("[data-resolve]").forEach(b=>{
+    b.onclick = async (e)=>{
+      e.stopPropagation();
+      if(!confirm("ยืนยันว่าแก้ไขเหตุขัดข้องเรียบร้อยแล้ว และให้งานดำเนินการต่อ?")) return;
+      await taskAction({
+        id: b.dataset.resolve, key: "resolve", btn: b,
+        patch: ()=> ({status: "In Progress"}),
+        run: ()=> api(`/tasks/${b.dataset.resolve}/resume`, {method:"POST"}),
+        successMsg: "แก้ไขเหตุขัดข้องแล้ว — งานดำเนินการต่อ",
+      });
+      reopenChatIfOpen(b.dataset.resolve);
+    };
+  });
+  container.querySelectorAll("[data-req-complete]").forEach(b=>{
+    b.onclick = async (e)=>{
+      e.stopPropagation();
+      if(!confirm("ยืนยันว่างานนี้เสร็จเรียบร้อยแล้ว?\nคนขับทุกคนในงานจะถูกปลดจากงานนี้ทันที")) return;
+      await taskAction({
+        id: b.dataset.reqComplete, key: "req-complete", btn: b,
+        patch: ()=> ({status: "Completed"}),
+        run: ()=> api(`/tasks/${b.dataset.reqComplete}/requester-complete`, {method:"POST"}),
+        successMsg: "ยืนยันงานเสร็จแล้ว",
+      });
+      reopenChatIfOpen(b.dataset.reqComplete);
+    };
+  });
   container.querySelectorAll("[data-edit]").forEach(b=> b.onclick = ()=> openEditTask(b.dataset.edit));
   container.querySelectorAll("[data-photo]").forEach(b=> b.onclick = ()=> openPhotoUpload(b.dataset.photo));
   container.querySelectorAll("[data-pause]").forEach(b=> b.onclick = ()=> openPauseSheet(b.dataset.pause));
@@ -4292,32 +4339,98 @@ function openNotifications(){
 }
 
 // ---------------- Task chat ----------------
-function openChatSheet(taskId){
+// If an action inside the chat changed the task, rebuild the chat so the
+// details and buttons at the top reflect the new state.
+function reopenChatIfOpen(taskId){
+  const open = document.querySelector(`.sheet-overlay[data-chat-task="${taskId}"]`);
+  if(open){ closeSheet(open); openChatSheet(taskId); }
+}
+
+function chatDetailsHTML(t){
+  const row = (label, value)=> value ? `<div class="as-d"><span>${label}</span><b>${value}</b></div>` : "";
+  const waited = minutesAgo(t.created_at);
+  const crew = (t.drivers || []).map(d=> `${d.full_name || d.employee_id}${d.vehicle_code ? ` (${d.vehicle_code})` : ""}`).join(", ");
+  return `<div class="as-detail">
+    <div class="as-code">${t.task_code} <span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span></div>
+    <div class="as-route">${t.from_location} <span class="arrow">→</span> ${t.to_location}</div>
+    ${row("จำนวนพาเลท", t.pallet_qty)}
+    ${row("สร้างคำขอเมื่อ", t.created_at ? `${fmtTime(t.created_at)} (${fmtDuration(waited)}ที่แล้ว)` : "")}
+    ${t.request_type === "Booking" ? row("นัดหมาย", fmtTime(t.scheduled_at)) : ""}
+    ${row("ผู้ขอ", t.requester_name || t.requester_employee_id)}
+    ${t.requester_contact ? `<div class="as-d"><span>ติดต่อ</span><b><a href="#" class="copy-phone" data-phone="${t.requester_contact}">${fmtPhone(t.requester_contact)}</a> <span class="copy-hint">กดเพื่อคัดลอก</span></b></div>` : ""}
+    ${row("คนขับ", crew)}
+    ${row("หมายเหตุ", t.remark)}
+  </div>`;
+}
+
+async function openChatSheet(taskId){
   const overlay = el(`
-    <div class="sheet-overlay">
-      <div class="sheet">
+    <div class="sheet-overlay" data-chat-task="${taskId}">
+      <div class="sheet sheet-full">
         <div class="sheet-head"><h2>แชทงาน</h2><button id="sh-close">✕</button></div>
-        <div class="chat-log" id="chat-log"><div class="empty">กำลังโหลด...</div></div>
+        <div id="chat-top"><div class="empty">กำลังโหลด...</div></div>
+        <div class="chat-log" id="chat-log"></div>
         <div class="chat-input-row">
           <input id="chat-input" placeholder="พิมพ์ข้อความ..." />
           <button class="btn amber" id="chat-send">ส่ง</button>
         </div>
       </div>
-    </div>
-  `);
+    </div>`);
   document.body.appendChild(overlay);
   overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
+  const top = overlay.querySelector("#chat-top");
+  async function loadTask(){
+    try{
+      const t = await api(`/tasks/${taskId}`, {background:true});
+      top.innerHTML = "";
+      top.appendChild(el(chatDetailsHTML(t)));
+      const actions = buildTaskDetailActions(t).replace(/<button class="btn" data-chat="[^"]*">💬 แชท<\/button>/g, "");
+      if(actions.trim()){
+        const bar = el(`<div class="card-actions chat-actions" data-id="${t.id}">${actions}</div>`);
+        // bindCardActions looks up the task id from the nearest .card
+        const wrap = el(`<div class="card chat-card" data-id="${t.id}"></div>`);
+        wrap.appendChild(bar);
+        top.appendChild(wrap);
+        bindTaskDetailActions(wrap);
+        // Whatever button is pressed here changes the job; pick up the result
+        // (and the automatic chat line it produces) right away.
+        wrap.addEventListener("click", (e)=>{
+          if(e.target.closest("button")) setTimeout(()=>{ lastCount = -2; loadMessages(); loadTask(); }, 900);
+        }, true);
+      }
+      top.querySelectorAll(".copy-phone").forEach(a=>{
+        a.onclick = async (e)=>{
+          e.preventDefault();
+          const num = a.dataset.phone;
+          try{ await navigator.clipboard.writeText(num); toast(`คัดลอกเบอร์ ${fmtPhone(num)} แล้ว`); }
+          catch(_){ toast(`เบอร์: ${fmtPhone(num)}`); }
+        };
+      });
+    }catch(e){ top.innerHTML = ""; top.appendChild(el(`<div class="err">${e.message}</div>`)); }
+  }
+
+  let lastCount = -1;
   async function loadMessages(){
     if(document.activeElement === overlay.querySelector("#chat-input")) return; // don't yank focus while typing
     try{
-      const msgs = await api(`/tasks/${taskId}/messages`);
+      const msgs = await api(`/tasks/${taskId}/messages`, {background:true});
       const log = overlay.querySelector("#chat-log");
       if(!log) return;
+      // A new automatic line means the job itself changed — refresh the
+      // details above so the status and buttons are never stale.
+      const newSystem = lastCount >= 0 && msgs.length > lastCount &&
+        msgs.slice(lastCount).some(m=> m.kind === "system");
+      if(msgs.length === lastCount) return;   // nothing new: leave the log alone
+      lastCount = msgs.length;
       log.innerHTML = "";
       if(msgs.length === 0){ log.appendChild(el(`<div class="empty">ยังไม่มีข้อความ เริ่มการสนทนาได้เลย</div>`)); }
       msgs.forEach(m=>{
+        if(m.kind === "system"){
+          log.appendChild(el(`<div class="chat-sys"><span>${m.message}</span><em>${fmtTime(m.created_at)}</em></div>`));
+          return;
+        }
         const mine = m.sender_employee_id === state.employee_id;
         log.appendChild(el(`<div class="chat-msg ${mine ? 'mine' : 'theirs'}">
           <div class="who">${mine ? 'คุณ' : m.sender_employee_id + ' ('+m.sender_role+')'}</div>
@@ -4325,6 +4438,7 @@ function openChatSheet(taskId){
         </div>`));
       });
       log.scrollTop = log.scrollHeight;
+      if(newSystem) loadTask();
     }catch(e){ /* not a participant, or task removed */ }
   }
   async function send(){
@@ -4334,13 +4448,15 @@ function openChatSheet(taskId){
     try{
       await api(`/tasks/${taskId}/messages`, {method:"POST", body: JSON.stringify({message})});
       input.value = "";
+      input.blur();
       await loadMessages();
     }catch(e){ toast(e.message); }
   }
   overlay.querySelector("#chat-send").onclick = send;
   overlay.querySelector("#chat-input").addEventListener("keydown", (e)=>{ if(e.key==="Enter") send(); });
 
-  loadMessages();
+  await Promise.all([loadTask(), loadMessages()]);
+  if(chatPollTimer) clearInterval(chatPollTimer);
   chatPollTimer = setInterval(loadMessages, 3000);
 }
 
