@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.260922.1646"
+APP_VERSION = "TTLOD.260922.1729"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
