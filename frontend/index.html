@@ -3117,35 +3117,52 @@ async function refreshDispatchBoard(){
   }catch(e){ /* keep the last good board on screen */ }
 }
 
+// Default view: everything still in play. Finished and cancelled work is one
+// tap away under "ทั้งหมด" but doesn't crowd the working list.
+const OPS_DEFAULT_FILTER = {status: "active", overdue: false, q: ""};
+
+// Task codes are compared letters-and-digits only, so "tk260922005",
+// "260922-005" and "005" all find TK260922-005.
+function normCode(s){ return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
+
+function isOverdue(t, now){
+  if(t.status === "Waiting") return (now - new Date(t.created_at).getTime()) > 15*60*1000;
+  if(t.status === "In Progress") return t.started_at && (now - new Date(t.started_at).getTime()) > 60*60*1000;
+  return false;
+}
+
 function renderOperationJobs(main){
-  if(!state.opsJobFilter) state.opsJobFilter = {status:"", overdue:false};
+  if(!state.opsJobFilter || state.opsJobFilter.status === "") {
+    // "" was the old "show everything" default; the working list is now the default.
+    state.opsJobFilter = {...OPS_DEFAULT_FILTER};
+  }
+  if(state.opsJobFilter.q === undefined) state.opsJobFilter.q = "";
+  const f = state.opsJobFilter;
 
   // Who is free, and who frees up when — the first thing needed before
   // handing out work, so it sits above the queue.
   renderDriversNowPanel(main);
 
+  const now = Date.now();
   const activeTasks = state.tasks.filter(t=> !["Completed","Cancelled"].includes(t.status));
-  const overdueCount = activeTasks.filter(t=>{
-    const now = Date.now();
-    if(t.status === "Waiting") return (now - new Date(t.created_at).getTime()) > 15*60*1000;
-    if(t.status === "In Progress") return t.started_at && (now - new Date(t.started_at).getTime()) > 60*60*1000;
-    return false;
-  }).length;
-  const summary = el(`<div class="stat-grid" style="margin-bottom:14px;">
-    <div class="stat"><div class="n">${state.tasks.filter(t=>t.status==='Waiting').length}</div><div class="l">รอดำเนินการ</div></div>
-    <div class="stat"><div class="n">${activeTasks.length - state.tasks.filter(t=>t.status==='Waiting').length}</div><div class="l">กำลังดำเนินการ</div></div>
-    <div class="stat"><div class="n">${overdueCount}</div><div class="l">ค้างนาน (Overdue)</div></div>
-  </div>`);
-  main.appendChild(summary);
+  const waiting = state.tasks.filter(t=> t.status === "Waiting").length;
+  main.appendChild(el(`<div class="stat-grid" style="margin-bottom:14px;">
+    <div class="stat"><div class="n">${waiting}</div><div class="l">รอดำเนินการ</div></div>
+    <div class="stat"><div class="n">${activeTasks.length - waiting}</div><div class="l">กำลังดำเนินการ</div></div>
+    <div class="stat"><div class="n">${activeTasks.filter(t=> isOverdue(t, now)).length}</div><div class="l">ค้างนาน (Overdue)</div></div>
+  </div>`));
 
   const filterBar = el(`<div class="card">
-    <div class="grid2">
+    <label>ค้นหาเลขงาน</label>
+    <input id="oj-q" placeholder="เช่น TK260922-005 หรือแค่ 005" autocomplete="off" />
+    <div class="grid2" style="margin-top:8px;">
       <div><label>สถานะ</label><select id="oj-status">
-        <option value="">ทั้งหมด</option>
+        <option value="active">ยังไม่เสร็จ (ไม่รวมเสร็จสิ้น/ยกเลิก)</option>
+        <option value="all">ทั้งหมด</option>
         <option value="Waiting">รอดำเนินการ</option>
         <option value="Assigned">มอบหมายแล้ว</option>
         <option value="In Progress">กำลังทำ</option>
-        <option value="Pause">หยุดชั่วคราว</option>
+        <option value="Pause">ขัดข้อง</option>
         <option value="Completed">เสร็จสิ้น</option>
         <option value="Cancelled">ยกเลิก</option>
       </select></div>
@@ -3155,53 +3172,91 @@ function renderOperationJobs(main){
     </div>
   </div>`);
   main.appendChild(filterBar);
-  filterBar.querySelector("#oj-status").value = state.opsJobFilter.status;
-  filterBar.querySelector("#oj-overdue").checked = state.opsJobFilter.overdue;
-  filterBar.querySelector("#oj-status").onchange = (e)=>{ state.opsJobFilter.status = e.target.value; renderContent(); };
-  filterBar.querySelector("#oj-overdue").onchange = (e)=>{ state.opsJobFilter.overdue = e.target.checked; renderContent(); };
+  const qInput = filterBar.querySelector("#oj-q");
+  const statusSel = filterBar.querySelector("#oj-status");
+  const overdueCb = filterBar.querySelector("#oj-overdue");
+  qInput.value = f.q;
+  statusSel.value = f.status;
+  overdueCb.checked = f.overdue;
 
-  const now = Date.now();
-  let tasks = state.tasks.slice();
-  if(state.opsJobFilter.status) tasks = tasks.filter(t=> t.status === state.opsJobFilter.status);
-  if(state.opsJobFilter.overdue){
-    tasks = tasks.filter(t=>{
-      if(t.status === "Waiting") return (now - new Date(t.created_at).getTime()) > 15*60*1000;
-      if(t.status === "In Progress") return t.started_at && (now - new Date(t.started_at).getTime()) > 60*60*1000;
-      return false;
-    });
+  // Everything below here is redrawn on each filter change. The filter bar
+  // above is NOT, so typing in the search box never loses focus.
+  const listBox = el(`<div id="oj-list"></div>`);
+  main.appendChild(listBox);
+
+  function statusMatch(t){
+    if(f.status === "all") return true;
+    if(f.status === "active") return !["Completed","Cancelled"].includes(t.status);
+    return t.status === f.status;
   }
-  // Oldest first: work should be handed out front-to-back, so the job that
-  // has waited longest is the one at the top.
-  tasks.sort((a,b)=> String(a.created_at||"").localeCompare(String(b.created_at||"")));
-  main.appendChild(el(`<div class="section-title">งาน (${tasks.length}) · เก่าสุดก่อน</div>`));
-  if(tasks.length === 0) main.appendChild(el(`<div class="empty">ไม่พบงานตามตัวกรอง</div>`));
-  tasks.forEach(t=>{
-    let actions = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
-    if(t.status === "Waiting"){
-      actions = `<button class="btn amber" data-assign="${t.id}">มอบหมายงาน</button>
-        <button class="btn" data-sendback="${t.id}">ตีกลับ</button>${actions}`;
-    } else if(["Assigned","In Progress","Pause"].includes(t.status)){
-      actions = `<button class="btn blue" data-reassign="${t.id}">มอบหมายใหม่</button>
-        <button class="btn green" data-add-driver="${t.id}">+ เพิ่มคนขับ</button>
-${actions}
-        ${t.status !== "Assigned" ? `<button class="btn green" data-admin-complete="${t.id}">ทำเครื่องหมายเสร็จ</button>` : ""}
-        <button class="btn red" data-action="cancel">ยกเลิก</button>`;
+  function codeMatch(t){
+    const q = normCode(f.q);
+    return !q || normCode(t.task_code).includes(q);
+  }
+
+  function drawList(){
+    listBox.innerHTML = "";
+    const n = Date.now();
+    let tasks = state.tasks.filter(t=> statusMatch(t) && codeMatch(t) && (!f.overdue || isOverdue(t, n)));
+    // Oldest first: work should be handed out front-to-back, so the job that
+    // has waited longest is the one at the top.
+    tasks.sort((a,b)=> String(a.created_at||"").localeCompare(String(b.created_at||"")));
+    listBox.appendChild(el(`<div class="section-title">งาน (${tasks.length}) · เก่าสุดก่อน</div>`));
+
+    if(tasks.length === 0){
+      // A task number that exists but sits outside the current status filter
+      // should never look like "not found" — offer to show it.
+      const elsewhere = f.q ? state.tasks.filter(t=> codeMatch(t) && !statusMatch(t)) : [];
+      if(elsewhere.length){
+        const hint = el(`<div class="empty">ไม่พบในตัวกรองนี้ แต่พบ ${elsewhere.length} งานในสถานะอื่น
+          (${elsewhere.slice(0,3).map(t=> `${t.task_code} · ${STATUS_LABEL[t.status] || t.status}`).join(", ")})
+          <br><button class="btn" style="margin-top:8px;">แสดงทุกสถานะ</button></div>`);
+        hint.querySelector("button").onclick = ()=>{ f.status = "all"; statusSel.value = "all"; drawList(); };
+        listBox.appendChild(hint);
+      } else if(f.q){
+        // Finished work older than the loaded window isn't on this screen —
+        // say so, rather than implying the task doesn't exist.
+        listBox.appendChild(el(`<div class="empty">ไม่พบเลขงาน "${f.q}" ในงานที่แสดงอยู่
+          <div class="field-note" style="margin-top:4px;">งานที่เสร็จหรือยกเลิกไปนานกว่า 14 วันจะไม่แสดงในหน้านี้</div></div>`));
+      } else {
+        listBox.appendChild(el(`<div class="empty">ไม่พบงานตามตัวกรอง</div>`));
+      }
+      return;
     }
-    main.appendChild(el(taskCard(t, actions, {showRequester:true})));
-  });
-  main.querySelectorAll("[data-assign]").forEach(b=> b.onclick = ()=> openAssignSheet(b.dataset.assign, false));
-  main.querySelectorAll("[data-reassign]").forEach(b=> b.onclick = ()=> openAssignSheet(b.dataset.reassign, true));
-  main.querySelectorAll("[data-add-driver]").forEach(b=> b.onclick = ()=> openAddDriverSheet(b.dataset.addDriver));
-  main.querySelectorAll("[data-admin-complete]").forEach(b=>{
-    b.onclick = async ()=>{
-      if(!confirm("ยืนยันทำเครื่องหมายว่างานนี้เสร็จแล้ว? ใช้สำหรับงานที่ค้างผิดปกติเท่านั้น")) return;
-      try{ await api(`/tasks/${b.dataset.adminComplete}/admin-complete`, {method:"POST"}); toast("ทำเครื่องหมายเสร็จแล้ว"); await refreshAll(); }
-      catch(e){ toast(e.message); }
-    };
-  });
-  main.querySelectorAll("[data-sendback]").forEach(b=> b.onclick = ()=> openSendBackSheet(b.dataset.sendback));
-  bindCardActions(main);
-  bindCardClickToDetail(main);
+
+    tasks.forEach(t=>{
+      let actions = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
+      if(t.status === "Waiting"){
+        actions = `<button class="btn amber" data-assign="${t.id}">มอบหมายงาน</button>
+          <button class="btn" data-sendback="${t.id}">ตีกลับ</button>${actions}`;
+      } else if(["Assigned","In Progress","Pause"].includes(t.status)){
+        actions = `<button class="btn blue" data-reassign="${t.id}">มอบหมายใหม่</button>
+          <button class="btn green" data-add-driver="${t.id}">+ เพิ่มคนขับ</button>
+${actions}
+          ${t.status !== "Assigned" ? `<button class="btn green" data-admin-complete="${t.id}">ทำเครื่องหมายเสร็จ</button>` : ""}
+          <button class="btn red" data-action="cancel">ยกเลิก</button>`;
+      }
+      listBox.appendChild(el(taskCard(t, actions, {showRequester:true})));
+    });
+    listBox.querySelectorAll("[data-assign]").forEach(b=> b.onclick = ()=> openAssignSheet(b.dataset.assign, false));
+    listBox.querySelectorAll("[data-reassign]").forEach(b=> b.onclick = ()=> openAssignSheet(b.dataset.reassign, true));
+    listBox.querySelectorAll("[data-add-driver]").forEach(b=> b.onclick = ()=> openAddDriverSheet(b.dataset.addDriver));
+    listBox.querySelectorAll("[data-admin-complete]").forEach(b=>{
+      b.onclick = async ()=>{
+        if(!confirm("ยืนยันทำเครื่องหมายว่างานนี้เสร็จแล้ว? ใช้สำหรับงานที่ค้างผิดปกติเท่านั้น")) return;
+        try{ await api(`/tasks/${b.dataset.adminComplete}/admin-complete`, {method:"POST"}); toast("ทำเครื่องหมายเสร็จแล้ว"); await refreshAll(); }
+        catch(e){ toast(e.message); }
+      };
+    });
+    listBox.querySelectorAll("[data-sendback]").forEach(b=> b.onclick = ()=> openSendBackSheet(b.dataset.sendback));
+    bindCardActions(listBox);
+    bindCardClickToDetail(listBox);
+  }
+
+  qInput.addEventListener("input", ()=>{ f.q = qInput.value; drawList(); });
+  statusSel.onchange = ()=>{ f.status = statusSel.value; drawList(); };
+  overdueCb.onchange = ()=>{ f.overdue = overdueCb.checked; drawList(); };
+  drawList();
 }
 
 function openAddDriverSheet(taskId){
