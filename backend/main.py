@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.260922.1729"
+APP_VERSION = "TTLOD.261014.1421"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -524,6 +524,52 @@ def add_minutes_iso(minutes: int) -> str:
     return (datetime.utcnow() + timedelta(minutes=minutes)).isoformat(timespec="seconds") + "Z"
 
 
+def iso_days_ago(days: int) -> str:
+    return (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds") + "Z"
+
+
+# How long a signed-in device stays signed in without being used. Sessions are
+# pruned opportunistically at login (there is no scheduler), so this is an
+# upper bound on how long an abandoned token can linger, not a precise expiry.
+SESSION_MAX_AGE_DAYS = 90
+
+
+def describe_user_agent(ua: Optional[str]) -> str:
+    """A short, recognisable name for a signed-in device.
+
+    The point is only that someone looking at their own device list can tell
+    the warehouse tablet from their phone, so this stays deliberately coarse —
+    no UA parsing library, no version numbers, no fingerprinting.
+    """
+    if not ua:
+        return "อุปกรณ์ไม่ทราบชนิด"
+    u = ua.lower()
+    if "ipad" in u:
+        os_name = "iPad"
+    elif "iphone" in u:
+        os_name = "iPhone"
+    elif "android" in u:
+        os_name = "Android"
+    elif "windows" in u:
+        os_name = "Windows"
+    elif "mac os" in u or "macintosh" in u:
+        os_name = "Mac"
+    else:
+        os_name = "อุปกรณ์อื่น"
+    # Order matters: Edge and Chrome both claim Safari, Edge also claims Chrome.
+    if "edg/" in u:
+        browser = "Edge"
+    elif "crios" in u or "chrome" in u:
+        browser = "Chrome"
+    elif "fxios" in u or "firefox" in u:
+        browser = "Firefox"
+    elif "safari" in u:
+        browser = "Safari"
+    else:
+        browser = None
+    return f"{os_name} · {browser}" if browser else os_name
+
+
 def generate_task_code(db) -> str:
     """TK{YYMMDD}-{seq}, e.g. TK260910-001. The date uses Thailand local time
     (UTC+7) — everything else in this app is stored in UTC, but a task code
@@ -557,11 +603,6 @@ def valid_thai_phone(contact: str) -> bool:
 # Kept in app_config (a key/value table) rather than environment variables so
 # it survives a deploy and can be edited from inside the product.
 CONFIG_DEFAULTS = {
-    # Registration invite codes. Whoever types one of these while registering
-    # gets that driver licence immediately, so they are changeable — if one
-    # leaks, an admin rotates it in จัดการระบบ instead of waiting for a build.
-    "invite_code_pe": "driver_pe_82640",
-    "invite_code_rt": "driver_rt_82640",
     # Rack location layout. The warehouse defines its own ranges, so nothing
     # here is hard-coded in the validator — it all reads from these values.
     "rack_aisle_from": "AAA",
@@ -749,7 +790,12 @@ CREATE TABLE IF NOT EXISTS vehicle_types (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type_key TEXT UNIQUE NOT NULL,
     type_name_th TEXT NOT NULL,
-    description TEXT
+    description TEXT,
+    -- Registering with this code grants a permanent licence for this type.
+    -- It lives here, rather than in two fixed config rows, so a type added
+    -- later can have one too. NULL means nobody can sign themselves up for
+    -- this type and an admin has to grant the licence.
+    invite_code TEXT
 );
 
 CREATE TABLE IF NOT EXISTS driver_licenses (
@@ -757,6 +803,11 @@ CREATE TABLE IF NOT EXISTS driver_licenses (
     driver_id INTEGER NOT NULL REFERENCES users(id),
     vehicle_type TEXT NOT NULL,
     expiry_date TEXT,
+    -- The driver's usual vehicle of this type ("รถประจำ"). Boarded for them
+    -- automatically when they open the app, so picking a vehicle stops being
+    -- a daily chore. It lives on the licence row because a driver licensed
+    -- for two types has one usual vehicle of each.
+    default_vehicle_id INTEGER REFERENCES vehicles(id),
     UNIQUE(driver_id, vehicle_type)
 );
 
@@ -828,16 +879,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     blocked_at TEXT
 );
 
+-- NOTE: is_active_for_driver is added by ensure_columns() for existing
+-- databases; fresh ones get it here.
 CREATE TABLE IF NOT EXISTS task_assignments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES tasks(id),
     driver_id INTEGER NOT NULL REFERENCES users(id),
-    vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),
+    -- Nullable: a driver can be assigned before they have boarded a vehicle.
+    -- assigned_vehicle_type then says which kind of vehicle the job expects,
+    -- and the id is filled in the moment they check one out.
+    vehicle_id INTEGER REFERENCES vehicles(id),
+    assigned_vehicle_type TEXT,
     assigned_by INTEGER NOT NULL REFERENCES users(id),
     assigned_at TEXT NOT NULL,
     unassigned_at TEXT,
     assignment_status TEXT NOT NULL DEFAULT 'Active',
-    reason TEXT
+    reason TEXT,
+    -- 1 = the job this driver has in hand, 0 = waiting in their queue.
+    is_active_for_driver INTEGER NOT NULL DEFAULT 1
 );
 
 -- A driver can never have two simultaneously-Active assignment rows on the
@@ -908,7 +967,11 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- Several devices can be signed in at once, so each session records what
+    -- it was opened from. Without this the "signed in on these devices" list
+    -- would be a row of identical timestamps nobody could act on.
+    user_agent TEXT
 );
 
 CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -1048,6 +1111,21 @@ NEW_COLUMNS = [
     # sender_id stays the person whose action caused it, so history is never
     # anonymous even for automatic lines.
     ("task_messages", "kind", "TEXT NOT NULL DEFAULT 'user'", None),
+    # Which role a driver was assigned AS. Normally the type of the vehicle
+    # they are in — but a driver can now be assigned before boarding one, and
+    # the job still has to know whether it is waiting on an RT or a PE.
+    ("task_assignments", "assigned_vehicle_type", "TEXT", None),
+    # Which device a session was opened from, for the device list in Profile.
+    ("sessions", "user_agent", "TEXT", None),
+    # The driver's usual vehicle for this licence type ("รถประจำ").
+    ("driver_licenses", "default_vehicle_id", "INTEGER", None),
+    # A driver can hold several jobs at once now. Exactly one of their Active
+    # assignments is the job in hand (1); the rest are their queue (0).
+    # Existing rows default to 1, which is correct: before queues, every
+    # Active assignment WAS the job in hand.
+    ("task_assignments", "is_active_for_driver", "INTEGER NOT NULL DEFAULT 1", None),
+    # Per-type invite code, replacing the two fixed invite_code_pe/rt settings.
+    ("vehicle_types", "invite_code", "TEXT", None),
 ]
 
 
@@ -1074,6 +1152,26 @@ def ensure_columns():
                     log.warning("Could not add column %s.%s: %s", table, col, e)
             if added:
                 log.info("Schema updated: added %s", ", ".join(added))
+
+            # vehicle_id used to be NOT NULL. Assigning a driver who has not
+            # boarded yet needs it nullable; on SQLite the constraint can only
+            # be changed by rebuilding the table, and fresh SQLite databases
+            # already get the new definition, so only Postgres needs this.
+            if IS_POSTGRES:
+                try:
+                    db.execute("ALTER TABLE task_assignments ALTER COLUMN vehicle_id DROP NOT NULL")
+                except Exception as ex:
+                    log.warning("Could not relax task_assignments.vehicle_id: %s", ex)
+
+            # Backfill the role for every assignment made before the column
+            # existed: it is simply the type of the vehicle they were in.
+            try:
+                db.execute(
+                    "UPDATE task_assignments SET assigned_vehicle_type = "
+                    "(SELECT vehicle_type FROM vehicles WHERE vehicles.id = task_assignments.vehicle_id) "
+                    "WHERE assigned_vehicle_type IS NULL AND vehicle_id IS NOT NULL")
+            except Exception as ex:
+                log.warning("Could not backfill assigned_vehicle_type: %s", ex)
 
             # Phone numbers were stored as typed/displayed ("081-234-5678").
             # Login and the uniqueness check compare digits only, so every
@@ -1107,6 +1205,46 @@ def ensure_columns():
                                (first, last, r["id"]))
                 if rows:
                     log.info("Backfilled first/last name for %d user(s)", len(rows))
+
+            # Invite codes moved from two fixed app_config rows onto the
+            # vehicle type they grant. This has to happen here, not in
+            # migrate_db(), which only ever runs on SQLite — on an existing
+            # Postgres database the codes would otherwise stay NULL and every
+            # driver who had been given one would be turned away.
+            try:
+                moved = []
+                for key, type_key, fallback in (("invite_code_rt", "RT", "driver_rt_82640"),
+                                                ("invite_code_pe", "PE", "driver_pe_82640")):
+                    vt = db.execute("SELECT invite_code FROM vehicle_types WHERE type_key=?",
+                                    (type_key,)).fetchone()
+                    if not vt or vt["invite_code"]:
+                        continue    # type gone, or it already carries its own code
+                    old_row = db.execute("SELECT value FROM app_config WHERE key=?", (key,)).fetchone()
+                    code = (old_row["value"] if old_row else None) or fallback
+                    db.execute("UPDATE vehicle_types SET invite_code=? WHERE type_key=?",
+                               (code, type_key))
+                    moved.append(f"{type_key}={code}")
+                if moved:
+                    log.info("Migrated: invite codes moved onto vehicle types (%s)", ", ".join(moved))
+            except Exception as ex:
+                log.warning("Could not move invite codes onto vehicle types: %s", ex)
+
+            # Any vehicle type that predates the zone matrix being populated
+            # per type can work nowhere, which fails every assignment using
+            # it. Give a type with no zone rows at all the full set.
+            try:
+                for vt in db.execute("SELECT type_key FROM vehicle_types").fetchall():
+                    has = db.execute("SELECT 1 FROM vehicle_type_zones WHERE vehicle_type=?",
+                                     (vt["type_key"],)).fetchone()
+                    if has:
+                        continue
+                    for z in db.execute("SELECT zone_key FROM zones").fetchall():
+                        db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) "
+                                   "VALUES (?,?) ON CONFLICT DO NOTHING",
+                                   (vt["type_key"], z["zone_key"]))
+                    log.info("Migrated: opened every zone for vehicle type %s", vt["type_key"])
+            except Exception as ex:
+                log.warning("Could not backfill vehicle_type_zones: %s", ex)
     except Exception as e:
         log.warning("ensure_columns skipped: %s", e)
 
@@ -1161,6 +1299,17 @@ def migrate_db():
             )
             log.info("Migrated database: added EMPTY_PALLET zone")
 
+        if not db.execute("SELECT 1 FROM zones WHERE zone_key='STAGING'").fetchone():
+            db.execute(
+                "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) "
+                "VALUES ('STAGING','Staging (อื่นๆ)','^.+$',0,'ระบุจุดเอง',7,1)"
+            )
+            # Free-text zone, so every vehicle type can serve it.
+            for vt in ("RT", "PE"):
+                db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) "
+                           "ON CONFLICT DO NOTHING", (vt, "STAGING"))
+            log.info("Migrated database: added STAGING zone")
+
 
 # ---------------------------------------------------------------------------
 # Master Forklift
@@ -1212,6 +1361,10 @@ def sync_master_fleet(db):
             # left the fleet — they'd be stuck unable to check out.
             db.execute("UPDATE users SET checked_in_vehicle_id=NULL, driver_status='Not Checked-in' "
                        "WHERE checked_in_vehicle_id=?", (row["id"],))
+            # ...and stop auto-boarding anyone into a vehicle that just left
+            # the fleet, which would otherwise fail on every app open.
+            db.execute("UPDATE driver_licenses SET default_vehicle_id=NULL WHERE default_vehicle_id=?",
+                       (row["id"],))
             db.execute("UPDATE vehicles SET retired_at=?, status='Retired' WHERE id=?",
                        (now_iso(), row["id"]))
             retired += 1
@@ -1228,9 +1381,9 @@ def seed_master_data(db):
     next boot instead of staying empty forever. Safe to call every startup."""
     if not db.execute("SELECT 1 FROM vehicle_types LIMIT 1").fetchone():
         db.execute(
-            "INSERT INTO vehicle_types (type_key, type_name_th, description) VALUES "
-            "('RT','RT - รถยก','ยกสินค้าขึ้นชั้นวาง (บางคันเข้า Double Deep ได้)'),"
-            "('PE','PE - รถลาก','ลากพาเลทระยะสั้น')"
+            "INSERT INTO vehicle_types (type_key, type_name_th, description, invite_code) VALUES "
+            "('RT','RT - รถยก','ยกสินค้าขึ้นชั้นวาง (บางคันเข้า Double Deep ได้)','driver_rt_82640'),"
+            "('PE','PE - รถลาก','ลากพาเลทระยะสั้น','driver_pe_82640')"
         )
         log.info("Seeded master data: vehicle_types")
 
@@ -1243,7 +1396,8 @@ def seed_master_data(db):
             "('MEZZANINE','Mezzanine','^Mezzanine-[1-4]-(ซ้าย \\(Cross dock\\)|ขวา \\(Double Deep\\))$',0,'Mezzanine-2-ซ้าย (Cross dock)',4,0),"
             "('SELECTIVE_RACK','Selective Rack','^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$',1,'BAA01A1',5,0),"
             "('DOUBLE_DEEP','Double Deep','^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$',1,'AAA01G1',6,0),"
-            "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า-จุดจ่าย',7,1)"
+            "('STAGING','Staging (อื่นๆ)','^.+$',0,'ระบุจุดเอง',7,1),"
+            "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า-จุดจ่าย',8,1)"
         )
         log.info("Seeded master data: zones")
 
@@ -1465,13 +1619,124 @@ def audit(db, actor_id: Optional[int], action: str, details: str = ""):
 
 def free_up_driver_and_vehicle(db, driver_id: Optional[int], vehicle_id: Optional[int]):
     if driver_id:
-        row = db.execute("SELECT driver_status FROM users WHERE id=?", (driver_id,)).fetchone()
-        if row and row["driver_status"] not in ("Breakdown",):
-            db.execute("UPDATE users SET driver_status='Available' WHERE id=?", (driver_id,))
+        # recompute rather than assume free: with queues, a driver coming off
+        # one job may still be holding others, and flattening them to
+        # "Available" would offer them to a second job they can't take.
+        recompute_driver_status(db, driver_id)
     if vehicle_id:
         row = db.execute("SELECT status FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
         if row and row["status"] != "Breakdown":
             db.execute("UPDATE vehicles SET status='Available' WHERE id=?", (vehicle_id,))
+
+
+# ---------------------------------------------------------------------------
+# Job queues
+#
+# A dispatcher can now hand a driver several jobs in one go instead of waiting
+# by the screen to deal them out one at a time. Exactly one of a driver's
+# Active assignments is the job in hand (is_active_for_driver = 1); the others
+# are their queue. Finishing the job in hand promotes the next one on its own,
+# so the driver never has to come back to the app to be given work that was
+# already theirs.
+#
+# The flag lives on the assignment, not on the task, because a task can carry
+# a crew: one member may be working it while another still has it queued
+# behind something else, and a single task-level flag could not express that.
+# ---------------------------------------------------------------------------
+
+def driver_active_assignment(db, driver_id):
+    """The assignment for the job this driver has in hand, or None."""
+    return db.execute(
+        "SELECT ta.* FROM task_assignments ta JOIN tasks t ON t.id = ta.task_id "
+        "WHERE ta.driver_id=? AND ta.assignment_status='Active' AND ta.is_active_for_driver=1 "
+        "AND t.status NOT IN ('Completed','Cancelled') LIMIT 1",
+        (driver_id,),
+    ).fetchone()
+
+
+def driver_queue(db, driver_id):
+    """This driver's queued assignments, the one waiting longest first."""
+    return db.execute(
+        "SELECT ta.*, t.task_code FROM task_assignments ta JOIN tasks t ON t.id = ta.task_id "
+        "WHERE ta.driver_id=? AND ta.assignment_status='Active' AND ta.is_active_for_driver=0 "
+        "AND t.status NOT IN ('Completed','Cancelled') ORDER BY t.created_at, ta.assigned_at",
+        (driver_id,),
+    ).fetchall()
+
+
+def task_has_active_worker(db, task_id) -> bool:
+    return bool(db.execute(
+        "SELECT 1 FROM task_assignments WHERE task_id=? AND assignment_status='Active' "
+        "AND is_active_for_driver=1", (task_id,),
+    ).fetchone())
+
+
+def recompute_driver_status(db, driver_id):
+    """Set a driver's status from what they are actually holding.
+
+    Four states, in order of precedence: a reported breakdown outranks
+    everything; working a job is Busy; holding only queued work is Assigned
+    (spoken for, so no job offers them to anyone else); otherwise free, which
+    is Available with a vehicle and Not Checked-in without one.
+    """
+    row = db.execute("SELECT driver_status, checked_in_vehicle_id FROM users WHERE id=?",
+                     (driver_id,)).fetchone()
+    if not row or row["driver_status"] == "Breakdown":
+        return
+    active = driver_active_assignment(db, driver_id)
+    if active and active["vehicle_id"]:
+        status = "Busy"
+    elif active or driver_queue(db, driver_id):
+        # Spoken for, but not out driving yet: either the job in hand is still
+        # waiting on a vehicle, or they are only holding queued work. Either
+        # way no other job may be offered to them.
+        status = "Assigned"
+    else:
+        status = "Available" if row["checked_in_vehicle_id"] else "Not Checked-in"
+    db.execute("UPDATE users SET driver_status=? WHERE id=?", (status, driver_id))
+
+
+def start_assignment(db, assignment, actor_id, *, announce=True):
+    """Make a queued assignment the job this driver has in hand."""
+    db.execute("UPDATE task_assignments SET is_active_for_driver=1 WHERE id=?", (assignment["id"],))
+    row = db.execute("SELECT * FROM tasks WHERE id=?", (assignment["task_id"],)).fetchone()
+    stamp = now_iso()
+    if row["status"] == "Assigned":
+        db.execute("UPDATE tasks SET status='In Progress', started_at=COALESCE(started_at,?) WHERE id=?",
+                   (stamp, row["id"]))
+        db.execute(
+            "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
+            "VALUES (?,?,?,?,?)", (row["id"], "Assigned", "In Progress", actor_id, stamp),
+        )
+    db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
+               (assignment["driver_id"], assignment["vehicle_id"], row["id"]))
+    recompute_driver_status(db, assignment["driver_id"])
+    if announce:
+        post_system_message(db, row["id"], assignment["driver_id"],
+                            f"{person_label(db, assignment['driver_id'])} เริ่มงานนี้แล้ว")
+    return row
+
+
+def promote_next_in_queue(db, driver_id, actor_id):
+    """Start the next queued job for a driver who just freed up.
+
+    This is the whole point of queues: the dispatcher hands out a batch, and
+    each job begins by itself as the one before it ends, with no one waiting
+    in the app to press anything.
+    """
+    if driver_active_assignment(db, driver_id):
+        return None
+    q = driver_queue(db, driver_id)
+    if not q:
+        return None
+    nxt = q[0]
+    row = start_assignment(db, nxt, actor_id, announce=False)
+    post_system_message(db, row["id"], driver_id,
+                        f"{person_label(db, driver_id)} เริ่มงานนี้ต่อจากงานที่เพิ่งเสร็จ")
+    notify(db, driver_id, f"เริ่มงานถัดไปในคิว: {row['task_code']} "
+                          f"{row['from_location']} → {row['to_location']}", row["id"])
+    notify(db, row["requester_id"], f"งาน {row['task_code']} เริ่มดำเนินการแล้ว", row["id"])
+    return row
 
 
 def check_waiting_too_long(db):
@@ -1562,7 +1827,7 @@ def require_role(*roles):
 
 
 @app.post("/auth/login")
-def login(body: LoginBody):
+def login(body: LoginBody, user_agent: Optional[str] = Header(None)):
     identifier = body.employee_id.strip()
     with get_db() as db:
         # One field, three ways in. Phone is matched on digits only so the
@@ -1591,22 +1856,65 @@ def login(body: LoginBody):
             raise HTTPException(428, "เข้าสู่ระบบครั้งแรก กรุณาตั้งรหัสผ่าน")
         if not verify_password(body.password, row["password_hash"]):
             raise HTTPException(401, "รหัสผ่านไม่ถูกต้อง หากลืมรหัสโปรดติดต่อ Admin")
-        if row["role"] == "DRIVER":
-            # Every fresh login starts "not on a vehicle yet" until they check in again.
-            db.execute(
-                "UPDATE users SET driver_status='Not Checked-in', checked_in_vehicle_id=NULL "
-                "WHERE id=? AND driver_status NOT IN ('Busy','Breakdown')",
-                (row["id"],),
-            )
-        # Single active session per account: a fresh login anywhere signs out
-        # any other device/browser this account was logged into elsewhere.
-        db.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
+        # Signing in no longer touches the vehicle. It used to clear
+        # checked_in_vehicle_id on every login, which is what made drivers
+        # re-pick a vehicle so often: anything that ended a session — a login
+        # on a second device, cleared site data — cost them their vehicle even
+        # though they were still sitting in it. A vehicle now changes hands
+        # only when somebody actually takes it (see /vehicles/check-in).
+        #
+        # Several devices may be signed in at once, too. The old rule kept one
+        # session per account, so a driver using both their phone and a shared
+        # tablet knocked themselves out all day and retyped their password
+        # every time. Profile lists the signed-in devices and can sign them
+        # all out, which is the control that replaces that rule.
         token = secrets.token_urlsafe(32)
         db.execute(
-            "INSERT INTO sessions (token, user_id, created_at) VALUES (?,?,?)",
-            (token, row["id"], now_iso()),
+            "INSERT INTO sessions (token, user_id, created_at, user_agent) VALUES (?,?,?,?)",
+            (token, row["id"], now_iso(), (user_agent or "")[:300] or None),
         )
+        # Housekeeping, done here because there is no scheduler: tokens this
+        # old belong to devices nobody signed out from months ago.
+        db.execute("DELETE FROM sessions WHERE user_id=? AND created_at < ?",
+                   (row["id"], iso_days_ago(SESSION_MAX_AGE_DAYS)))
         return {"token": token, "role": row["role"], "employee_id": row["employee_id"]}
+
+
+@app.get("/auth/sessions")
+def list_my_sessions(authorization: Optional[str] = Header(None), user=Depends(current_user)):
+    """Devices this account is signed in on, newest first."""
+    mine = (authorization or "").removeprefix("Bearer ").strip()
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT token, created_at, user_agent FROM sessions WHERE user_id=? ORDER BY created_at DESC",
+            (user["id"],),
+        ).fetchall()
+    return [{
+        "created_at": r["created_at"],
+        "device": describe_user_agent(r["user_agent"]),
+        "current": r["token"] == mine,
+    } for r in rows]
+
+
+@app.post("/auth/logout")
+def logout(authorization: Optional[str] = Header(None), user=Depends(current_user)):
+    """Sign this device out. Without this the token stayed valid forever: the
+    frontend only dropped its copy, and nothing on the server ever expired
+    it."""
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    with get_db() as db:
+        db.execute("DELETE FROM sessions WHERE token=? AND user_id=?", (token, user["id"]))
+    return {"ok": True}
+
+
+@app.post("/auth/logout-all")
+def logout_all(user=Depends(current_user)):
+    """Sign out everywhere, this device included — what to reach for when a
+    phone goes missing or a shared tablet was left signed in."""
+    with get_db() as db:
+        n = db.execute("SELECT COUNT(*) c FROM sessions WHERE user_id=?", (user["id"],)).fetchone()["c"]
+        db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+    return {"ok": True, "signed_out": n}
 
 
 def find_deleted_account(db, employee_id):
@@ -1655,13 +1963,16 @@ def register(body: RegisterBody):
         # written, so a bad code costs nothing.
         role, licence = "USER", None
         if body.invite_code:
+            # Every vehicle type carries its own code, so a type added later
+            # can hand out its own licence without a code change in here.
             code = body.invite_code.strip()
-            if code and code == get_config(db, "invite_code_pe"):
-                role, licence = "DRIVER", "PE"
-            elif code and code == get_config(db, "invite_code_rt"):
-                role, licence = "DRIVER", "RT"
-            else:
+            match = db.execute(
+                "SELECT type_key FROM vehicle_types WHERE invite_code IS NOT NULL "
+                "AND invite_code != '' AND invite_code=?", (code,),
+            ).fetchone() if code else None
+            if not match:
                 raise HTTPException(400, "รหัสเชิญไม่ถูกต้อง")
+            role, licence = "DRIVER", match["type_key"]
 
         full_name = body.full_name.strip()
         first = (body.first_name or "").strip() or full_name.split(" ", 1)[0]
@@ -1733,9 +2044,15 @@ def me(user=Depends(current_user)):
             today = datetime.utcnow().strftime("%Y-%m-%d")
             out["licenses"] = [
                 {"vehicle_type": r["vehicle_type"], "expiry_date": r["expiry_date"],
-                 "valid": (not r["expiry_date"]) or r["expiry_date"] >= today}
-                for r in db.execute("SELECT vehicle_type, expiry_date FROM driver_licenses "
-                                    "WHERE driver_id=? ORDER BY vehicle_type", (user["id"],)).fetchall()
+                 "valid": (not r["expiry_date"]) or r["expiry_date"] >= today,
+                 # Their usual vehicle for this type, so the profile can state
+                 # it without the client having to join against the fleet.
+                 "default_vehicle_code": r["default_code"]}
+                for r in db.execute(
+                    "SELECT dl.vehicle_type, dl.expiry_date, v.code AS default_code "
+                    "FROM driver_licenses dl LEFT JOIN vehicles v "
+                    "ON v.id = dl.default_vehicle_id AND v.retired_at IS NULL "
+                    "WHERE dl.driver_id=? ORDER BY dl.vehicle_type", (user["id"],)).fetchall()
             ]
     return out
 
@@ -1839,15 +2156,16 @@ def admin_update_user(user_id: int, body: UserAdminUpdateBody, user=Depends(requ
         if not row:
             raise HTTPException(404, "ไม่พบผู้ใช้")
         fields = body.dict(exclude_unset=True, exclude={"email"})
+        # Personal details belong to the person. An admin can see them, change
+        # someone's role, reset their password and remove the account — but
+        # name, phone, email and cost centre are edited by their owner only,
+        # so there is one source of truth for who someone is.
+        personal = [k for k in ("full_name", "contact", "cost_center") if k in fields]
+        if personal or body.email is not None:
+            raise HTTPException(
+                403, "แอดมินแก้ไขข้อมูลส่วนตัวของผู้ใช้ไม่ได้ — เจ้าของบัญชีแก้ไขเองในเมนูโปรไฟล์")
         if "role" in fields and fields["role"] not in ("USER", "DRIVER", "ADMIN"):
             raise HTTPException(400, "role ไม่ถูกต้อง")
-        if fields.get("cost_center"):
-            if not fields["cost_center"].isdigit() or len(fields["cost_center"]) != 5:
-                raise HTTPException(400, "Cost center ต้องเป็นตัวเลข 5 หลัก")
-        if fields.get("contact") and not valid_thai_phone(fields["contact"]):
-            raise HTTPException(400, "เบอร์ติดต่อไม่ถูกต้อง")
-        if body.email is not None:
-            fields["email"] = validate_and_normalize_email(db, body.email, exclude_user_id=user_id)
         if not fields:
             return {"ok": True}
         set_clause = ", ".join(f"{k}=?" for k in fields.keys())
@@ -1927,6 +2245,8 @@ def get_driver_licenses(user_id: int, user=Depends(require_role("ADMIN"))):
 class LicenseBody(BaseModel):
     vehicle_type: str
     expiry_date: Optional[str] = None  # None = permanent, never expires
+    # The driver's usual vehicle of this type. "" / None clears it.
+    default_vehicle_code: Optional[str] = None
 
 
 @app.post("/admin/users/{user_id}/licenses")
@@ -1937,12 +2257,27 @@ def set_driver_license(user_id: int, body: LicenseBody, user=Depends(require_rol
         except ValueError:
             raise HTTPException(400, "วันหมดอายุต้องอยู่ในรูปแบบ YYYY-MM-DD (เช่น 2027-12-31)")
     with get_db() as db:
+        default_id = None
+        code = (body.default_vehicle_code or "").strip()
+        if code:
+            v = db.execute("SELECT * FROM vehicles WHERE code=? AND retired_at IS NULL", (code,)).fetchone()
+            if not v:
+                raise HTTPException(404, f"ไม่พบรถรหัส {code}")
+            # A usual vehicle of a type the licence isn't for could never be
+            # boarded, so refuse it here rather than failing silently later.
+            if v["vehicle_type"] != body.vehicle_type:
+                raise HTTPException(
+                    400, f"รถ {code} เป็นประเภท {v['vehicle_type']} "
+                         f"จึงตั้งเป็นรถประจำของใบอนุญาต {body.vehicle_type} ไม่ได้")
+            default_id = v["id"]
         db.execute(
-            "INSERT INTO driver_licenses (driver_id, vehicle_type, expiry_date) VALUES (?,?,?) "
-            "ON CONFLICT(driver_id, vehicle_type) DO UPDATE SET expiry_date=excluded.expiry_date",
-            (user_id, body.vehicle_type, body.expiry_date),
+            "INSERT INTO driver_licenses (driver_id, vehicle_type, expiry_date, default_vehicle_id) "
+            "VALUES (?,?,?,?) ON CONFLICT(driver_id, vehicle_type) DO UPDATE SET "
+            "expiry_date=excluded.expiry_date, default_vehicle_id=excluded.default_vehicle_id",
+            (user_id, body.vehicle_type, body.expiry_date, default_id),
         )
-        audit(db, user["id"], "set_license", f"driver {user_id}: {body.vehicle_type} exp={body.expiry_date}")
+        audit(db, user["id"], "set_license",
+              f"driver {user_id}: {body.vehicle_type} exp={body.expiry_date} default={code or '-'}")
         return {"ok": True}
 
 
@@ -2143,6 +2478,7 @@ def tasks_to_dicts(rows, db, viewer_role: Optional[str] = None) -> list:
     assignments_by_task = {}
     arows = db.execute(
         "SELECT task_assignments.task_id, task_assignments.vehicle_id, "
+        "task_assignments.assigned_vehicle_type, task_assignments.is_active_for_driver, "
         "task_assignments.assigned_at, users.employee_id, users.full_name "
         "FROM task_assignments JOIN users ON users.id = task_assignments.driver_id "
         f"WHERE task_assignments.task_id IN ({_placeholders(len(task_ids))}) "
@@ -2152,6 +2488,32 @@ def tasks_to_dicts(rows, db, viewer_role: Optional[str] = None) -> list:
     ).fetchall()
     for a in arows:
         assignments_by_task.setdefault(a["task_id"], []).append(a)
+
+    # 1b. For paused tasks, the most recent hold: who raised it, which side,
+    #     and what they said. One query for all of them, never per card.
+    pause_by_task = {}
+    paused_ids = [d["id"] for d in dicts if d.get("status") == "Pause"]
+    if paused_ids:
+        prows = db.execute(
+            "SELECT h.task_id, h.note, h.changed_at, u.employee_id, u.full_name, u.first_name, u.role "
+            "FROM task_status_history h LEFT JOIN users u ON u.id = h.changed_by "
+            f"WHERE h.task_id IN ({_placeholders(len(paused_ids))}) AND h.to_status='Pause' "
+            "ORDER BY h.id",
+            tuple(paused_ids),
+        ).fetchall()
+        for p in prows:
+            note = p["note"] or ""
+            m = re.match(r"\[(\w+)\]\s*(.*)", note)
+            side, reason = (m.group(1), m.group(2)) if m else (None, note)
+            pause_by_task[p["task_id"]] = {      # later rows overwrite: latest wins
+                "side": side,                     # 'user' or 'vehicle'
+                "side_label": _PAUSE_SIDE_TH.get(side, side or ""),
+                "reason": reason,
+                "by_role": p["role"],
+                "by_name": (p["first_name"] or p["full_name"] or p["employee_id"] or ""),
+                "by_employee_id": p["employee_id"],
+                "at": p["changed_at"],
+            }
 
     # 2. Every user referenced by any task (driver + requester) in one query.
     user_ids = set()
@@ -2218,11 +2580,26 @@ def tasks_to_dicts(rows, db, viewer_role: Optional[str] = None) -> list:
             {
                 "employee_id": a["employee_id"], "full_name": a["full_name"],
                 "vehicle_code": vehicle_code_by_id.get(a["vehicle_id"]),
+                # The role they were assigned as. Set even before they board,
+                # so the card can say "RT 1 · PE 2" from the moment work is
+                # handed out rather than once everyone has a vehicle.
+                "vehicle_type": a["assigned_vehicle_type"],
+                "awaiting_vehicle": a["vehicle_id"] is None,
+                # False when this job is sitting in that driver's queue behind
+                # another one. The driver's own screen uses it to separate the
+                # job in hand from what is waiting.
+                "working_on_it": bool(a["is_active_for_driver"]),
             }
             for a in assignments_by_task.get(d["id"], [])
         ]
         d["drivers"] = drivers
         d["other_driver_count"] = max(0, len(drivers) - 1)
+        counts = {}
+        for a in drivers:
+            if a["vehicle_type"]:
+                counts[a["vehicle_type"]] = counts.get(a["vehicle_type"], 0) + 1
+        d["driver_counts"] = counts
+        d["pause_info"] = pause_by_task.get(d["id"])
         out.append(d)
     return out
 
@@ -2482,9 +2859,15 @@ class AssignBody(BaseModel):
     estimated_minutes: Optional[int] = None
     force: bool = False
 
+    # Richer form: which role each driver takes. Needed because a driver can
+    # be assigned before boarding, when their type can't be read off a vehicle.
+    # [{"employee_id": "D01", "vehicle_type": "RT"}, ...]
+    crew: Optional[List[dict]] = None
+
     def drivers(self) -> List[str]:
         """Normalised, de-duplicated, order-preserving list of employee ids."""
-        raw = list(self.driver_employee_ids or [])
+        raw = [str(c.get("employee_id") or "") for c in (self.crew or [])]
+        raw += list(self.driver_employee_ids or [])
         if self.driver_employee_id:
             raw.insert(0, self.driver_employee_id)
         seen, out = set(), []
@@ -2495,34 +2878,113 @@ class AssignBody(BaseModel):
                 out.append(e)
         return out
 
+    def type_for(self, employee_id: str) -> Optional[str]:
+        """The role this driver was picked for, when the caller said."""
+        for c in (self.crew or []):
+            if str(c.get("employee_id") or "").strip() == employee_id:
+                t = (c.get("vehicle_type") or "").strip().upper()
+                return t or None
+        return None
+
 
 _STATUS_TH = {
     "Available": "ว่าง", "Busy": "ไม่ว่าง", "Pause": "พัก", "Breakdown": "ขัดข้อง", "Not Checked-in": "ยังไม่ขึ้นรถ",
+    # Spoken for by a job, but still has to board a vehicle before working.
+    "Assigned": "รอเลือกรถ",
 }
 
 
-def eligibility_issues(db, driver, vehicle, task_row) -> List[str]:
+def eligibility_issues(db, driver, vehicle, task_row, vehicle_type=None) -> List[str]:
+    """Problems with putting this driver on this task.
+
+    `vehicle` may be None: a driver can be assigned before boarding one. The
+    checks that need an actual vehicle (its status) are then skipped — they
+    are enforced again at check-in — but the licence and zone checks still
+    run against the TYPE the driver is being assigned as, so a job can never
+    be given to someone who could not do it whatever vehicle they pick.
+    """
     issues = []
-    if driver["driver_status"] not in ("Available",):
-        issues.append(f"คนขับมีสถานะ '{_STATUS_TH.get(driver['driver_status'], driver['driver_status'])}' ไม่ใช่ 'ว่าง'")
-    if vehicle["status"] not in ("Available",):
-        issues.append(f"รถมีสถานะ '{_STATUS_TH.get(vehicle['status'], vehicle['status'])}' ไม่ใช่ 'ว่าง'")
-    lic = db.execute(
-        "SELECT 1 FROM driver_licenses WHERE driver_id=? AND vehicle_type=?", (driver["id"], vehicle["vehicle_type"])
-    ).fetchone()
-    if not lic:
-        issues.append(f"คนขับไม่มีใบอนุญาตขับรถประเภท {vehicle['vehicle_type']}")
-    from_issue = zone_capability_issue(db, vehicle["vehicle_type"], task_row["from_zone"])
+    vtype = vehicle["vehicle_type"] if vehicle else vehicle_type
+    if not vtype:
+        return ["ไม่ทราบประเภทรถที่จะใช้"]
+    # Busy and Assigned are no longer problems: handing work to a driver who
+    # already has some is exactly what a queue is for, and refusing it was
+    # what forced the dispatcher to sit in the app dealing jobs out one at a
+    # time. Only a reported breakdown or a paused driver is a real obstacle.
+    if driver["driver_status"] in ("Breakdown", "Pause"):
+        issues.append(f"คนขับมีสถานะ '{_STATUS_TH.get(driver['driver_status'], driver['driver_status'])}'")
+    if vehicle and vehicle["status"] == "Breakdown":
+        issues.append("รถคันนี้ถูกแจ้งว่าเสีย")
+
+    from_issue = zone_capability_issue(db, vtype, task_row["from_zone"])
     if from_issue:
         issues.append(from_issue)
     if task_row["to_zone"] != task_row["from_zone"]:
-        to_issue = zone_capability_issue(db, vehicle["vehicle_type"], task_row["to_zone"])
+        to_issue = zone_capability_issue(db, vtype, task_row["to_zone"])
         if to_issue:
             issues.append(to_issue)
     return issues
 
 
-def _attach_extra_driver(db, task_row, driver, vehicle, actor_id, reason):
+def resolve_crew(db, body, task_row):
+    """Turn the requested crew into (driver, vehicle_or_None, type, issues).
+
+    A driver who has not boarded yet is allowed: the caller says which role
+    they take, or it is inferred from their licences when that is
+    unambiguous. Nothing is written until every member has been resolved, so
+    a bad name in the list can't leave half a crew assigned.
+    """
+    out, problems = [], []
+    for emp in body.drivers():
+        drv = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'", (emp,)).fetchone()
+        if not drv:
+            raise HTTPException(404, f"ไม่พบคนขับ {emp}")
+        veh = None
+        if drv["checked_in_vehicle_id"]:
+            veh = db.execute("SELECT * FROM vehicles WHERE id=?", (drv["checked_in_vehicle_id"],)).fetchone()
+        vtype = veh["vehicle_type"] if veh else body.type_for(emp)
+        if not vtype:
+            # No vehicle and no stated role: only safe to guess when the
+            # driver holds exactly one licence.
+            lic = sorted(valid_license_types(db, drv["id"]))
+            if len(lic) == 1:
+                vtype = lic[0]
+            elif not lic:
+                raise HTTPException(
+                    400, f"คนขับ {drv['full_name'] or emp} ไม่มีใบอนุญาตขับรถ จึงมอบหมายงานไม่ได้")
+            else:
+                raise HTTPException(
+                    400, f"คนขับ {drv['full_name'] or emp} มีใบอนุญาตหลายประเภท ({', '.join(lic)}) "
+                         f"กรุณาระบุว่าจะให้ไปในฐานะรถประเภทใด")
+        stated = body.type_for(emp)
+        extra = []
+        if veh and stated and stated != veh["vehicle_type"]:
+            # They were put down as one type while sitting in another. The job
+            # does not demand a type, so this is allowed; it goes through as
+            # the stated type with the vehicle left behind, and the dispatcher
+            # is told so they can see what they asked for.
+            extra.append(f"ขณะนี้อยู่บนรถ {veh['vehicle_type']} {veh['code']} "
+                         f"— มอบหมายในฐานะ {stated} จะต้องเปลี่ยนไปขึ้นรถ {stated} ก่อนเริ่มงาน")
+            vtype = stated
+            veh = None
+        # Checked against the role they will actually take, which is only
+        # settled above. A hard stop, deliberately not one of the forceable
+        # issues: check-in refuses an unlicensed vehicle at 403, so forcing
+        # this through would only create a job the driver could never start.
+        licensed = valid_license_types(db, drv["id"])
+        if vtype not in licensed:
+            raise HTTPException(
+                409, f"คนขับ {drv['full_name'] or emp} ไม่มีใบอนุญาตขับรถประเภท {vtype} "
+                     f"(ใบอนุญาตที่มี: {', '.join(sorted(licensed)) or 'ไม่มี'}) "
+                     f"จึงมอบหมายในฐานะนี้ไม่ได้")
+        iss = extra + eligibility_issues(db, drv, veh, task_row, vehicle_type=vtype)
+        out.append((drv, veh, vtype, iss))
+        if iss:
+            problems.append(f"{drv['full_name'] or emp}: " + "; ".join(iss))
+    return out, problems
+
+
+def _attach_extra_driver(db, task_row, driver, vehicle, actor_id, reason, vehicle_type=None):
     """Add one more Active driver to a task that already has a primary.
     Shared by multi-driver assign and the admin 'add driver' action so the two
     can't drift apart."""
@@ -2531,24 +2993,34 @@ def _attach_extra_driver(db, task_row, driver, vehicle, actor_id, reason):
         (task_row["id"], driver["id"]),
     ).fetchone():
         return False
+    vtype = vehicle["vehicle_type"] if vehicle else vehicle_type
+    takes_it_up = not driver_active_assignment(db, driver["id"])
     try:
         db.execute(
-            "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_by, assigned_at, "
-            "assignment_status, reason) VALUES (?,?,?,?,?,?,?)",
-            (task_row["id"], driver["id"], vehicle["id"], actor_id, now_iso(), "Active", reason or "มอบหมายพร้อมกันหลายคน"),
+            "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_vehicle_type, assigned_by, "
+            "assigned_at, assignment_status, reason, is_active_for_driver) VALUES (?,?,?,?,?,?,?,?,?)",
+            (task_row["id"], driver["id"], vehicle["id"] if vehicle else None, vtype, actor_id, now_iso(),
+             "Active", reason or "มอบหมายพร้อมกันหลายคน", 1 if takes_it_up else 0),
         )
     except IntegrityError:
         raise HTTPException(409, f"คนขับ {driver['full_name'] or driver['employee_id']} เพิ่งถูกเพิ่มเข้างานนี้ไปแล้ว")
-    db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
-    db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
-    notify(db, driver["id"], f"คุณถูกเพิ่มเข้างาน {task_row['task_code']}", task_row["id"])
+    if vehicle and takes_it_up:
+        db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
+        db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
+    else:
+        recompute_driver_status(db, driver["id"])
+    notify(db, driver["id"], f"คุณถูกเพิ่มเข้างาน {task_row['task_code']}"
+                             + ("" if takes_it_up else " (อยู่ในคิวงานของคุณ)"), task_row["id"])
     post_system_message(db, task_row["id"], driver["id"],
                         f"{person_label(db, driver['id'])} ได้รับงานนี้เรียบร้อย "
-                        f"({vehicle['vehicle_type']} {vehicle['code']})")
+                        + (f"({vehicle['vehicle_type']} {vehicle['code']})" if vehicle
+                           else f"({vtype} — รอเลือกรถ)")
+                        + ("" if takes_it_up else " — อยู่ในคิวงานของคนขับ"))
     return True
 
 
-def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_minutes, is_reassign):
+def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_minutes, is_reassign,
+               vehicle_type=None):
     if is_reassign:
         # Fetch every currently-active driver/vehicle BEFORE closing their rows, so
         # multi-driver tasks get everyone freed up + notified, not just the one
@@ -2569,21 +3041,34 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
         if task_row["status"] == "Assigned":
             db.execute("UPDATE tasks SET accepted_at=NULL WHERE id=?", (task_row["id"],))
 
+    vtype = vehicle["vehicle_type"] if vehicle else vehicle_type
+    # If this driver already has a job in hand, the new one joins their queue
+    # rather than displacing it. Reassigning is the exception: it replaces the
+    # crew on this task, so whoever lands on it takes it up straight away.
+    takes_it_up = is_reassign or not driver_active_assignment(db, driver["id"])
     try:
         db.execute(
-            "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_by, assigned_at, "
-            "assignment_status, reason) VALUES (?,?,?,?,?,?,?)",
-            (task_row["id"], driver["id"], vehicle["id"], assigned_by_id, now_iso(), "Active", reason),
+            "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_vehicle_type, assigned_by, "
+            "assigned_at, assignment_status, reason, is_active_for_driver) VALUES (?,?,?,?,?,?,?,?,?)",
+            (task_row["id"], driver["id"], vehicle["id"] if vehicle else None, vtype,
+             assigned_by_id, now_iso(), "Active", reason, 1 if takes_it_up else 0),
         )
     except IntegrityError:
         raise HTTPException(409, "คนขับคนนี้มีการมอบหมายที่ Active อยู่กับงานนี้อยู่แล้ว (อาจเกิดจากกดซ้ำ หรือมีคนอื่นทำพร้อมกัน)")
     eta = add_minutes_iso(estimated_minutes) if estimated_minutes else task_row["estimated_arrival"]
     db.execute(
         "UPDATE tasks SET current_driver_id=?, current_vehicle_id=?, estimated_arrival=? WHERE id=?",
-        (driver["id"], vehicle["id"], eta, task_row["id"]),
+        (driver["id"], vehicle["id"] if vehicle else None, eta, task_row["id"]),
     )
-    db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
-    db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
+    # A driver with no vehicle yet is not "Busy" in the fleet sense — they
+    # still have to board one — but they are spoken for, so they must not be
+    # offered to another job either. 'Assigned' says exactly that, and it also
+    # covers a driver holding nothing but queued work.
+    if vehicle and takes_it_up:
+        db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
+        db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
+    else:
+        recompute_driver_status(db, driver["id"])
     if task_row["status"] == "Waiting":
         # Atomic claim: the WHERE clause re-checks status at write time (not
         # just from the stale in-memory task_row read earlier), so if two
@@ -2608,21 +3093,34 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
         # "accept" tap any more. accepted_at is still stamped because reports,
         # the driver stats endpoint and the CSV export all read it as "when did
         # this driver take the job"; leaving it NULL would silently break them.
+        #
+        # Unless it went into the driver's queue: then the job is theirs but
+        # nobody is on it yet, which is what 'Assigned' means. It becomes
+        # In Progress when they reach it (promote_next_in_queue, or they pick
+        # it themselves).
         stamp = now_iso()
-        db.execute(
-            "UPDATE tasks SET status='In Progress', accepted_at=?, started_at=? WHERE id=?",
-            (stamp, stamp, task_row["id"]),
-        )
+        if takes_it_up:
+            db.execute(
+                "UPDATE tasks SET status='In Progress', accepted_at=?, started_at=? WHERE id=?",
+                (stamp, stamp, task_row["id"]),
+            )
+            db.execute(
+                "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
+                "VALUES (?,?,?,?,?)",
+                (task_row["id"], "Assigned", "In Progress", assigned_by_id, stamp),
+            )
+        else:
+            db.execute("UPDATE tasks SET accepted_at=? WHERE id=?", (stamp, task_row["id"]))
         post_system_message(db, task_row["id"], driver["id"],
                             f"{person_label(db, driver['id'])} ได้รับงานนี้เรียบร้อย "
-                            f"({vehicle['vehicle_type']} {vehicle['code']})")
-        db.execute(
-            "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
-            "VALUES (?,?,?,?,?)",
-            (task_row["id"], "Assigned", "In Progress", assigned_by_id, stamp),
-        )
+                            + (f"({vehicle['vehicle_type']} {vehicle['code']})" if vehicle
+                               else f"({vtype} — รอเลือกรถ)")
+                            + ("" if takes_it_up else " — อยู่ในคิวงานของคนขับ"))
 
-    notify(db, driver["id"], f"คุณได้รับมอบหมายงาน {task_row['task_code']}", task_row["id"])
+    queue_pos = 0 if takes_it_up else len(driver_queue(db, driver["id"]))
+    notify(db, driver["id"],
+           f"คุณได้รับมอบหมายงาน {task_row['task_code']}"
+           + (f" (อยู่ในคิวลำดับที่ {queue_pos})" if queue_pos else ""), task_row["id"])
     notify(db, task_row["requester_id"], f"งาน {task_row['task_code']} มอบหมายให้คนขับแล้ว", task_row["id"])
     if is_reassign:
         notify_admins(db, f"งาน {task_row['task_code']} มอบหมายใหม่ให้ {driver['employee_id']}", task_row["id"])
@@ -2640,35 +3138,21 @@ def assign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADMIN
         if not emp_ids:
             raise HTTPException(400, "กรุณาเลือกคนขับอย่างน้อย 1 คน")
 
-        # Resolve and validate EVERY driver before writing anything. Assigning
-        # the first two and then failing on the third would leave a half-formed
-        # crew that the admin would have to unpick by hand.
-        resolved, all_issues = [], []
-        for emp in emp_ids:
-            drv = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'", (emp,)).fetchone()
-            if not drv:
-                raise HTTPException(404, f"ไม่พบคนขับ {emp}")
-            if not drv["checked_in_vehicle_id"]:
-                raise HTTPException(400, f"คนขับ {drv['full_name'] or emp} ยังไม่ได้เช็คอินรถ")
-            veh = db.execute("SELECT * FROM vehicles WHERE id=?", (drv["checked_in_vehicle_id"],)).fetchone()
-            iss = eligibility_issues(db, drv, veh, row)
-            resolved.append((drv, veh, iss))
-            if iss:
-                all_issues.append(f"{drv['full_name'] or emp}: " + "; ".join(iss))
+        resolved, all_issues = resolve_crew(db, body, row)
         if all_issues and not body.force:
             raise HTTPException(409, "เงื่อนไขไม่ผ่าน — " + " | ".join(all_issues) +
                                  " (ยืนยันด้วย force=true เพื่อมอบหมายทั้งที่ไม่ตรงเงื่อนไข)")
         if all_issues and body.force:
             audit(db, user["id"], "manual_override_assign", f"task {row['task_code']}: {' | '.join(all_issues)}")
 
-        primary_drv, primary_veh, _ = resolved[0]
+        primary_drv, primary_veh, primary_type, _ = resolved[0]
         _do_assign(db, row, primary_drv, primary_veh, user["id"], body.reason,
-                   body.estimated_minutes, is_reassign=False)
+                   body.estimated_minutes, is_reassign=False, vehicle_type=primary_type)
         # The rest join the same task. _do_assign already moved it to
         # In Progress, so these are additional crew on live work.
-        for drv, veh, _ in resolved[1:]:
-            _attach_extra_driver(db, row, drv, veh, user["id"], body.reason)
-        return {"ok": True, "assigned": [d["employee_id"] for d, _, _ in resolved],
+        for drv, veh, vtype, _ in resolved[1:]:
+            _attach_extra_driver(db, row, drv, veh, user["id"], body.reason, vehicle_type=vtype)
+        return {"ok": True, "assigned": [d["employee_id"] for d, _, _, _ in resolved],
                 "overridden_issues": all_issues or None}
 
 
@@ -2680,29 +3164,61 @@ def reassign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADM
             raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] not in ("Assigned", "In Progress", "Pause"):
             raise HTTPException(400, f"มอบหมายงานใหม่ไม่ได้ เพราะงานอยู่ในสถานะ {TASK_STATUS_LABEL_TH.get(row['status'], row['status'])}")
-        emp_ids = body.drivers()
-        if not emp_ids:
+        if not body.drivers():
             raise HTTPException(400, "กรุณาเลือกคนขับอย่างน้อย 1 คน")
-        driver = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'",
-                             (emp_ids[0],)).fetchone()
-        if not driver:
-            raise HTTPException(404, "ไม่พบคนขับคนนี้")
-        if not driver["checked_in_vehicle_id"]:
-            raise HTTPException(400, "คนขับยังไม่ได้เช็คอินรถ ไม่สามารถมอบหมายงานได้")
-        vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["checked_in_vehicle_id"],)).fetchone()
-        issues = eligibility_issues(db, driver, vehicle, row)
+        resolved, issues = resolve_crew(db, body, row)
         if issues and not body.force:
-            raise HTTPException(409, "เงื่อนไขไม่ผ่าน: " + "; ".join(issues) +
+            raise HTTPException(409, "เงื่อนไขไม่ผ่าน: " + " | ".join(issues) +
                                  " (ยืนยันด้วย force=true เพื่อมอบหมายทั้งที่ไม่ตรงเงื่อนไข)")
         if issues and body.force:
-            audit(db, user["id"], "manual_override_reassign", f"task {row['task_code']}: {'; '.join(issues)}")
-        _do_assign(db, row, driver, vehicle, user["id"], body.reason, body.estimated_minutes, is_reassign=True)
-        for extra in emp_ids[1:]:
-            drv = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'", (extra,)).fetchone()
-            if drv and drv["checked_in_vehicle_id"]:
-                veh = db.execute("SELECT * FROM vehicles WHERE id=?", (drv["checked_in_vehicle_id"],)).fetchone()
-                _attach_extra_driver(db, row, drv, veh, user["id"], body.reason)
+            audit(db, user["id"], "manual_override_reassign", f"task {row['task_code']}: {' | '.join(issues)}")
+        drv0, veh0, type0, _ = resolved[0]
+        _do_assign(db, row, drv0, veh0, user["id"], body.reason, body.estimated_minutes,
+                   is_reassign=True, vehicle_type=type0)
+        for drv, veh, vtype, _ in resolved[1:]:
+            _attach_extra_driver(db, row, drv, veh, user["id"], body.reason, vehicle_type=vtype)
         return {"ok": True, "overridden_issues": issues if issues else None}
+
+
+@app.post("/tasks/{task_id}/make-active")
+def make_task_active(task_id: int, user=Depends(require_role("DRIVER"))):
+    """Work this queued job now instead of the one the system picked.
+
+    The queue is served oldest-first by default, but a driver who is already
+    beside a different bay should not have to drive back for the sake of the
+    order. The job they were on goes back to their queue, untouched — it only
+    ever got there automatically, so nothing is lost.
+    """
+    with get_db() as db:
+        mine = db.execute(
+            "SELECT * FROM task_assignments WHERE task_id=? AND driver_id=? AND assignment_status='Active'",
+            (task_id, user["id"]),
+        ).fetchone()
+        if not mine:
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
+        row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row["status"] not in ("Assigned", "In Progress"):
+            raise HTTPException(400, "งานนี้ไม่ได้อยู่ในสถานะที่เริ่มทำได้")
+        if mine["is_active_for_driver"]:
+            return {"ok": True, "already_active": True}
+        current = driver_active_assignment(db, user["id"])
+        if current:
+            db.execute("UPDATE task_assignments SET is_active_for_driver=0 WHERE id=?", (current["id"],))
+            prev = db.execute("SELECT * FROM tasks WHERE id=?", (current["task_id"],)).fetchone()
+            # A crewed job keeps running on whoever is left; one nobody is on
+            # goes back to "handed out but not started".
+            if not task_has_active_worker(db, prev["id"]) and prev["status"] == "In Progress":
+                db.execute("UPDATE tasks SET status='Assigned' WHERE id=?", (prev["id"],))
+                db.execute(
+                    "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
+                    "VALUES (?,?,?,?,?)", (prev["id"], "In Progress", "Assigned", user["id"], now_iso()),
+                )
+            post_system_message(db, prev["id"], user["id"],
+                                f"{person_label(db, user['id'])} กลับไปทำงาน {row['task_code']} ก่อน "
+                                f"— งานนี้รออยู่ในคิว")
+        start_assignment(db, mine, user["id"])
+        notify(db, row["requester_id"], f"งาน {row['task_code']} เริ่มดำเนินการแล้ว", task_id)
+        return {"ok": True}
 
 
 class SelfAssignBody(BaseModel):
@@ -2721,7 +3237,8 @@ def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_ro
         driver = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if not driver["checked_in_vehicle_id"]:
             raise HTTPException(400, "กรุณาเช็คอินรถก่อนรับงาน")
-        if driver["driver_status"] != "Available":
+        # Already holding work is no reason to refuse — it joins their queue.
+        if driver["driver_status"] in ("Breakdown", "Pause"):
             raise HTTPException(400, f"สถานะของคุณตอนนี้คือ {DRIVER_STATUS_LABEL_TH.get(driver['driver_status'], driver['driver_status'])} จึงรับงานไม่ได้")
         vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["checked_in_vehicle_id"],)).fetchone()
         issues = eligibility_issues(db, driver, vehicle, row)
@@ -2751,6 +3268,8 @@ def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_role
         driver = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if not driver["checked_in_vehicle_id"]:
             raise HTTPException(400, "กรุณาเช็คอินรถก่อนรับงาน")
+        # Take-over stays strict: this seizes a job someone else is working,
+        # and doing it while holding your own would leave that one stranded.
         if driver["driver_status"] != "Available":
             raise HTTPException(400, f"สถานะของคุณตอนนี้คือ {DRIVER_STATUS_LABEL_TH.get(driver['driver_status'], driver['driver_status'])} จึงรับงานไม่ได้")
         vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["checked_in_vehicle_id"],)).fetchone()
@@ -2828,6 +3347,10 @@ def complete_task(task_id: int, user=Depends(require_role("DRIVER"))):
             (now_iso(), my_assignment["id"]),
         )
         free_up_driver_and_vehicle(db, user["id"], my_assignment["vehicle_id"])
+        # Whatever else happens to this task, this driver's next queued job
+        # begins now. Done before the task bookkeeping below so the driver's
+        # status settles on the new job rather than flickering through free.
+        promote_next_in_queue(db, user["id"], user["id"])
         remaining = db.execute(
             "SELECT COUNT(*) n FROM task_assignments WHERE task_id=? AND assignment_status='Active'", (task_id,)
         ).fetchone()["n"]
@@ -2933,27 +3456,32 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_role("DRIVE
         driver = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if not driver["checked_in_vehicle_id"]:
             raise HTTPException(400, "กรุณาเช็คอินรถก่อน")
-        if driver["driver_status"] != "Available":
+        # Already holding work is no reason to refuse — it joins their queue.
+        if driver["driver_status"] in ("Breakdown", "Pause"):
             raise HTTPException(400, f"คุณมีสถานะ {_STATUS_TH.get(driver['driver_status'], driver['driver_status'])} ไม่ใช่ 'ว่าง'")
         vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["checked_in_vehicle_id"],)).fetchone()
         issues = eligibility_issues(db, driver, vehicle, row)
         if issues:
             raise HTTPException(409, "เข้าร่วมไม่ได้: " + "; ".join(issues))
+        takes_it_up = not driver_active_assignment(db, driver["id"])
         try:
             db.execute(
-                "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_by, assigned_at, "
-                "assignment_status, reason) VALUES (?,?,?,?,?,?,?)",
-                (task_id, driver["id"], vehicle["id"], user["id"], now_iso(), "Active", "Joined by driver"),
+                "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_vehicle_type, "
+                "assigned_by, assigned_at, assignment_status, reason, is_active_for_driver) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (task_id, driver["id"], vehicle["id"], vehicle["vehicle_type"], user["id"], now_iso(),
+                 "Active", "Joined by driver", 1 if takes_it_up else 0),
             )
         except IntegrityError:
             raise HTTPException(409, "คุณเพิ่งเข้าร่วมงานนี้ไปแล้ว (อาจเกิดจากกดซ้ำ)")
-        db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
+        recompute_driver_status(db, driver["id"])
         if body.battery_level is not None:
-            db.execute("UPDATE vehicles SET status='Busy', battery_level=? WHERE id=?",
-                       (body.battery_level, vehicle["id"]))
-        else:
+            db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
+        if takes_it_up:
             db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
-        post_system_message(db, task_id, user["id"], f"{person_label(db, user['id'])} เข้าร่วมงาน")
+        post_system_message(db, task_id, user["id"],
+                            f"{person_label(db, user['id'])} เข้าร่วมงาน"
+                            + ("" if takes_it_up else " (อยู่ในคิวงานของเขา)"))
         notify(db, row["requester_id"], f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
         notify_admins(db, f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
         return {"ok": True}
@@ -2981,23 +3509,23 @@ def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_rol
             (task_id, driver["id"]),
         ).fetchone():
             raise HTTPException(400, "คนขับคนนี้อยู่ในงานนี้อยู่แล้ว")
-        if not driver["checked_in_vehicle_id"]:
-            raise HTTPException(400, "คนขับยังไม่ได้เช็คอินรถ")
-        vehicle = db.execute("SELECT * FROM vehicles WHERE id=?", (driver["checked_in_vehicle_id"],)).fetchone()
-        issues = eligibility_issues(db, driver, vehicle, row)
+        vehicle = None
+        if driver["checked_in_vehicle_id"]:
+            vehicle = db.execute("SELECT * FROM vehicles WHERE id=?",
+                                 (driver["checked_in_vehicle_id"],)).fetchone()
+        # No vehicle is fine: they are put down for a type and board one when
+        # they get to the job, same as any other assignment.
+        licensed = sorted(valid_license_types(db, driver["id"]))
+        vtype = vehicle["vehicle_type"] if vehicle else (licensed[0] if len(licensed) == 1 else None)
+        if not vtype:
+            raise HTTPException(
+                409, f"คนขับ {driver['full_name'] or driver['employee_id']} "
+                     + ("มีใบอนุญาตหลายประเภท กรุณาใช้ 'แก้ไขการมอบหมาย' เพื่อระบุประเภทรถ"
+                        if licensed else "ไม่มีใบอนุญาตขับรถ จึงเพิ่มเข้างานไม่ได้"))
+        issues = eligibility_issues(db, driver, vehicle, row, vehicle_type=vtype)
         if issues:
             raise HTTPException(409, "เพิ่มไม่ได้: " + "; ".join(issues))
-        try:
-            db.execute(
-                "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_by, assigned_at, "
-                "assignment_status, reason) VALUES (?,?,?,?,?,?,?)",
-                (task_id, driver["id"], vehicle["id"], user["id"], now_iso(), "Active", "Added by admin"),
-            )
-        except IntegrityError:
-            raise HTTPException(409, "คนขับคนนี้เพิ่งถูกเพิ่มเข้างานนี้ไปแล้ว (อาจเกิดจากกดซ้ำ)")
-        db.execute("UPDATE users SET driver_status='Busy' WHERE id=?", (driver["id"],))
-        db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (vehicle["id"],))
-        notify(db, driver["id"], f"คุณถูกเพิ่มเข้างาน {row['task_code']}", task_id)
+        _attach_extra_driver(db, row, driver, vehicle, user["id"], "Added by admin", vehicle_type=vtype)
         notify(db, row["requester_id"], f"เพิ่มคนขับ {driver['employee_id']} เข้างาน {row['task_code']}", task_id)
         return {"ok": True}
 
@@ -3027,6 +3555,9 @@ def leave_task(task_id: int, user=Depends(require_role("DRIVER"))):
             (now_iso(), my_assignment["id"]),
         )
         free_up_driver_and_vehicle(db, user["id"], my_assignment["vehicle_id"])
+        # Stepping off the job in hand starts the next one they are holding,
+        # the same as finishing it would.
+        promote_next_in_queue(db, user["id"], user["id"])
         if active_count <= 1:
             # Last driver, task hadn't started yet -> send it back to the pool.
             db.execute(
@@ -3080,9 +3611,35 @@ class PauseBody(BaseModel):
 
 
 @app.post("/tasks/{task_id}/pause")
-def pause_task(task_id: int, body: PauseBody, user=Depends(require_role("DRIVER"))):
+def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
+    """Report a problem on a live job.
+
+    Open to the drivers on it, the requester who asked for it, and admins —
+    a hold-up is as often the requester's to report (goods not ready, bay
+    blocked) as the driver's, and routing it through the driver just delayed
+    everyone finding out.
+    """
     if body.category not in ("user", "vehicle"):
         raise HTTPException(400, "category must be 'user' or 'vehicle'")
+    if user["role"] != "DRIVER":
+        # Only a driver can report a VEHICLE fault, since that pulls their own
+        # vehicle out of service.
+        if body.category != "user":
+            raise HTTPException(400, "เฉพาะคนขับเท่านั้นที่แจ้งปัญหารถได้")
+        with get_db() as db:
+            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "ไม่พบงานนี้")
+            if user["role"] == "USER" and row["requester_id"] != user["id"]:
+                raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
+            if row["status"] not in ("In Progress", "Assigned"):
+                raise HTTPException(400, "แจ้งปัญหาได้เฉพาะงานที่กำลังดำเนินการ")
+            transition(db, row, "Pause", user["id"], note=f"[user] {body.reason}")
+            for a in db.execute("SELECT driver_id FROM task_assignments WHERE task_id=? "
+                                "AND assignment_status='Active'", (task_id,)).fetchall():
+                notify(db, a["driver_id"], f"งาน {row['task_code']} มีเหตุขัดข้อง: {body.reason}", task_id)
+            notify_admins(db, f"งาน {row['task_code']} ขัดข้องฝั่งผู้ขอ: {body.reason}", task_id)
+            return {"ok": True}
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -3350,15 +3907,8 @@ def put_admin_config(body: ConfigBody, user=Depends(require_role("ADMIN"))):
         unknown = [k for k in body.values if k not in CONFIG_DEFAULTS]
         if unknown:
             raise HTTPException(400, "ตั้งค่าที่ไม่รู้จัก: " + ", ".join(unknown))
-        # Invite codes: the PE code is checked first at registration, so if both
-        # were identical every invite signup would silently become PE and RT
-        # would be unobtainable. An empty code would let anyone in.
-        pe = str(body.values.get("invite_code_pe", get_config(db, "invite_code_pe"))).strip()
-        rt = str(body.values.get("invite_code_rt", get_config(db, "invite_code_rt"))).strip()
-        if not pe or not rt:
-            raise HTTPException(400, "รหัสเชิญต้องไม่เว้นว่าง")
-        if pe == rt:
-            raise HTTPException(400, "รหัสเชิญ PE และ RT ต้องไม่ซ้ำกัน")
+        # Invite codes used to live here as two fixed keys; they are now a
+        # column on vehicle_types, edited through /vehicle-types.
         for k, v in body.values.items():
             set_config(db, k, str(v).strip())
         # Fail loudly if the new layout can't validate its own example, rather
@@ -3578,40 +4128,127 @@ def list_drivers(user=Depends(require_role("ADMIN"))):
             "FROM users LEFT JOIN driver_licenses ON driver_licenses.driver_id = users.id "
             "WHERE users.role='DRIVER' AND users.deleted_at IS NULL GROUP BY users.id"
         ).fetchall()
-        return [dict(r) for r in rows]
+        # How much work each driver is holding. The dispatcher chose not to cap
+        # queue length, so the only thing stopping jobs quietly piling onto one
+        # person is being able to see the pile — one query for everyone, never
+        # one per driver.
+        queued = {r["driver_id"]: r["n"] for r in db.execute(
+            "SELECT ta.driver_id, COUNT(*) n FROM task_assignments ta JOIN tasks t ON t.id = ta.task_id "
+            "WHERE ta.assignment_status='Active' AND ta.is_active_for_driver=0 "
+            "AND t.status NOT IN ('Completed','Cancelled') GROUP BY ta.driver_id"
+        ).fetchall()}
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["queue_len"] = queued.get(r["id"], 0)
+            out.append(d)
+        return out
 
 
 class VehicleTypeCreate(BaseModel):
     type_key: str
     type_name_th: str
     description: Optional[str] = None
+    # Registering with this grants a permanent licence for the type. Empty or
+    # omitted means nobody can sign themselves up for it.
+    invite_code: Optional[str] = None
+
+
+def generate_invite_code(type_key: str) -> str:
+    """A code that is awkward to guess but still readable over a radio."""
+    return f"driver_{type_key.strip().lower()}_{secrets.randbelow(90000) + 10000}"
+
+
+def check_invite_code_unique(db, code: str, except_type: Optional[str] = None):
+    """Two types sharing a code would make the licence it grants a coin flip."""
+    row = db.execute(
+        "SELECT type_key FROM vehicle_types WHERE invite_code=? AND type_key != ?",
+        (code, except_type or ""),
+    ).fetchone()
+    if row:
+        raise HTTPException(400, f"รหัสเชิญนี้ถูกใช้กับประเภท {row['type_key']} อยู่แล้ว")
 
 
 @app.get("/vehicle-types")
 def list_vehicle_types(user=Depends(current_user)):
     with get_db() as db:
-        return [dict(r) for r in db.execute("SELECT * FROM vehicle_types ORDER BY id").fetchall()]
+        rows = [dict(r) for r in db.execute("SELECT * FROM vehicle_types ORDER BY id").fetchall()]
+    # The code is what lets someone make themselves a driver, so only an admin
+    # is ever shown it; everyone else gets the type without it.
+    if user["role"] != "ADMIN":
+        for r in rows:
+            r.pop("invite_code", None)
+    return rows
 
 
 @app.post("/vehicle-types")
 def create_vehicle_type(body: VehicleTypeCreate, user=Depends(require_role("ADMIN"))):
     with get_db() as db:
         key = body.type_key.strip().upper()
+        if not key:
+            raise HTTPException(400, "กรุณาระบุรหัสประเภทรถ")
         if db.execute("SELECT 1 FROM vehicle_types WHERE type_key=?", (key,)).fetchone():
             raise HTTPException(400, "ประเภทรถนี้มีอยู่แล้ว")
-        db.execute("INSERT INTO vehicle_types (type_key, type_name_th, description) VALUES (?,?,?)",
-                   (key, body.type_name_th, body.description))
-        audit(db, user["id"], "create_vehicle_type", key)
-        return {"ok": True}
+        code = (body.invite_code or "").strip() or None
+        if code:
+            check_invite_code_unique(db, code)
+        db.execute("INSERT INTO vehicle_types (type_key, type_name_th, description, invite_code) "
+                   "VALUES (?,?,?,?)", (key, body.type_name_th, body.description, code))
+        for z in db.execute("SELECT zone_key FROM zones").fetchall():
+            db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) "
+                       "ON CONFLICT DO NOTHING", (key, z["zone_key"]))
+        audit(db, user["id"], "create_vehicle_type", f"{key} invite={'set' if code else '-'}")
+        return {"ok": True, "invite_code": code}
+
+
+class VehicleTypeUpdate(BaseModel):
+    type_name_th: Optional[str] = None
+    description: Optional[str] = None
+    # "" clears the code (nobody can self-register for this type any more).
+    invite_code: Optional[str] = None
+    # true ignores invite_code and generates a fresh one.
+    regenerate_invite_code: bool = False
+
+
+@app.put("/vehicle-types/{type_key}")
+def update_vehicle_type(type_key: str, body: VehicleTypeUpdate, user=Depends(require_role("ADMIN"))):
+    with get_db() as db:
+        row = db.execute("SELECT * FROM vehicle_types WHERE type_key=?", (type_key,)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบประเภทรถนี้")
+        code = row["invite_code"]
+        if body.regenerate_invite_code:
+            code = generate_invite_code(type_key)
+            check_invite_code_unique(db, code, type_key)
+        elif body.invite_code is not None:
+            code = body.invite_code.strip() or None
+            if code:
+                check_invite_code_unique(db, code, type_key)
+        db.execute(
+            "UPDATE vehicle_types SET type_name_th=?, description=?, invite_code=? WHERE type_key=?",
+            (body.type_name_th if body.type_name_th is not None else row["type_name_th"],
+             body.description if body.description is not None else row["description"],
+             code, type_key),
+        )
+        audit(db, user["id"], "update_vehicle_type", f"{type_key} invite={'set' if code else '-'}")
+        return {"ok": True, "invite_code": code}
 
 
 @app.delete("/vehicle-types/{type_key}")
 def delete_vehicle_type(type_key: str, user=Depends(require_role("ADMIN"))):
     with get_db() as db:
-        if db.execute("SELECT 1 FROM vehicles WHERE vehicle_type=?", (type_key,)).fetchone():
-            raise HTTPException(400, "ลบไม่ได้ เพราะยังมีรถที่ใช้ประเภทนี้อยู่")
+        live = db.execute(
+            "SELECT COUNT(*) n FROM vehicles WHERE vehicle_type=? AND retired_at IS NULL",
+            (type_key,),
+        ).fetchone()["n"]
+        if live:
+            raise HTTPException(400, f"ลบไม่ได้ เพราะยังมีรถที่ใช้ประเภทนี้อยู่ {live} คัน "
+                                     f"(ปลดระวางรถทั้งหมดก่อน)")
         db.execute("DELETE FROM vehicle_types WHERE type_key=?", (type_key,))
         db.execute("DELETE FROM vehicle_type_zones WHERE vehicle_type=?", (type_key,))
+        # Licences for a type that no longer exists would keep counting toward
+        # what a driver may operate.
+        db.execute("DELETE FROM driver_licenses WHERE vehicle_type=?", (type_key,))
         audit(db, user["id"], "delete_vehicle_type", type_key)
         return {"ok": True}
 
@@ -3648,20 +4285,33 @@ def create_vehicle(body: VehicleCreate, user=Depends(require_role("ADMIN"))):
 
 @app.delete("/vehicles/{vehicle_id}")
 def delete_vehicle(vehicle_id: int, user=Depends(require_role("ADMIN"))):
+    """Take a vehicle out of service.
+
+    It is retired, not deleted. Every finished task and assignment still
+    points at the row, so removing it outright failed on a foreign key the
+    moment the vehicle had done any work at all — the admin got a 500 with no
+    explanation. Retiring is also what the master-fleet sync already does, so
+    the two paths now agree.
+    """
     with get_db() as db:
         row = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
         if not row:
             raise HTTPException(404, "ไม่พบรถคันนี้")
+        if row["retired_at"]:
+            return {"ok": True, "already_retired": True}
         active_task = db.execute(
             "SELECT 1 FROM tasks WHERE current_vehicle_id=? AND status NOT IN ('Completed','Cancelled')",
             (vehicle_id,),
         ).fetchone()
         if active_task:
-            raise HTTPException(400, "ลบไม่ได้ เพราะรถคันนี้กำลังถูกใช้งานในงานที่ยังไม่เสร็จ")
+            raise HTTPException(400, "ปลดระวางไม่ได้ เพราะรถคันนี้กำลังถูกใช้งานในงานที่ยังไม่เสร็จ")
         if db.execute("SELECT 1 FROM users WHERE checked_in_vehicle_id=?", (vehicle_id,)).fetchone():
-            raise HTTPException(400, "ลบไม่ได้ เพราะมีคนขับเช็คอินรถคันนี้อยู่")
-        db.execute("DELETE FROM vehicles WHERE id=?", (vehicle_id,))
-        audit(db, user["id"], "delete_vehicle", row["code"])
+            raise HTTPException(400, "ปลดระวางไม่ได้ เพราะมีคนขับเช็คอินรถคันนี้อยู่")
+        db.execute("UPDATE vehicles SET retired_at=?, status='Retired' WHERE id=?", (now_iso(), vehicle_id))
+        # Nobody should be auto-boarded into a vehicle that has left the fleet.
+        db.execute("UPDATE driver_licenses SET default_vehicle_id=NULL WHERE default_vehicle_id=?",
+                   (vehicle_id,))
+        audit(db, user["id"], "retire_vehicle", row["code"])
         return {"ok": True}
 
 
@@ -3688,20 +4338,63 @@ def update_vehicle(vehicle_id: int, body: VehicleUpdateBody, user=Depends(requir
         return {"ok": True}
 
 
+def vehicle_holders(db):
+    """Who is currently sitting in each vehicle: vehicle_id -> row.
+
+    A driver keeps a vehicle until somebody takes it, so "held" is a normal
+    state rather than a problem, and the picker has to say who holds what.
+    """
+    rows = db.execute(
+        "SELECT id, employee_id, full_name, first_name, driver_status, checked_in_vehicle_id "
+        "FROM users WHERE role='DRIVER' AND deleted_at IS NULL AND checked_in_vehicle_id IS NOT NULL"
+    ).fetchall()
+    return {r["checked_in_vehicle_id"]: r for r in rows}
+
+
+# Someone mid-job cannot have their vehicle taken out from under them;
+# anything else is fair game.
+HOLD_PROTECTED_STATUSES = ("Busy", "Breakdown")
+
+
 @app.get("/vehicles/available-for-checkin")
 def vehicles_available_for_checkin(user=Depends(require_role("DRIVER"))):
-    """Vehicles nobody else is currently checked into (excludes Breakdown too)."""
+    """Every vehicle this driver is licensed for, including ones another
+    driver is currently in.
+
+    Hiding held vehicles used to mean a vehicle left with someone who went
+    home stayed invisible to everyone — the fleet quietly shrank. They are
+    listed instead, saying who has them, and can be taken over unless that
+    person is actually working.
+    """
     with get_db() as db:
         rows = db.execute(
-            "SELECT * FROM vehicles WHERE retired_at IS NULL AND status != 'Breakdown' AND id NOT IN "
-            "(SELECT checked_in_vehicle_id FROM users WHERE role='DRIVER' "
-            "AND checked_in_vehicle_id IS NOT NULL AND id != ?) ORDER BY code",
-            (user["id"],),
+            "SELECT * FROM vehicles WHERE retired_at IS NULL AND status != 'Breakdown' ORDER BY code"
         ).fetchall()
-        # Only vehicles this driver is licensed for — offering the rest would
-        # just be a list of buttons that all end in an error.
         allowed = valid_license_types(db, user["id"])
-        return [dict(r) for r in rows if r["vehicle_type"] in allowed]
+        holders = vehicle_holders(db)
+        defaults = {r["default_vehicle_id"] for r in db.execute(
+            "SELECT default_vehicle_id FROM driver_licenses WHERE driver_id=? AND default_vehicle_id IS NOT NULL",
+            (user["id"],)).fetchall()}
+        out = []
+        for r in rows:
+            if r["vehicle_type"] not in allowed:
+                continue
+            h = holders.get(r["id"])
+            mine = h is not None and h["id"] == user["id"]
+            d = dict(r)
+            d["is_default"] = r["id"] in defaults
+            d["is_mine"] = mine
+            if h is None or mine:
+                d["held_by"] = None
+                d["can_take"] = True
+                d["blocked_reason"] = None
+            else:
+                d["held_by"] = h["full_name"] or h["employee_id"]
+                busy = h["driver_status"] in HOLD_PROTECTED_STATUSES
+                d["can_take"] = not busy
+                d["blocked_reason"] = (f"{d['held_by']} กำลังใช้งานอยู่" if busy else None)
+            out.append(d)
+        return out
 
 
 class DriverStatusBody(BaseModel):
@@ -3752,17 +4445,107 @@ def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
             raise HTTPException(
                 403, f"คุณไม่มีใบอนุญาตขับรถประเภท {v['vehicle_type']} (ใบอนุญาตที่มี: {have}) "
                      f"กรุณาติดต่อแอดมิน")
+        # Taking a vehicle somebody else is in. Allowed — a driver holds a
+        # vehicle until someone needs it, so this is the normal way one
+        # changes hands at the end of a shift — unless they are mid-job, in
+        # which case nothing may pull it out from under them.
+        holder = db.execute(
+            "SELECT * FROM users WHERE role='DRIVER' AND deleted_at IS NULL "
+            "AND checked_in_vehicle_id=? AND id!=?", (v["id"], user["id"]),
+        ).fetchone()
+        if holder:
+            if holder["driver_status"] in HOLD_PROTECTED_STATUSES:
+                raise HTTPException(
+                    409, f"รถ {v['code']} กำลังถูกใช้งานโดย "
+                         f"{holder['full_name'] or holder['employee_id']} อยู่ กรุณาเลือกคันอื่น")
+            db.execute("UPDATE users SET checked_in_vehicle_id=NULL, driver_status='Not Checked-in' "
+                       "WHERE id=?", (holder["id"],))
+            # They will not be looking at the app, so tell them rather than
+            # letting them discover it next time they try to start a job.
+            notify(db, holder["id"],
+                   f"รถ {v['code']} ถูกรับไปใช้ต่อโดย {person_label(db, user['id'])} "
+                   f"— ถ้ายังต้องใช้รถ กรุณาเลือกรถคันใหม่")
+            audit(db, user["id"], "vehicle_taken_over",
+                  f"{v['code']} from {holder['employee_id']}")
+
         if body.battery_level is not None:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, v["id"]))
         db.execute("UPDATE users SET checked_in_vehicle_id=? WHERE id=?", (v["id"], user["id"]))
         cur = db.execute(
             "SELECT driver_status FROM users WHERE id=?", (user["id"],)
         ).fetchone()
-        if cur["driver_status"] == "Not Checked-in":
-            db.execute("UPDATE users SET driver_status='Available' WHERE id=?", (user["id"],))
+        # Jobs already assigned to this driver that were waiting on a vehicle
+        # now get one. This is the "choose a vehicle when you take the job"
+        # step: the driver boards, and every job expecting that type binds.
+        bound = db.execute(
+            "SELECT ta.id, t.task_code FROM task_assignments ta JOIN tasks t ON t.id = ta.task_id "
+            "WHERE ta.driver_id=? AND ta.assignment_status='Active' AND ta.vehicle_id IS NULL "
+            "AND ta.assigned_vehicle_type=? AND t.status NOT IN ('Completed','Cancelled')",
+            (user["id"], v["vehicle_type"]),
+        ).fetchall()
+        for b in bound:
+            db.execute("UPDATE task_assignments SET vehicle_id=? WHERE id=?", (v["id"], b["id"]))
+        if bound:
+            db.execute("UPDATE tasks SET current_vehicle_id=? WHERE current_driver_id=? "
+                       "AND current_vehicle_id IS NULL", (v["id"], user["id"]))
+            db.execute("UPDATE vehicles SET status='Busy' WHERE id=?", (v["id"],))
+            for b in bound:
+                tid = db.execute("SELECT task_id FROM task_assignments WHERE id=?", (b["id"],)).fetchone()["task_id"]
+                post_system_message(db, tid, user["id"],
+                                    f"{person_label(db, user['id'])} เลือกรถ {v['vehicle_type']} {v['code']} แล้ว")
+
+        # Boarding can change what their status should be — a job that was
+        # waiting on a vehicle now has one. recompute rather than guess, so a
+        # driver holding queued work does not come out as "Available".
+        if cur["driver_status"] in ("Not Checked-in", "Assigned", "Available"):
+            recompute_driver_status(db, user["id"])
         audit(db, user["id"], "vehicle_check_in",
               body.vehicle_code + (f" battery={body.battery_level}%" if body.battery_level is not None else ""))
         return {"ok": True}
+
+
+@app.post("/vehicles/auto-board")
+def auto_board_default_vehicle(user=Depends(require_role("DRIVER"))):
+    """Put the driver back in their usual vehicle, called once when the app
+    opens.
+
+    This is what makes "no picking a vehicle every day" true in practice: the
+    driver who always takes WH-01 opens the app and is in WH-01, with nothing
+    to tap. It is deliberately a POST the client calls explicitly rather than
+    a side effect of reading /me, so nothing boards a vehicle behind the
+    driver's back on a background poll.
+
+    Returns {"boarded": code} when it did something, {"boarded": null} plus a
+    reason otherwise. Never an error: failing to auto-board is not a problem,
+    it just means the driver picks a vehicle the usual way.
+    """
+    with get_db() as db:
+        me = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        if me["checked_in_vehicle_id"]:
+            return {"boarded": None, "reason": "already_on_vehicle"}
+        allowed = valid_license_types(db, user["id"])
+        rows = db.execute(
+            "SELECT dl.vehicle_type, v.* FROM driver_licenses dl "
+            "JOIN vehicles v ON v.id = dl.default_vehicle_id "
+            "WHERE dl.driver_id=? AND v.retired_at IS NULL", (user["id"],),
+        ).fetchall()
+        candidates = [r for r in rows if r["vehicle_type"] in allowed]
+        if not candidates:
+            return {"boarded": None, "reason": "no_default"}
+        holders = vehicle_holders(db)
+        for v in candidates:
+            if v["status"] == "Breakdown":
+                continue
+            h = holders.get(v["id"])
+            if h and h["driver_status"] in HOLD_PROTECTED_STATUSES:
+                continue    # someone is working in it; leave them alone
+            try:
+                vehicle_check_in(CheckInBody(vehicle_code=v["code"]), user)
+            except HTTPException:
+                continue    # licence expired between queries, vehicle gone: just skip
+            return {"boarded": v["code"], "vehicle_type": v["vehicle_type"],
+                    "taken_from": (h["full_name"] or h["employee_id"]) if h else None}
+        return {"boarded": None, "reason": "default_in_use"}
 
 
 @app.post("/vehicles/check-out")
@@ -4591,6 +5374,19 @@ def index():
             return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
     return Response(content=_INDEX_HTML, media_type="text/html; charset=utf-8",
                     headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/install")
+def install_page():
+    """Same app shell, reached by scanning the QR code.
+
+    It is a real path rather than a query string so the QR stays short and the
+    link is readable when someone sends it in a chat. The shell notices the
+    path and opens the "add to home screen" instructions, which is the step
+    people were skipping — and the step iOS requires before notifications work
+    at all.
+    """
+    return index()
 
 
 @app.get("/service-worker.js")
