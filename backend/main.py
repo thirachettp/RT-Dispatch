@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261015.0847"
+APP_VERSION = "TTLOD.261015.1349"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -773,7 +773,7 @@ CREATE TABLE IF NOT EXISTS users (
     first_name TEXT,
     last_name TEXT,
     password_hash TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('USER','DRIVER','ADMIN')),
+    role TEXT NOT NULL CHECK(role IN ('USER','DRIVER','DISPATCH','ADMIN')),
     cost_center TEXT,
     contact TEXT,
     driver_status TEXT DEFAULT 'Not Checked-in',
@@ -867,6 +867,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     request_type TEXT NOT NULL,
     scheduled_at TEXT,
     bu TEXT,
+    cost_center TEXT,
     from_zone TEXT NOT NULL,
     from_location TEXT NOT NULL,
     to_zone TEXT NOT NULL,
@@ -1147,6 +1148,11 @@ NEW_COLUMNS = [
     ("zones", "origin_only", "INTEGER NOT NULL DEFAULT 0", None),
     ("zones", "no_location", "INTEGER NOT NULL DEFAULT 0", None),
     ("zones", "active", "INTEGER NOT NULL DEFAULT 1", None),
+    # The cost centre the job is booked against. It used to be read off the
+    # requester's profile, which left nothing to charge against when an admin
+    # or dispatcher raised the job on someone's behalf — they have no cost
+    # centre of their own.
+    ("tasks", "cost_center", "TEXT", None),
 ]
 
 
@@ -1227,6 +1233,19 @@ def ensure_columns():
                 if rows:
                     log.info("Backfilled first/last name for %d user(s)", len(rows))
 
+            # Existing jobs keep the number the reports already showed for
+            # them: whatever their requester's profile says. Without this,
+            # every past job would export a blank cost centre.
+            try:
+                n = db.execute(
+                    "UPDATE tasks SET cost_center = (SELECT cost_center FROM users "
+                    "WHERE users.id = tasks.requester_id) WHERE cost_center IS NULL"
+                ).rowcount
+                if n:
+                    log.info("Migrated: cost centre copied onto %s existing task(s)", n)
+            except Exception as ex:
+                log.warning("Could not backfill tasks.cost_center: %s", ex)
+
             # Zone behaviour for the zones that already exist. Done here, in
             # the path that runs on every boot for both backends, because
             # seed_master_data only fills an EMPTY zones table — a live
@@ -1280,6 +1299,93 @@ def ensure_columns():
 
     except Exception as e:
         log.warning("ensure_columns skipped: %s", e)
+
+
+def widen_role_constraint():
+    """Teach an EXISTING database that DISPATCH is a role.
+
+    users.role carries CHECK(role IN (...)), and every database built before
+    this version lists only USER/DRIVER/ADMIN — so promoting anyone to
+    ผู้กระจายงาน fails at the database, not in the app. Like everything in
+    ensure_columns(), this has to run on every boot for both backends:
+    init_db() applies SCHEMA to a FRESH database only, and migrate_db() never
+    runs on Postgres.
+
+    Postgres can simply replace the constraint. SQLite cannot alter one at
+    all, so the table is rebuilt by the documented procedure (copy, drop,
+    rename) on its own autocommit connection — foreign_keys must be off
+    while the old table is dropped, and PRAGMA is ignored inside a
+    transaction.
+    """
+    try:
+        if IS_POSTGRES:
+            with get_db() as db:
+                # Serialize concurrent cold starts: DROP/ADD CONSTRAINT takes
+                # an exclusive lock, and two instances arriving together would
+                # otherwise both try it.
+                db.execute("SELECT pg_advisory_xact_lock(913472002)")
+                row = db.execute(
+                    "SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint "
+                    "WHERE conrelid = 'users'::regclass AND conname = 'users_role_check'"
+                ).fetchone()
+                if row and "DISPATCH" in (row["def"] or ""):
+                    return    # already widened, or a fresh database
+                db.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check")
+                db.execute("ALTER TABLE users ADD CONSTRAINT users_role_check "
+                           "CHECK (role IN ('USER','DRIVER','DISPATCH','ADMIN'))")
+            log.info("Migrated: users.role now accepts DISPATCH")
+            return
+
+        with get_db() as db:
+            row = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+        ddl = (row["sql"] if row else "") or ""
+        if not ddl or "CHECK(role" not in ddl.replace("CHECK (role", "CHECK(role"):
+            return    # no constraint to widen
+        if "DISPATCH" in ddl:
+            return    # already current
+
+        body = re.search(
+            r"CREATE TABLE IF NOT EXISTS users \((.*?)\n\);", SCHEMA, re.S)
+        if not body:
+            log.warning("Could not find the users block in SCHEMA; role constraint left as is")
+            return
+
+        conn = sqlite3.connect(DB_PATH, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            live = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("BEGIN")
+            conn.execute(f"CREATE TABLE users_role_migration ({body.group(1)}\n)")
+            fresh = [r["name"] for r in conn.execute(
+                "PRAGMA table_info(users_role_migration)").fetchall()]
+            # Only columns both shapes have: a column the live table never
+            # got is left to ensure_columns, which runs before this.
+            shared = ", ".join(c for c in fresh if c in live)
+            conn.execute(
+                f"INSERT INTO users_role_migration ({shared}) SELECT {shared} FROM users")
+            conn.execute("DROP TABLE users")
+            conn.execute("ALTER TABLE users_role_migration RENAME TO users")
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                # Dropping the table took its indexes with it; every
+                # CREATE here is IF NOT EXISTS, so this only refills those.
+                conn.executescript(SCHEMA)
+            except Exception as ex:
+                log.warning("Could not restore indexes after the role rebuild: %s", ex)
+            conn.close()
+        log.info("Migrated: users table rebuilt so role accepts DISPATCH")
+    except Exception as e:
+        log.warning("Could not widen the users.role constraint: %s", e)
 
 
 def migrate_db():
@@ -1552,7 +1658,11 @@ def person_label(db, user_id) -> str:
     if not u:
         return "ระบบ"
     name = (u["first_name"] or "").strip() or (u["full_name"] or "").strip() or u["employee_id"]
-    return "แอดมิน" if u["role"] == "ADMIN" else f"คุณ{name}"
+    if u["role"] == "ADMIN":
+        return "แอดมิน"
+    if u["role"] == "DISPATCH":
+        return f"ผู้กระจายงาน {name}"
+    return f"คุณ{name}"
 
 
 def post_system_message(db, task_id: int, actor_id: int, text: str):
@@ -1776,7 +1886,8 @@ def check_waiting_too_long(db):
 
 
 def task_chat_allowed(db, task_row, user) -> bool:
-    if user["role"] == "ADMIN":
+    # Dispatchers coordinate every job, so they are in every job's chat.
+    if user["role"] in ("ADMIN", "DISPATCH"):
         return True
     if task_row["requester_id"] == user["id"]:
         return True
@@ -1844,12 +1955,65 @@ def current_user(authorization: Optional[str] = Header(None)):
     return dict(row)
 
 
+# ---------------------------------------------------------------------------
+# Roles
+#
+# DISPATCH is an admin minus "จัดการระบบ": they run the floor — hand out work,
+# manage staff and vehicles, answer every chat — but they do not change the
+# system's own configuration (zones, vehicle types, rack layout, settings) and
+# they cannot read the audit log.
+#
+# The one rule that is not about screens, and the reason it is written here
+# rather than per endpoint: a dispatcher must never be able to reach an ADMIN
+# account or hand out the ADMIN role. Without that, "no system management" is
+# decoration — they would simply reset an admin's password and sign in as them.
+# ---------------------------------------------------------------------------
+
+ROLES = ("USER", "DRIVER", "DISPATCH", "ADMIN")
+
+# Who each role may set someone else's role to.
+ROLES_ASSIGNABLE_BY = {
+    "ADMIN": ("USER", "DRIVER", "DISPATCH", "ADMIN"),
+    "DISPATCH": ("USER", "DRIVER", "DISPATCH"),
+}
+
+# Anything that acts on another person's account. Only an admin may aim it at
+# an admin.
+def require_can_manage(actor, target_row):
+    if target_row["role"] == "ADMIN" and actor["role"] != "ADMIN":
+        raise HTTPException(403, "บัญชีนี้เป็นแอดมิน เฉพาะแอดมินเท่านั้นที่จัดการได้")
+
+
+def require_can_grant_role(actor, role):
+    allowed = ROLES_ASSIGNABLE_BY.get(actor["role"], ())
+    if role not in allowed:
+        raise HTTPException(
+            403, f"คุณตั้งสิทธิ์เป็น {role} ให้ใครไม่ได้ "
+                 f"(ตั้งได้: {', '.join(allowed) or 'ไม่มี'})")
+
+
+def _guard_target(actor, user_id):
+    """require_can_manage for an endpoint that only has the target's id."""
+    with get_db() as db:
+        row = db.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "ไม่พบผู้ใช้")
+    require_can_manage(actor, row)
+
+
 def require_role(*roles):
     def checker(user=Depends(current_user)):
         if user["role"] not in roles:
             raise HTTPException(403, "คุณไม่มีสิทธิ์เข้าถึงส่วนนี้")
         return user
     return checker
+
+
+# Shorthand for "the floor", used by everything a dispatcher shares with an
+# admin — spelled out once so a new endpoint cannot quietly land on the wrong
+# side of the line.
+def require_ops():
+    return require_role("ADMIN", "DISPATCH")
 
 
 @app.post("/auth/login")
@@ -2128,11 +2292,15 @@ class NewDriverBody(BaseModel):
 
 
 @app.post("/admin/drivers")
-def create_driver(body: NewDriverBody, user=Depends(require_role("ADMIN"))):
+def create_driver(body: NewDriverBody, user=Depends(require_ops())):
     with get_db() as db:
         existing = find_deleted_account(db, body.employee_id)
         if existing == "live":
             raise HTTPException(400, "รหัสพนักงานนี้มีอยู่ในระบบแล้ว")
+        if existing is not None and existing != "live":
+            # Bringing back a removed account: if it used to be an admin, this
+            # would quietly turn it into a driver, so only an admin may.
+            require_can_manage(user, existing)
         email = validate_and_normalize_email(db, body.email)
         reactivated = False
         if existing:
@@ -2158,7 +2326,7 @@ def create_driver(body: NewDriverBody, user=Depends(require_role("ADMIN"))):
 
 
 @app.get("/admin/users")
-def list_all_users(user=Depends(require_role("ADMIN"))):
+def list_all_users(user=Depends(require_ops())):
     with get_db() as db:
         rows = db.execute(
             "SELECT id, employee_id, email, full_name, role, contact, cost_center, driver_status "
@@ -2176,7 +2344,7 @@ class UserAdminUpdateBody(BaseModel):
 
 
 @app.put("/admin/users/{user_id}")
-def admin_update_user(user_id: int, body: UserAdminUpdateBody, user=Depends(require_role("ADMIN"))):
+def admin_update_user(user_id: int, body: UserAdminUpdateBody, user=Depends(require_ops())):
     with get_db() as db:
         row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not row:
@@ -2190,8 +2358,11 @@ def admin_update_user(user_id: int, body: UserAdminUpdateBody, user=Depends(requ
         if personal or body.email is not None:
             raise HTTPException(
                 403, "แอดมินแก้ไขข้อมูลส่วนตัวของผู้ใช้ไม่ได้ — เจ้าของบัญชีแก้ไขเองในเมนูโปรไฟล์")
-        if "role" in fields and fields["role"] not in ("USER", "DRIVER", "ADMIN"):
-            raise HTTPException(400, "role ไม่ถูกต้อง")
+        require_can_manage(user, row)
+        if "role" in fields:
+            if fields["role"] not in ROLES:
+                raise HTTPException(400, "role ไม่ถูกต้อง")
+            require_can_grant_role(user, fields["role"])
         if not fields:
             return {"ok": True}
         set_clause = ", ".join(f"{k}=?" for k in fields.keys())
@@ -2203,7 +2374,7 @@ def admin_update_user(user_id: int, body: UserAdminUpdateBody, user=Depends(requ
 
 
 @app.delete("/admin/users/{user_id}")
-def admin_delete_user(user_id: int, user=Depends(require_role("ADMIN"))):
+def admin_delete_user(user_id: int, user=Depends(require_ops())):
     """Soft-delete: keeps the row (and every historical task/audit/chat record
     that references it) but blocks login and hides the account from normal
     lists. A hard DELETE would either fail on foreign-key constraints (if the
@@ -2215,6 +2386,7 @@ def admin_delete_user(user_id: int, user=Depends(require_role("ADMIN"))):
             raise HTTPException(404, "ไม่พบผู้ใช้")
         if row["id"] == user["id"]:
             raise HTTPException(400, "ลบบัญชีตัวเองไม่ได้")
+        require_can_manage(user, row)
         if row["role"] == "ADMIN":
             other_admins = db.execute(
                 "SELECT COUNT(*) n FROM users WHERE role='ADMIN' AND deleted_at IS NULL AND id!=?", (user_id,)
@@ -2246,15 +2418,18 @@ def admin_delete_user(user_id: int, user=Depends(require_role("ADMIN"))):
 
 
 @app.post("/admin/users/{user_id}/reset-password")
-def admin_reset_password(user_id: int, user=Depends(require_role("ADMIN"))):
-    """'Forgot password' for Admin to trigger on someone else's behalf: puts
-    the account back into the same first-login state new accounts start in,
-    so the user logs in with any password and is prompted to set a new one
-    (reuses the existing /auth/set-password flow, no new mechanism needed)."""
+def admin_reset_password(user_id: int, user=Depends(require_ops())):
+    """'Forgot password' to trigger on someone else's behalf: puts the account
+    back into the same first-login state new accounts start in, so the user
+    logs in with any password and is prompted to set a new one (reuses the
+    existing /auth/set-password flow, no new mechanism needed)."""
     with get_db() as db:
         row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not row:
             raise HTTPException(404, "ไม่พบผู้ใช้")
+        # Otherwise a dispatcher resets an admin's password and signs in as
+        # them, which would make every admin-only screen reachable anyway.
+        require_can_manage(user, row)
         db.execute("UPDATE users SET password_hash=? WHERE id=?", (PENDING_PASSWORD, user_id))
         db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))  # force logout everywhere
         audit(db, user["id"], "reset_password", row["employee_id"])
@@ -2262,7 +2437,7 @@ def admin_reset_password(user_id: int, user=Depends(require_role("ADMIN"))):
 
 
 @app.get("/admin/users/{user_id}/licenses")
-def get_driver_licenses(user_id: int, user=Depends(require_role("ADMIN"))):
+def get_driver_licenses(user_id: int, user=Depends(require_ops())):
     with get_db() as db:
         rows = db.execute("SELECT * FROM driver_licenses WHERE driver_id=?", (user_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -2276,7 +2451,8 @@ class LicenseBody(BaseModel):
 
 
 @app.post("/admin/users/{user_id}/licenses")
-def set_driver_license(user_id: int, body: LicenseBody, user=Depends(require_role("ADMIN"))):
+def set_driver_license(user_id: int, body: LicenseBody, user=Depends(require_ops())):
+    _guard_target(user, user_id)
     if body.expiry_date:
         try:
             datetime.strptime(body.expiry_date, "%Y-%m-%d")
@@ -2308,7 +2484,8 @@ def set_driver_license(user_id: int, body: LicenseBody, user=Depends(require_rol
 
 
 @app.delete("/admin/users/{user_id}/licenses/{vehicle_type}")
-def delete_driver_license(user_id: int, vehicle_type: str, user=Depends(require_role("ADMIN"))):
+def delete_driver_license(user_id: int, vehicle_type: str, user=Depends(require_ops())):
+    _guard_target(user, user_id)
     with get_db() as db:
         db.execute("DELETE FROM driver_licenses WHERE driver_id=? AND vehicle_type=?", (user_id, vehicle_type))
         audit(db, user["id"], "delete_license", f"driver {user_id}: {vehicle_type}")
@@ -2510,6 +2687,9 @@ class TaskCreate(BaseModel):
     priority: str = "Normal"
     remark: Optional[str] = None
     barcode_pallet_id: Optional[str] = None
+    # Which cost centre the job is booked against. Left out, it comes from the
+    # person raising it — which is why an admin or dispatcher has to state one.
+    cost_center: Optional[str] = None
 
 
 class TaskUpdate(BaseModel):
@@ -2707,23 +2887,41 @@ def task_to_dict(row, db, viewer_role: Optional[str] = None) -> dict:
 
 
 @app.post("/tasks")
-def create_task(body: TaskCreate, user=Depends(require_role("USER"))):
+def create_task(body: TaskCreate, user=Depends(require_role("USER", "ADMIN", "DISPATCH"))):
+    """Raise a job.
+
+    Open to admins and dispatchers as well as requesters: plenty of work is
+    phoned or radioed in, and the dispatcher raising it themselves beats
+    telling the caller to go and use the app. Whoever raises it is the
+    requester on the job — they are the one the drivers will talk to in the
+    chat and the one who gets told when it is done.
+    """
     if body.request_type == "Booking" and not body.scheduled_at:
         raise HTTPException(400, "การจองล่วงหน้าต้องระบุวันเวลา")
     if body.bu not in BU_LIST:
         raise HTTPException(400, f"BU ไม่ถูกต้อง ต้องเป็นหนึ่งใน: {', '.join(BU_LIST)}")
+    # The job's own cost centre, defaulting to the requester's. An admin or
+    # dispatcher has none on their profile, so for them it is required —
+    # otherwise the job would be charged to nobody and the report would show a
+    # blank the month after, with no way to work out whose it was.
+    cost_center = (body.cost_center or "").strip() or (user["cost_center"] or "").strip()
+    if not cost_center:
+        raise HTTPException(400, "กรุณาระบุ cost center ของงานนี้")
+    if not (cost_center.isdigit() and len(cost_center) == 5):
+        raise HTTPException(400, "cost center ต้องเป็นตัวเลข 5 หลัก")
     with get_db() as db:
         from_location = validate_location_string(db, body.from_zone, body.from_location)
         to_location = validate_location_string(db, body.to_zone, body.to_location, is_destination=True)
         task_type = infer_task_type(db, body.from_zone, body.to_zone)
         code = generate_task_code(db)
         cur = db.execute(
-            "INSERT INTO tasks (task_code, request_type, scheduled_at, bu, from_zone, from_location, to_zone, "
-            "to_location, task_type, pallet_qty, priority, remark, barcode_pallet_id, "
-            "requester_id, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
-            (code, body.request_type, body.scheduled_at, body.bu, body.from_zone, from_location, body.to_zone,
-             to_location, task_type, body.pallet_qty, body.priority, body.remark,
-             body.barcode_pallet_id, user["id"], "Waiting", now_iso()),
+            "INSERT INTO tasks (task_code, request_type, scheduled_at, bu, cost_center, from_zone, "
+            "from_location, to_zone, to_location, task_type, pallet_qty, priority, remark, "
+            "barcode_pallet_id, requester_id, status, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+            (code, body.request_type, body.scheduled_at, body.bu, cost_center, body.from_zone,
+             from_location, body.to_zone, to_location, task_type, body.pallet_qty, body.priority,
+             body.remark, body.barcode_pallet_id, user["id"], "Waiting", now_iso()),
         )
         task_id = cur.fetchone()["id"]
         db.execute(
@@ -2802,7 +3000,7 @@ def get_task_photo(task_id: int, photo_id: int, user=Depends(current_user)):
 
 
 @app.post("/tasks/{task_id}/priority")
-def change_priority(task_id: int, body: PriorityBody, user=Depends(require_role("ADMIN"))):
+def change_priority(task_id: int, body: PriorityBody, user=Depends(require_ops())):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -2832,7 +3030,7 @@ def _history_cutoff_iso() -> str:
 @app.get("/tasks")
 def list_tasks(status_filter: Optional[str] = None, user=Depends(current_user)):
     with get_db() as db:
-        if user["role"] == "ADMIN":
+        if user["role"] in ("ADMIN", "DISPATCH"):
             check_waiting_too_long(db)
         cutoff = _history_cutoff_iso()
         if user["role"] == "USER":
@@ -2892,7 +3090,7 @@ def cancel_task(task_id: int, reason: Optional[str] = None, user=Depends(current
         if user["role"] == "USER":
             if row["requester_id"] != user["id"] or row["status"] not in ("Waiting", "Assigned"):
                 raise HTTPException(403, "ยกเลิกงานนี้ไม่ได้")
-        elif user["role"] != "ADMIN":
+        elif user["role"] not in ("ADMIN", "DISPATCH"):
             raise HTTPException(403, "ไม่มีสิทธิ์ดำเนินการนี้")
         transition(db, row, "Cancelled", user["id"], note=reason)
         db.execute("UPDATE tasks SET cancel_reason=? WHERE id=?", (reason, task_id))
@@ -2913,7 +3111,7 @@ class SendBackBody(BaseModel):
 
 
 @app.post("/tasks/{task_id}/send-back")
-def send_back_task(task_id: int, body: SendBackBody, user=Depends(require_role("ADMIN"))):
+def send_back_task(task_id: int, body: SendBackBody, user=Depends(require_ops())):
     """Admin kicks a Waiting task back to the User to fix (e.g. not enough PE
     vehicles right now) instead of leaving it stuck or cancelling outright."""
     with get_db() as db:
@@ -3225,7 +3423,7 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
 
 
 @app.post("/tasks/{task_id}/assign")
-def assign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADMIN"))):
+def assign_task(task_id: int, body: AssignBody, user=Depends(require_ops())):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -3255,7 +3453,7 @@ def assign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADMIN
 
 
 @app.post("/tasks/{task_id}/reassign")
-def reassign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADMIN"))):
+def reassign_task(task_id: int, body: AssignBody, user=Depends(require_ops())):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -3532,7 +3730,7 @@ def requester_complete_task(task_id: int, user=Depends(require_role("USER"))):
 
 
 @app.post("/tasks/{task_id}/admin-complete")
-def admin_complete_task(task_id: int, user=Depends(require_role("ADMIN"))):
+def admin_complete_task(task_id: int, user=Depends(require_ops())):
     """Admin manually force-completes a stuck/orphaned task, bypassing the normal
     driver-must-complete-their-own-part flow."""
     with get_db() as db:
@@ -3603,7 +3801,7 @@ class AddDriverBody(BaseModel):
 
 
 @app.post("/tasks/{task_id}/add-driver")
-def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_role("ADMIN"))):
+def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_ops())):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -3838,7 +4036,7 @@ def resume_task(task_id: int, user=Depends(current_user)):
             raise HTTPException(404, "ไม่พบงานนี้")
         if row["status"] != "Pause":
             raise HTTPException(400, "งานนี้ไม่ได้อยู่ในสถานะขัดข้อง")
-        allowed = user["role"] == "ADMIN" or (
+        allowed = user["role"] in ("ADMIN", "DISPATCH") or (
             user["role"] == "USER" and row["requester_id"] == user["id"]
         ) or bool(db.execute(
             "SELECT 1 FROM task_assignments WHERE task_id=? AND driver_id=? AND assignment_status='Active'",
@@ -3983,17 +4181,17 @@ class TeamChatBody(BaseModel):
 
 
 @app.get("/team-chat/participants")
-def team_chat_participants(user=Depends(require_role("ADMIN", "DRIVER"))):
+def team_chat_participants(user=Depends(require_role("ADMIN", "DISPATCH", "DRIVER"))):
     with get_db() as db:
         rows = db.execute(
-            "SELECT employee_id, full_name, role FROM users WHERE role IN ('ADMIN','DRIVER') "
+            "SELECT employee_id, full_name, role FROM users WHERE role IN ('ADMIN','DISPATCH','DRIVER') "
             "AND deleted_at IS NULL ORDER BY role, employee_id"
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 @app.get("/team-chat/messages")
-def get_team_chat_messages(user=Depends(require_role("ADMIN", "DRIVER"))):
+def get_team_chat_messages(user=Depends(require_role("ADMIN", "DISPATCH", "DRIVER"))):
     with get_db() as db:
         rows = db.execute(
             "SELECT team_chat_messages.*, users.employee_id AS sender_employee_id, users.full_name AS sender_name, "
@@ -4004,7 +4202,7 @@ def get_team_chat_messages(user=Depends(require_role("ADMIN", "DRIVER"))):
 
 
 @app.post("/team-chat/messages")
-def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN", "DRIVER"))):
+def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN", "DISPATCH", "DRIVER"))):
     message = body.message.strip()
     if not message:
         raise HTTPException(400, "ข้อความต้องไม่เว้นว่าง")
@@ -4159,7 +4357,7 @@ def admin_diagnostics(user=Depends(require_role("ADMIN"))):
 
 
 @app.get("/dispatch/board")
-def dispatch_board(user=Depends(require_role("ADMIN"))):
+def dispatch_board(user=Depends(require_ops())):
     """Everything the admin needs to hand out work, in one request.
 
     The assign sheet used to list every driver in table order and let the admin
@@ -4279,7 +4477,7 @@ def drivers_availability_summary(user=Depends(current_user)):
 
 
 @app.get("/drivers")
-def list_drivers(user=Depends(require_role("ADMIN"))):
+def list_drivers(user=Depends(require_ops())):
     with get_db() as db:
         concat_fn = "STRING_AGG(driver_licenses.vehicle_type, ',')" if IS_POSTGRES else "GROUP_CONCAT(driver_licenses.vehicle_type)"
         # expiry_date is stored as YYYY-MM-DD TEXT. SQLite compares it fine with
@@ -4340,9 +4538,9 @@ def check_invite_code_unique(db, code: str, except_type: Optional[str] = None):
 def list_vehicle_types(user=Depends(current_user)):
     with get_db() as db:
         rows = [dict(r) for r in db.execute("SELECT * FROM vehicle_types ORDER BY id").fetchall()]
-    # The code is what lets someone make themselves a driver, so only an admin
-    # is ever shown it; everyone else gets the type without it.
-    if user["role"] != "ADMIN":
+    # The code is what lets someone make themselves a driver, so only the two
+    # roles that run staffing ever see it.
+    if user["role"] not in ("ADMIN", "DISPATCH"):
         for r in rows:
             r.pop("invite_code", None)
     return rows
@@ -4432,7 +4630,7 @@ class VehicleCreate(BaseModel):
 
 
 @app.post("/vehicles")
-def create_vehicle(body: VehicleCreate, user=Depends(require_role("ADMIN"))):
+def create_vehicle(body: VehicleCreate, user=Depends(require_ops())):
     with get_db() as db:
         if db.execute("SELECT 1 FROM vehicles WHERE code=?", (body.code,)).fetchone():
             raise HTTPException(400, "รหัสรถนี้มีอยู่แล้ว")
@@ -4447,7 +4645,7 @@ def create_vehicle(body: VehicleCreate, user=Depends(require_role("ADMIN"))):
 
 
 @app.delete("/vehicles/{vehicle_id}")
-def delete_vehicle(vehicle_id: int, user=Depends(require_role("ADMIN"))):
+def delete_vehicle(vehicle_id: int, user=Depends(require_ops())):
     """Take a vehicle out of service.
 
     It is retired, not deleted. Every finished task and assignment still
@@ -4483,7 +4681,7 @@ class VehicleUpdateBody(BaseModel):
 
 
 @app.put("/vehicles/{vehicle_id}")
-def update_vehicle(vehicle_id: int, body: VehicleUpdateBody, user=Depends(require_role("ADMIN"))):
+def update_vehicle(vehicle_id: int, body: VehicleUpdateBody, user=Depends(require_ops())):
     with get_db() as db:
         row = db.execute("SELECT * FROM vehicles WHERE id=?", (vehicle_id,)).fetchone()
         if not row:
@@ -4726,7 +4924,7 @@ def vehicle_check_out(user=Depends(require_role("DRIVER"))):
 
 
 @app.get("/dispatch/suggest/{task_id}")
-def suggest_dispatch(task_id: int, user=Depends(require_role("ADMIN"))):
+def suggest_dispatch(task_id: int, user=Depends(require_ops())):
     with get_db() as db:
         task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not task:
@@ -4830,7 +5028,7 @@ def report_breakdown(body: BreakdownBody, user=Depends(require_role("DRIVER"))):
 
 
 @app.get("/breakdowns")
-def list_breakdowns(user=Depends(require_role("ADMIN"))):
+def list_breakdowns(user=Depends(require_ops())):
     with get_db() as db:
         rows = db.execute("SELECT * FROM breakdowns ORDER BY created_at DESC").fetchall()
         return [dict(r) for r in rows]
@@ -4841,7 +5039,7 @@ class ResolveBreakdownBody(BaseModel):
 
 
 @app.post("/breakdowns/{breakdown_id}/resolve")
-def resolve_breakdown(breakdown_id: int, body: ResolveBreakdownBody = ResolveBreakdownBody(), user=Depends(require_role("ADMIN"))):
+def resolve_breakdown(breakdown_id: int, body: ResolveBreakdownBody = ResolveBreakdownBody(), user=Depends(require_ops())):
     with get_db() as db:
         b = db.execute("SELECT * FROM breakdowns WHERE id=?", (breakdown_id,)).fetchone()
         if not b:
@@ -4889,7 +5087,7 @@ def read_notification(notif_id: int, user=Depends(current_user)):
 
 
 @app.post("/notifications/broadcast")
-def broadcast_notification(body: BroadcastBody, user=Depends(require_role("ADMIN"))):
+def broadcast_notification(body: BroadcastBody, user=Depends(require_ops())):
     message = body.message.strip()
     if not message:
         raise HTTPException(400, "กรุณากรอกข้อความประกาศ")
@@ -5022,7 +5220,7 @@ def app_data(scope: str = "core", user=Depends(current_user)):
             out["vehicles"] = list_vehicles(user)
             out["teamChatMessages"] = get_team_chat_messages(user)
             out["teamChatParticipants"] = team_chat_participants(user)
-        elif scope in ("admin_ops", "admin_dash") and user["role"] == "ADMIN":
+        elif scope in ("admin_ops", "admin_dash") and user["role"] in ("ADMIN", "DISPATCH"):
             out["drivers"] = list_drivers(user)
             out["vehicles"] = list_vehicles(user)
             out["allUsers"] = list_all_users(user)
@@ -5067,7 +5265,7 @@ def dashboard(user=Depends(require_role("ADMIN"))):
 
 
 @app.get("/dashboard/task-volume")
-def dashboard_task_volume(days: int = 7, user=Depends(require_role("ADMIN"))):
+def dashboard_task_volume(days: int = 7, user=Depends(require_ops())):
     days = max(1, min(days, 31))
     statuses = ["Waiting", "Assigned", "In Progress", "Pause", "Completed", "Cancelled"]
     with get_db() as db:
@@ -5099,7 +5297,7 @@ def dashboard_task_volume(days: int = 7, user=Depends(require_role("ADMIN"))):
 
 
 @app.get("/dashboard/overview")
-def dashboard_overview(period: str = "today", user=Depends(require_role("ADMIN"))):
+def dashboard_overview(period: str = "today", user=Depends(require_ops())):
     """Management KPIs: 'how are we performing' — period-bound flow metrics with
     trend vs the immediately preceding period of equal length, plus live snapshot
     metrics (in-progress/overdue/utilization) that don't have a meaningful trend."""
@@ -5243,7 +5441,7 @@ def _xlsx_style_sheet(ws, headers, rows, col_widths, note=None):
 
 
 @app.get("/dashboard/export")
-def export_tasks(period: str = "all", user=Depends(require_role("ADMIN"))):
+def export_tasks(period: str = "all", user=Depends(require_ops())):
     with get_db() as db:
         if period == "all":
             tasks = db.execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
@@ -5347,7 +5545,8 @@ def export_tasks(period: str = "all", user=Depends(require_role("ADMIN"))):
                 zone_names.get(t["from_zone"], t["from_zone"]), t["from_location"],
                 zone_names.get(t["to_zone"], t["to_zone"]), t["to_location"],
                 t["pallet_qty"],
-                req.get("full_name") or "", req.get("employee_id") or "", req.get("cost_center") or "", req.get("contact") or "",
+                req.get("full_name") or "", req.get("employee_id") or "",
+                t["cost_center"] or req.get("cost_center") or "", req.get("contact") or "",
                 ", ".join(driver_names), ", ".join(vehicle_codes),
                 _fmt_dt(t["created_at"]), _fmt_dt(t["accepted_at"]), _fmt_dt(t["started_at"]), _fmt_dt(t["completed_at"]),
                 _minutes_between(t["created_at"], t["accepted_at"]),
@@ -5412,6 +5611,7 @@ try:
         raise RuntimeError(f"Postgres driver import failed: {_IMPORT_ERROR}")
     init_db()
     ensure_columns()
+    widen_role_constraint()
     try:
         with get_db() as _db:
             sync_master_fleet(_db)
