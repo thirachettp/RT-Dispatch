@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261015.1349"
+APP_VERSION = "TTLOD.261015.1831"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -202,7 +202,8 @@ def get_vapid_public_key_b64() -> Optional[str]:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/"):
+def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/",
+                          tag: Optional[str] = None):
     """Best-effort: never let a push failure break the request that triggered it
     (existing callers via notify() ignore the return value). Also returns a
     summary dict — {"attempted": N, "sent": M, "reason": str|None} — so the
@@ -220,7 +221,13 @@ def send_web_push_to_user(db, user_id: int, title: str, body: str, url: str = "/
         log.info("Web push skipped for user %s: no push subscription on file "
                  "(they haven't turned on notifications in Profile, or it never completed)", user_id)
         return {"attempted": 0, "sent": 0, "reason": "ยังไม่มีการเปิดใช้งานแจ้งเตือนไว้เลย"}
-    payload = json.dumps({"title": title, "body": body, "url": url})
+    # The tag decides whether a new notification STACKS or REPLACES on the
+    # phone. Every notification used to carry the same one, so three new jobs
+    # arriving together showed up as a single line and the first two were never
+    # seen. One tag per job (so a later update about that job replaces the
+    # earlier one, which is what you want) and otherwise one tag per message.
+    payload = json.dumps({"title": title, "body": body, "url": url,
+                          "tag": tag or f"scdc-{secrets.token_hex(4)}"})
 
     def _one(s):
         """Returns (sent?, subscription_id_to_delete_or_None, (status, reason) or None)."""
@@ -314,7 +321,7 @@ def _explain_push_failure(errors) -> str:
 # --------------------------------------------------------------------------
 # notify() used to call send_web_push_to_user() inline, so the HTTP request
 # that triggered a notification sat waiting for every push to be delivered to
-# Google/Apple before it could return. notify_admins() made that far worse: it
+# Google/Apple before it could return. notify_ops() made that far worse: it
 # looped over every admin, and each admin over each of their devices. With 5
 # admins on 2 devices, a driver tapping "รับงาน" waited on 10 sequential
 # outbound HTTPS calls before the button released.
@@ -333,9 +340,9 @@ def _flush_push_queue(jobs):
     request's was already committed and closed by then."""
     try:
         with get_db() as db:
-            for user_id, title, body, url in jobs:
+            for user_id, title, body, url, tag in jobs:
                 try:
-                    send_web_push_to_user(db, user_id, title, body, url)
+                    send_web_push_to_user(db, user_id, title, body, url, tag)
                 except Exception as e:
                     log.warning("Deferred push to user %s failed: %s", user_id, e)
     except Exception as e:
@@ -1725,19 +1732,38 @@ def notify(db, user_id: int, message: str, task_id: Optional[int] = None, kind: 
         (user_id, message, task_id, kind, now_iso()),
     )
     push_url = f"/?task={task_id}" if (kind in ("task", "chat") and task_id) else "/"
+    # Chat messages about one job collapse into one line; anything else about
+    # that job replaces the previous line about it; everything else stands on
+    # its own. See send_web_push_to_user() for why this matters.
+    if task_id:
+        tag = f"scdc-chat-{task_id}" if kind == "chat" else f"scdc-task-{task_id}"
+    else:
+        tag = f"scdc-{kind}-{secrets.token_hex(4)}"
     queue = _push_queue_var.get()
     if queue is None:
         # Outside an HTTP request (startup tasks, scripts) — send inline.
-        send_web_push_to_user(db, user_id, "SCDC", message, push_url)
+        send_web_push_to_user(db, user_id, "SCDC", message, push_url, tag)
     else:
         # Inside a request — hand off to the post-response flush so the caller
         # isn't blocked on push delivery.
-        queue.append((user_id, "SCDC", message, push_url))
+        queue.append((user_id, "SCDC", message, push_url, tag))
 
 
-def notify_admins(db, message: str, task_id: Optional[int] = None, kind: str = "task"):
-    for a in db.execute("SELECT id FROM users WHERE role='ADMIN'").fetchall():
+def notify_ops(db, message: str, task_id: Optional[int] = None, kind: str = "task"):
+    """Everyone who runs the floor — admins AND dispatchers.
+
+    This used to be notify_admins() and selected role='ADMIN' only, which left
+    the one role whose whole job is dispatching with no notification of a new
+    job, a job waiting too long, or a breakdown. Deleted accounts are excluded:
+    without that filter, someone who has left the company keeps receiving job
+    notifications on their own phone, because a soft-deleted row still has live
+    push subscriptions.
+    """
+    for a in db.execute(
+        "SELECT id FROM users WHERE role IN ('ADMIN','DISPATCH') AND deleted_at IS NULL"
+    ).fetchall():
         notify(db, a["id"], message, task_id, kind)
+
 
 
 def audit(db, actor_id: Optional[int], action: str, details: str = ""):
@@ -1881,7 +1907,7 @@ def check_waiting_too_long(db):
         "SELECT * FROM tasks WHERE status='Waiting' AND waiting_alert_sent=0 AND created_at<?", (cutoff,)
     ).fetchall()
     for t in rows:
-        notify_admins(db, f"งาน {t['task_code']} รอนานเกิน {WAITING_TOO_LONG_MINUTES} นาทีแล้ว", t["id"])
+        notify_ops(db, f"งาน {t['task_code']} รอนานเกิน {WAITING_TOO_LONG_MINUTES} นาทีแล้ว", t["id"])
         db.execute("UPDATE tasks SET waiting_alert_sent=1 WHERE id=?", (t["id"],))
 
 
@@ -2104,6 +2130,9 @@ def logout_all(user=Depends(current_user)):
     with get_db() as db:
         n = db.execute("SELECT COUNT(*) c FROM sessions WHERE user_id=?", (user["id"],)).fetchone()["c"]
         db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+        # The reason to press this is usually a phone that has gone missing, so
+        # the notifications have to stop going to it too.
+        db.execute("DELETE FROM push_subscriptions WHERE user_id=?", (user["id"],))
     return {"ok": True, "signed_out": n}
 
 
@@ -2193,7 +2222,7 @@ def register(body: RegisterBody):
                        "ON CONFLICT DO NOTHING", (user_id, licence))
             # Anyone who knows the code can make themselves a driver, so every
             # use is announced instead of happening silently.
-            notify_admins(db, f"{body.employee_id} สมัครเป็นคนขับด้วยรหัสเชิญ (ใบอนุญาต {licence})")
+            notify_ops(db, f"{body.employee_id} สมัครเป็นคนขับด้วยรหัสเชิญ (ใบอนุญาต {licence})")
             audit(db, user_id, "register_with_invite_code", f"{body.employee_id} -> DRIVER {licence}")
         return {"ok": True, "reactivated": bool(existing), "role": role, "license": licence}
 
@@ -2249,8 +2278,12 @@ def me(user=Depends(current_user)):
 
 @app.put("/me")
 def update_me(body: ProfileUpdateBody, user=Depends(current_user)):
-    """Everyone can edit their own name/contact/email; only USER has a cost center to edit.
-    Employee ID and role are never editable here."""
+    """Everyone can edit their own name, contact, email and cost centre.
+    Employee ID and role are never editable here.
+
+    Cost centre used to be USER-only. Now that an admin or a dispatcher raises
+    jobs too — and a job takes the creator's cost centre as its default — they
+    need somewhere to set their own, or they retype it on every job."""
     fields = {}
     if body.full_name is not None:
         if not body.full_name.strip():
@@ -2259,11 +2292,11 @@ def update_me(body: ProfileUpdateBody, user=Depends(current_user)):
     # contact is validated inside the DB block below — it needs a uniqueness
     # check now that phone numbers are a login identifier.
     if body.cost_center is not None:
-        if user["role"] != "USER":
-            raise HTTPException(400, "เฉพาะบัญชีผู้ขอใช้งานเท่านั้นที่มี Cost center")
-        if not body.cost_center.isdigit() or len(body.cost_center) != 5:
+        cc = body.cost_center.strip()
+        # Clearing it is allowed: a driver has no cost centre of their own.
+        if cc and (not cc.isdigit() or len(cc) != 5):
             raise HTTPException(400, "Cost center ต้องเป็นตัวเลข 5 หลัก")
-        fields["cost_center"] = body.cost_center
+        fields["cost_center"] = cc or None
     if not fields and body.email is None and body.contact is None:
         return {"ok": True}
     with get_db() as db:
@@ -2413,6 +2446,10 @@ def admin_delete_user(user_id: int, user=Depends(require_ops())):
         db.execute("UPDATE users SET deleted_at=?, checked_in_vehicle_id=NULL, "
                    "driver_status='Not Checked-in' WHERE id=?", (now_iso(), user_id))
         db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))  # force logout everywhere
+        # And stop pushing to their phone. Clearing sessions alone only ended
+        # the login: the push subscription outlived it, so someone who had left
+        # the company kept getting job notifications on their own device.
+        db.execute("DELETE FROM push_subscriptions WHERE user_id=?", (user_id,))
         audit(db, user["id"], "delete_user", row["employee_id"])
         return {"ok": True}
 
@@ -2928,7 +2965,7 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER", "ADMIN", "DI
             "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
             "VALUES (?,?,?,?,?)", (task_id, None, "Waiting", user["id"], now_iso()),
         )
-        notify_admins(db, f"งานใหม่ {code} สร้างโดย {user['employee_id']}", task_id)
+        notify_ops(db, f"งานใหม่ {code} สร้างโดย {user['employee_id']}", task_id)
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         result = task_to_dict(row, db, viewer_role=user["role"])
         available = db.execute(
@@ -3140,7 +3177,7 @@ def resubmit_task(task_id: int, user=Depends(require_role("USER"))):
             "UPDATE tasks SET blocked_reason=NULL, blocked_at=NULL, waiting_alert_sent=0 WHERE id=?", (task_id,)
         )
         audit(db, user["id"], "resubmit_task", f"task {row['task_code']}")
-        notify_admins(db, f"งาน {row['task_code']} ถูกส่งกลับมาใหม่โดย {user['employee_id']}", task_id)
+        notify_ops(db, f"งาน {row['task_code']} ถูกส่งกลับมาใหม่โดย {user['employee_id']}", task_id)
         return {"ok": True}
 
 
@@ -3419,7 +3456,7 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
            + (f" (อยู่ในคิวลำดับที่ {queue_pos})" if queue_pos else ""), task_row["id"])
     notify(db, task_row["requester_id"], f"งาน {task_row['task_code']} มอบหมายให้คนขับแล้ว", task_row["id"])
     if is_reassign:
-        notify_admins(db, f"งาน {task_row['task_code']} มอบหมายใหม่ให้ {driver['employee_id']}", task_row["id"])
+        notify_ops(db, f"งาน {task_row['task_code']} มอบหมายใหม่ให้ {driver['employee_id']}", task_row["id"])
 
 
 @app.post("/tasks/{task_id}/assign")
@@ -3558,7 +3595,7 @@ def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_ro
                    (now_iso(), body.battery_level, task_id))
         if body.battery_level is not None:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
-        notify_admins(db, f"คนขับ {user['employee_id']} รับงาน {row['task_code']} ด้วยตัวเอง", task_id)
+        notify_ops(db, f"คนขับ {user['employee_id']} รับงาน {row['task_code']} ด้วยตัวเอง", task_id)
         return {"ok": True}
 
 
@@ -3590,7 +3627,7 @@ def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_role
                    (now_iso(), body.battery_level, task_id))
         if body.battery_level is not None:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
-        notify_admins(db, f"คนขับ {user['employee_id']} รับช่วงงาน {row['task_code']}", task_id)
+        notify_ops(db, f"คนขับ {user['employee_id']} รับช่วงงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -3617,7 +3654,7 @@ def accept_task(task_id: int, body: AcceptBody, user=Depends(require_role("DRIVE
                 db.execute("UPDATE vehicles SET battery_level=? WHERE id=?",
                            (body.battery_level, row["current_vehicle_id"]))
         notify(db, row["requester_id"], f"คนขับกดรับงาน {row['task_code']} แล้ว", task_id)
-        notify_admins(db, f"คนขับ {user['employee_id']} กดรับงาน {row['task_code']}", task_id)
+        notify_ops(db, f"คนขับ {user['employee_id']} กดรับงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -3725,7 +3762,7 @@ def requester_complete_task(task_id: int, user=Depends(require_role("USER"))):
         drivers = _close_task_for_everyone(db, row, user, note="Confirmed complete by requester")
         for d in drivers:
             notify(db, d, f"ผู้ขอยืนยันงาน {row['task_code']} เสร็จแล้ว", task_id)
-        notify_admins(db, f"ผู้ขอยืนยันงาน {row['task_code']} เสร็จแล้ว", task_id)
+        notify_ops(db, f"ผู้ขอยืนยันงาน {row['task_code']} เสร็จแล้ว", task_id)
         return {"ok": True}
 
 
@@ -3792,7 +3829,7 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_role("DRIVE
                             f"{person_label(db, user['id'])} เข้าร่วมงาน"
                             + ("" if takes_it_up else " (อยู่ในคิวงานของเขา)"))
         notify(db, row["requester_id"], f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
-        notify_admins(db, f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
+        notify_ops(db, f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -3874,7 +3911,7 @@ def leave_task(task_id: int, user=Depends(require_role("DRIVER"))):
                 (task_id,),
             )
             transition(db, row, "Waiting", user["id"], note="Last driver left before starting")
-            notify_admins(db, f"งาน {row['task_code']} ไม่มีคนขับแล้ว กลับไปรอมอบหมายใหม่", task_id)
+            notify_ops(db, f"งาน {row['task_code']} ไม่มีคนขับแล้ว กลับไปรอมอบหมายใหม่", task_id)
             return {"ok": True}
         if row["current_driver_id"] == user["id"]:
             nxt = db.execute(
@@ -3886,7 +3923,7 @@ def leave_task(task_id: int, user=Depends(require_role("DRIVER"))):
                            (nxt["driver_id"], nxt["vehicle_id"], task_id))
         post_system_message(db, task_id, user["id"], f"{person_label(db, user['id'])} ออกจากงาน")
         notify(db, row["requester_id"], f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
-        notify_admins(db, f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
+        notify_ops(db, f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -3947,7 +3984,7 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
             for a in db.execute("SELECT driver_id FROM task_assignments WHERE task_id=? "
                                 "AND assignment_status='Active'", (task_id,)).fetchall():
                 notify(db, a["driver_id"], f"งาน {row['task_code']} มีเหตุขัดข้อง: {body.reason}", task_id)
-            notify_admins(db, f"งาน {row['task_code']} ขัดข้องฝั่งผู้ขอ: {body.reason}", task_id)
+            notify_ops(db, f"งาน {row['task_code']} ขัดข้องฝั่งผู้ขอ: {body.reason}", task_id)
             return {"ok": True}
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -3967,7 +4004,7 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
         if body.category == "user":
             transition(db, row, "Pause", user["id"], note=note)
             notify(db, row["requester_id"], f"งาน {row['task_code']} หยุดชั่วคราว: {body.reason}", task_id)
-            notify_admins(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งผู้ขอ): {body.reason}", task_id)
+            notify_ops(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งผู้ขอ): {body.reason}", task_id)
             return {"ok": True}
 
         # A vehicle problem only stops the reporting driver. If someone else
@@ -3980,7 +4017,7 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
         if others == 0:
             transition(db, row, "Pause", user["id"], note=note)
             notify(db, row["requester_id"], f"งาน {row['task_code']} หยุดชั่วคราว: {body.reason}", task_id)
-            notify_admins(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งรถ): {body.reason}", task_id)
+            notify_ops(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งรถ): {body.reason}", task_id)
             return {"ok": True}
 
         # Others remain active: step this driver back (like /leave) and flag
@@ -4016,7 +4053,7 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
         notify(db, row["requester_id"],
                f"คนขับ {user['employee_id']} แจ้งปัญหารถในงาน {row['task_code']} "
                f"({body.reason}) — งานยังดำเนินต่อโดยคนขับที่เหลือ", task_id)
-        notify_admins(db, f"แจ้งปัญหารถในงาน {row['task_code']} โดย {user['employee_id']}: "
+        notify_ops(db, f"แจ้งปัญหารถในงาน {row['task_code']} โดย {user['employee_id']}: "
                           f"{body.reason} (งานยังดำเนินการอยู่ เหลือคนขับ {others} คน)", task_id)
         return {"ok": True}
 
@@ -4167,6 +4204,23 @@ def post_task_message(task_id: int, body: ChatMessageBody, user=Depends(current_
         for r in active_drivers:
             if r["driver_id"] != user["id"]:
                 others.add(r["driver_id"])
+        # Anyone who has already spoken in THIS job's chat. Without this, a
+        # dispatcher could ask a question here and never be told the answer:
+        # only the requester and the drivers on the job were notified. Scoped
+        # to people actually in the conversation rather than every admin, so
+        # turning this on does not notify the whole office about every job.
+        for r in db.execute(
+            "SELECT DISTINCT sender_id FROM task_messages WHERE task_id=? AND sender_id IS NOT NULL "
+            "AND kind='user'", (task_id,)
+        ).fetchall():
+            if r["sender_id"] != user["id"]:
+                others.add(r["sender_id"])
+        # Never notify an account that has been closed.
+        if others:
+            live = {r["id"] for r in db.execute(
+                f"SELECT id FROM users WHERE deleted_at IS NULL AND id IN ({','.join(['?'] * len(others))})",
+                tuple(others)).fetchall()}
+            others &= live
         for uid in others:
             notify(db, uid, f"มีข้อความใหม่ในงาน {row['task_code']}", task_id, kind="chat")
         return {"ok": True}
@@ -4211,11 +4265,15 @@ def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN"
             "INSERT INTO team_chat_messages (sender_id, message, created_at) VALUES (?,?,?)",
             (user["id"], message, now_iso()),
         )
-        # Parse @employee_id mentions and notify each matched, real ADMIN/DRIVER user.
+        # Parse @employee_id mentions and notify each matched, real member of
+        # this chat. DISPATCH used to be missing from this list, so mentioning
+        # a dispatcher silently did nothing — the one role most likely to be
+        # called on by name.
         mentioned_ids = set(re.findall(r"@(\w+)", message))
         for emp_id in mentioned_ids:
             target = db.execute(
-                "SELECT id FROM users WHERE employee_id=? AND role IN ('ADMIN','DRIVER') AND deleted_at IS NULL", (emp_id,)
+                "SELECT id FROM users WHERE employee_id=? AND role IN ('ADMIN','DISPATCH','DRIVER') "
+                "AND deleted_at IS NULL", (emp_id,)
             ).fetchone()
             if target and target["id"] != user["id"]:
                 notify(db, target["id"], f"{user['employee_id']} กล่าวถึงคุณในแชททีม", kind="team_chat")
@@ -4769,7 +4827,7 @@ def set_driver_status(body: DriverStatusBody, user=Depends(require_role("DRIVER"
     with get_db() as db:
         db.execute("UPDATE users SET driver_status=? WHERE id=?", (body.status, user["id"]))
         if body.status == "Breakdown":
-            notify_admins(db, f"คนขับ {user['employee_id']} แจ้งสถานะรถเสีย")
+            notify_ops(db, f"คนขับ {user['employee_id']} แจ้งสถานะรถเสีย")
         return {"ok": True}
 
 
@@ -5023,7 +5081,7 @@ def report_breakdown(body: BreakdownBody, user=Depends(require_role("DRIVER"))):
             "VALUES (?,?,?,?,?,?,?)",
             (body.target_type, target_id, label, body.description, user["id"], "Open", now_iso()),
         )
-        notify_admins(db, f"แจ้งเสีย: {'คนขับ' if body.target_type == 'driver' else 'รถ'} {label} โดย {user['employee_id']}")
+        notify_ops(db, f"แจ้งเสีย: {'คนขับ' if body.target_type == 'driver' else 'รถ'} {label} โดย {user['employee_id']}")
         return {"ok": True}
 
 
@@ -5092,10 +5150,20 @@ def broadcast_notification(body: BroadcastBody, user=Depends(require_ops())):
     if not message:
         raise HTTPException(400, "กรุณากรอกข้อความประกาศ")
     with get_db() as db:
+        # "ALL" used to mean USER+DRIVER, so an announcement to everyone reached
+        # neither the dispatchers nor the other admins — the people most likely
+        # to need to act on it. OPS is the new shorthand for the office side.
         if body.role == "ALL":
-            targets = db.execute("SELECT id FROM users WHERE role IN ('USER','DRIVER') AND deleted_at IS NULL").fetchall()
-        else:
+            targets = db.execute("SELECT id FROM users WHERE deleted_at IS NULL").fetchall()
+        elif body.role == "OPS":
+            targets = db.execute(
+                "SELECT id FROM users WHERE role IN ('ADMIN','DISPATCH') AND deleted_at IS NULL").fetchall()
+        elif body.role in ROLES:
             targets = db.execute("SELECT id FROM users WHERE role=? AND deleted_at IS NULL", (body.role,)).fetchall()
+        else:
+            raise HTTPException(400, f"กลุ่มผู้รับไม่ถูกต้อง: {body.role}")
+        # The sender does not need their own announcement back.
+        targets = [t for t in targets if t["id"] != user["id"]]
         for t in targets:
             notify(db, t["id"], f"[แอดมิน] {message}")
         audit(db, user["id"], "broadcast", f"{body.role}: {message}")
@@ -5131,6 +5199,40 @@ def push_subscribe(body: PushSubscribeBody, user=Depends(current_user)):
             "ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, p256dh=excluded.p256dh, auth=excluded.auth",
             (user["id"], body.endpoint, p256dh, auth, now_iso()),
         )
+        return {"ok": True}
+
+
+class PushResubscribeBody(BaseModel):
+    old_endpoint: str
+    endpoint: str
+    keys: dict
+
+
+@app.post("/push/resubscribe")
+def push_resubscribe(body: PushResubscribeBody):
+    """Called by the service worker when the BROWSER replaces a subscription
+    on its own (pushsubscriptionchange) — Chrome does this after an update or
+    a storage clear. Nothing ran in the page at that moment, so there is no
+    logged-in session to authenticate with; the old endpoint is the identity,
+    and it only ever moves an existing row to the new address. Without this,
+    notifications stopped for that device silently, and stayed stopped until
+    someone thought to toggle them off and on.
+    """
+    p256dh, auth = body.keys.get("p256dh"), body.keys.get("auth")
+    if not p256dh or not auth:
+        raise HTTPException(400, "ข้อมูลการสมัครรับแจ้งเตือนไม่ถูกต้อง")
+    with get_db() as db:
+        row = db.execute("SELECT user_id FROM push_subscriptions WHERE endpoint=?",
+                         (body.old_endpoint,)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบการลงทะเบียนเดิม")
+        db.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (body.old_endpoint,))
+        db.execute(
+            "INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, created_at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, p256dh=excluded.p256dh, "
+            "auth=excluded.auth",
+            (row["user_id"], body.endpoint, p256dh, auth, now_iso()))
+        log.info("Push subscription renewed by the browser for user %s", row["user_id"])
         return {"ok": True}
 
 
@@ -5758,9 +5860,181 @@ def service_worker():
     return FileResponse(os.path.join(FRONTEND_DIR, "service-worker.js"), media_type="application/javascript")
 
 
+# ---------------------------------------------------------------------------
+# App icons and the install manifest
+# ---------------------------------------------------------------------------
+# iOS only delivers Web Push to a PWA that was really installed to the home
+# screen, and that depends entirely on this manifest: no `display: standalone`,
+# or a manifest that 404s because the file did not make it into the deployment,
+# and notifications are dead on every iPhone with nothing anywhere to say why.
+# So the manifest is now built in code — the repo's file is still honoured, it
+# just cannot be the single point of failure any more — and the icons it points
+# at are drawn here, so they always exist.
+
+BRAND_BG = (0x25, 0x63, 0xEB)       # --amber in the stylesheet
+BRAND_FG = (0xFF, 0xFF, 0xFF)
+
+# The forklift mark from the sign-in screen, in its own 24x24 grid:
+# (kind, ...) with rects as x,y,w,h and circles as cx,cy,r.
+_MARK = [
+    ("rect", 2, 15, 7, 2),          # fork tines
+    ("rect", 9, 5, 1.6, 12),        # mast
+    ("rect", 12.5, 5, 1.6, 12),     # mast
+    ("rect", 10.5, 10, 9, 6),       # body
+    ("circle", 13, 18.5, 1.8),      # wheel
+    ("circle", 18, 18.5, 1.8),      # wheel
+]
+
+
+def _png_bytes(width: int, height: int, pixels: bytearray) -> bytes:
+    """Minimal 8-bit RGB PNG. Written by hand because this has to work with
+    nothing installed but the standard library."""
+    import zlib as _zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (len(data).to_bytes(4, "big") + tag + data
+                + (_zlib.crc32(tag + data) & 0xFFFFFFFF).to_bytes(4, "big"))
+
+    raw = bytearray()
+    stride = width * 3
+    for y in range(height):
+        raw.append(0)                               # filter: none
+        raw += pixels[y * stride:(y + 1) * stride]
+    ihdr = (width.to_bytes(4, "big") + height.to_bytes(4, "big")
+            + bytes([8, 2, 0, 0, 0]))               # 8-bit, truecolour
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", _zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+
+
+def render_app_icon(size: int) -> bytes:
+    """The mark on a full-bleed brand square — full-bleed so it is safe both as
+    an Apple touch icon (which turns transparency black) and as an Android
+    maskable icon (the mark sits well inside the 80% safe area)."""
+    px = bytearray(bytes(BRAND_BG) * (size * size))
+    # The glyph takes the middle ~62%, the same proportion as the header mark.
+    glyph = size * 0.62
+    scale = glyph / 24.0
+    ox = oy = (size - glyph) / 2.0
+
+    def put(x: int, y: int, coverage: float = 1.0):
+        if not (0 <= x < size and 0 <= y < size) or coverage <= 0:
+            return
+        i = (y * size + x) * 3
+        if coverage >= 1.0:
+            px[i:i + 3] = bytes(BRAND_FG)
+        else:
+            for k in range(3):
+                px[i + k] = round(px[i + k] + (BRAND_FG[k] - px[i + k]) * coverage)
+
+    for shape in _MARK:
+        if shape[0] == "rect":
+            _, x, y, w, h = shape
+            x0, y0 = round(ox + x * scale), round(oy + y * scale)
+            x1, y1 = round(ox + (x + w) * scale), round(oy + (y + h) * scale)
+            for yy in range(y0, max(y1, y0 + 1)):
+                for xx in range(x0, max(x1, x0 + 1)):
+                    put(xx, yy)
+        else:
+            _, cx, cy, r = shape
+            dcx, dcy, dr = ox + cx * scale, oy + cy * scale, r * scale
+            # Anti-aliased, by sampling 4x4 inside each pixel of the circle's
+            # own bounding box only — a few hundred pixels, so it stays cheap.
+            for yy in range(int(dcy - dr) - 1, int(dcy + dr) + 2):
+                for xx in range(int(dcx - dr) - 1, int(dcx + dr) + 2):
+                    hits = 0
+                    for sy in range(4):
+                        for sx in range(4):
+                            ddx = xx + (sx + 0.5) / 4 - dcx
+                            ddy = yy + (sy + 0.5) / 4 - dcy
+                            if ddx * ddx + ddy * ddy <= dr * dr:
+                                hits += 1
+                    if hits:
+                        put(xx, yy, hits / 16.0)
+    return _png_bytes(size, size, px)
+
+
+_ICON_CACHE = {}
+ICON_SIZES = (180, 192, 512)
+
+
+def app_icon_png(size: int) -> bytes:
+    if size not in _ICON_CACHE:
+        _ICON_CACHE[size] = render_app_icon(size)
+    return _ICON_CACHE[size]
+
+
+@app.get("/icon-{size}.png")
+def app_icon(size: int):
+    if size not in ICON_SIZES:
+        raise HTTPException(404, "ไม่มีไอคอนขนาดนี้")
+    return Response(content=app_icon_png(size), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.get("/apple-touch-icon.png")
+def apple_touch_icon():
+    return Response(content=app_icon_png(180), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(content=app_icon_png(192), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=604800"})
+
+
+BASE_MANIFEST = {
+    "name": "CRL ForkliftDispatch",
+    "short_name": "ForkliftDispatch",
+    "lang": "th",
+    "start_url": "/",
+    "scope": "/",
+    # iOS delivers push only to an installed, standalone PWA.
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#f5f6f8",
+    "theme_color": "#f5f6f8",
+    "icons": [
+        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+    ],
+}
+
+
+def build_manifest():
+    """The repo's manifest.json wins wherever it says something, except where
+    saying it would stop the app being installable. Returns (manifest, source)
+    so /push/status can report which one the phone is actually getting."""
+    manifest = dict(BASE_MANIFEST)
+    source = "generated"
+    try:
+        with open(os.path.join(FRONTEND_DIR, "manifest.json"), encoding="utf-8") as fh:
+            disk = json.load(fh)
+        if isinstance(disk, dict) and disk:
+            for k, v in disk.items():
+                if v not in (None, "", [], {}):
+                    manifest[k] = v
+            source = "file"
+    except FileNotFoundError:
+        log.info("No manifest.json on disk — serving the built-in one")
+    except Exception as e:
+        log.warning("manifest.json could not be read (%s) — serving the built-in one", e)
+    # Two things are not negotiable, because getting them wrong is invisible
+    # and costs every iPhone its notifications.
+    if manifest.get("display") not in ("standalone", "fullscreen"):
+        manifest["display"] = "standalone"
+    if not isinstance(manifest.get("icons"), list) or not manifest["icons"]:
+        manifest["icons"] = BASE_MANIFEST["icons"]
+    return manifest, source
+
+
 @app.get("/manifest.json")
 def manifest():
-    return FileResponse(os.path.join(FRONTEND_DIR, "manifest.json"), media_type="application/manifest+json")
+    data, _ = build_manifest()
+    return Response(content=json.dumps(data, ensure_ascii=False),
+                    media_type="application/manifest+json",
+                    headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":
