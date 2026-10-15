@@ -174,7 +174,7 @@
   .brand b{letter-spacing:.02em;}
   .brand small{display:block;color:var(--ink-dim);font-size:11px;letter-spacing:.03em;}
   .role-pill{font-size:11px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;color:var(--ink-dim);
-    letter-spacing:.03em;}
+    letter-spacing:.03em;max-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   main{flex:1;padding:16px;padding-bottom:90px;}
 
   .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}
@@ -1637,14 +1637,14 @@ function renderRegister(prefill = {}){
         <p class="sub">CRL ForkliftDispatch</p>
         <label for="rg-emp">รหัสพนักงาน</label><input id="rg-emp" name="username" autocomplete="username" />
         <div class="grid2">
-          <div><label>ชื่อ</label><input id="rg-first" placeholder="สมชาย" /></div>
-          <div><label>นามสกุล</label><input id="rg-last" placeholder="ใจดี" /></div>
+          <div><label>ชื่อ</label><input id="rg-first" placeholder="เช่น สมชาย" /></div>
+          <div><label>นามสกุล</label><input id="rg-last" placeholder="เช่น ใจดี" /></div>
         </div>
         <label>อีเมล @central.co.th (ไม่บังคับ — ใช้ล็อกอินแทนรหัสพนักงานได้)</label>
-        <input id="rg-email" type="email" placeholder="somchai@central.co.th" />
+        <input id="rg-email" type="email" placeholder="เช่น somchai@central.co.th" />
         <label for="rg-pass">รหัสผ่าน</label>${pwField("rg-pass", "อย่างน้อย 6 ตัวอักษร", "new")}
-        <label>Cost Center (5 หลัก)</label><input id="rg-cc" maxlength="5" placeholder="82899" />
-        <label>เบอร์ติดต่อ</label><input id="rg-contact" placeholder="081-234-5678" />
+        <label>Cost Center (5 หลัก)</label><input id="rg-cc" maxlength="5" placeholder="เช่น 12345" />
+        <label>เบอร์ติดต่อ</label><input id="rg-contact" placeholder="เช่น 081-234-5678" />
         <div id="rg-contact-err"></div>
         <label>รหัสเชิญ (ไม่บังคับ)</label>
         <input id="rg-invite" placeholder="ใส่เฉพาะกรณีที่ได้รับรหัสมาเพื่อสมัครเป็นคนขับ" />
@@ -1815,10 +1815,10 @@ function renderShell(){
   let brandInner;
   if(isDriver){
     const meVehicle = (state.vehicles || []).find(v=> v.id === (state.me && state.me.checked_in_vehicle_id));
-    const sub = ["DRIVER", meVehicle ? meVehicle.code : null].filter(Boolean).join(" · ");
+    const sub = [ROLE_PILL_TH.DRIVER, meVehicle ? meVehicle.code : null].filter(Boolean).join(" · ");
     brandInner = `<b>${(state.me && state.me.full_name) || state.employee_id}</b><small>${sub}</small>`;
   } else {
-    brandInner = `<b>${(state.me && state.me.full_name) || "SCDC Dispatch"}</b><small>${state.role}</small>`;
+    brandInner = `<b>${(state.me && state.me.full_name) || "SCDC Dispatch"}</b><small>${state.employee_id || ""}</small>`;
   }
 
   let rightIcons;
@@ -1832,8 +1832,8 @@ function renderShell(){
     `;
   } else {
     rightIcons = `
-      ${state.role === "ADMIN" ? `<button class="bell-btn" id="admin-search-btn">🔍</button>` : ""}
-      <span class="role-pill">${state.role}</span>
+      ${isOps() ? `<button class="bell-btn" id="admin-search-btn">🔍</button>` : ""}
+      <span class="role-pill">${ROLE_PILL_TH[state.role] || state.role}</span>
       <button class="bell-btn" id="bell">🔔${unread ? '<span class="bell-dot"></span>' : ''}</button>
     `;
   }
@@ -1855,7 +1855,7 @@ function renderShell(){
     header.querySelector("#chat-menu-btn").onclick = ()=> openChatMenuSheet();
     header.querySelector("#hdr-status-btn").onclick = ()=> openDriverStatusSheet();
   }
-  if(state.role === "ADMIN"){
+  if(isOps()){
     header.querySelector("#admin-search-btn").onclick = ()=> openAdminSearchSheet();
   }
   app.appendChild(header);
@@ -1880,7 +1880,7 @@ function renderShell(){
   // It used to be wired inside the admin dashboard renderer, which re-ran on
   // every poll and stacked a fresh set of touch listeners on <main> each time.
   wirePullToRefresh(main, pullIndicator, ()=>{
-    if(state.role === "ADMIN" && state.tab === "dashboard" && typeof loadDashboardNow === "function"){
+    if(isOps() && state.tab === "dashboard" && typeof loadDashboardNow === "function"){
       return loadDashboardNow();
     }
     return refreshNow();
@@ -1890,6 +1890,11 @@ function renderShell(){
     USER: [["tasks","งานของฉัน"], ["history","ประวัติ"], ["help","วิธีใช้"], ["profile","โปรไฟล์"]],
     DRIVER: [["available","งานของฉัน"], ["history","ประวัติ"], ["help","วิธีใช้"], ["profile","โปรไฟล์"]],
     ADMIN: [["dashboard","แดชบอร์ด"], ["operation","ปฏิบัติการ"], ["settings","จัดการระบบ"], ["help","วิธีใช้"], ["profile","โปรไฟล์"]],
+    // Same as an admin without จัดการระบบ. No driver screens, for the same
+    // reason an admin has none: taking a job yourself needs a licence and a
+    // checked-in vehicle, so it belongs to a driver account. Someone who both
+    // dispatches and drives has their role set to DRIVER for that shift.
+    DISPATCH: [["dashboard","แดชบอร์ด"], ["operation","ปฏิบัติการ"], ["help","วิธีใช้"], ["profile","โปรไฟล์"]],
   }[state.role];
 
   if(!tabsDef){
@@ -1916,7 +1921,9 @@ function renderShell(){
   if(!tabsDef.find(([k])=>k===state.tab)) setTab(tabsDef[0][0], "");
   renderContent();
 
-  if(state.role === "USER"){
+  // Requesters raise their own work; admins and dispatchers raise what comes
+  // in by radio or phone, which is most of it.
+  if(state.role === "USER" || isOps()){
     const fab = el(`<button class="fab" id="fab-add">+</button>`);
     fab.onclick = ()=> openCreateTask();
     app.appendChild(fab);
@@ -1955,7 +1962,7 @@ async function renderContent(){
   if(state.tab === "help") renderHelpTab(main);
   else if(state.role === "USER") renderUserTab(main);
   else if(state.role === "DRIVER") renderDriverTab(main);
-  else if(state.role === "ADMIN") renderAdminTab(main);
+  else if(isOps()) renderAdminTab(main);
   // Restore scroll position so the 3s auto-refresh poll doesn't yank the user
   // back to the top of a long list they were scrolled through. The page itself
   // scrolls (header uses position:sticky), not #main, so this targets window.
@@ -1968,7 +1975,21 @@ async function renderContent(){
 // dangling divider.
 // Who put a job on hold, from which side, and why — the three things anyone
 // looking at a stopped job needs before they can do anything about it.
-const ROLE_TH = {DRIVER: "คนขับ", USER: "ผู้ขอ", ADMIN: "แอดมิน"};
+const ROLE_TH = {DRIVER: "คนขับ", USER: "ผู้ขอ", DISPATCH: "ผู้กระจายงาน", ADMIN: "แอดมิน"};
+const ROLE_PILL_TH = {DRIVER: "คนขับ", USER: "ผู้ขอ", DISPATCH: "กระจายงาน", ADMIN: "แอดมิน"};
+// A dispatcher runs the floor with an admin's screens, minus จัดการระบบ.
+const OPS_ROLES = ["ADMIN", "DISPATCH"];
+const isOps = ()=> OPS_ROLES.includes(state.role);
+// Mirrors the server: an admin hands out any role, a dispatcher anything but
+// admin. Kept in step so the screen never offers a choice that returns 403.
+const ROLES_I_CAN_GRANT = {
+  ADMIN: ["USER", "DRIVER", "DISPATCH", "ADMIN"],
+  DISPATCH: ["USER", "DRIVER", "DISPATCH"],
+};
+const rolesICanGrant = ()=> ROLES_I_CAN_GRANT[state.role] || [];
+// An admin account is only an admin's to manage — otherwise a dispatcher
+// resets their password and signs in as them.
+const canManageUser = (u)=> u && (u.role !== "ADMIN" || state.role === "ADMIN");
 const PAUSE_ROLE_TH = ROLE_TH;   // same map; kept under the old name too
 
 function pauseLine(t){
@@ -2350,7 +2371,7 @@ function buildLocationPicker(container, zones, initial){
       // no separate "add" button: the sheet's own confirm button renames
       // itself to "เพิ่มจุดนี้" while a number is sitting in the box, so there
       // is one button to look for instead of two that do nearly the same job.
-      const row = el(`<div><input type="number" min="1" max="85" placeholder="1-85" /></div>`);
+      const row = el(`<div><input type="number" min="1" max="85" placeholder="เลข 1-85" /></div>`);
       const hint = el(`<div class="field-note"></div>`);
       const chipRow = el(`<div class="chip-row" style="margin-top:8px;"></div>`);
       function drawChips(){
@@ -2437,7 +2458,7 @@ function buildLocationPicker(container, zones, initial){
         drawChips();
         body.appendChild(row); body.appendChild(chipRow);
       } else {
-        const inp = el(`<textarea rows="2" placeholder="${currentZone.example_code||'พิมพ์รายละเอียด'}">${singleValue}</textarea>`);
+        const inp = el(`<textarea rows="2" placeholder="${currentZone.example_code ? 'เช่น ' + currentZone.example_code : 'พิมพ์รายละเอียด'}">${singleValue}</textarea>`);
         inp.oninput = ()=>{ singleValue = inp.value.trim(); };
         body.appendChild(inp);
       }
@@ -2445,7 +2466,7 @@ function buildLocationPicker(container, zones, initial){
       // No separate "add" button: the sheet's own confirm button does both
       // jobs and renames itself, so there is one button to look for instead
       // of two that do nearly the same thing.
-      const row = el(`<div style="display:flex;gap:8px;"><input placeholder="${currentZone.example_code||''} (วางจาก Excel ได้)" /></div>`);
+      const row = el(`<div style="display:flex;gap:8px;"><input placeholder="${currentZone.example_code ? 'เช่น ' + currentZone.example_code + ' ' : ''}(วางจาก Excel ได้)" /></div>`);
       const chipRow = el(`<div class="chip-row"></div>`);
       function drawChips(){
         chipRow.innerHTML = "";
@@ -2500,7 +2521,7 @@ function buildLocationPicker(container, zones, initial){
       drawChips();
       body.appendChild(row); body.appendChild(chipRow);
     } else {
-      const inp = el(`<input placeholder="${currentZone.example_code||''}" value="${singleValue}" />`);
+      const inp = el(`<input placeholder="${currentZone.example_code ? 'เช่น ' + currentZone.example_code : ''}" value="${singleValue}" />`);
       inp.oninput = ()=>{ singleValue = inp.value.trim().toUpperCase(); };
       body.appendChild(inp);
     }
@@ -2582,6 +2603,13 @@ function openCreateTask(prefill){
         </div>
         <label>BU</label>
         <select id="ct-bu">${BU_LIST.map(b=>`<option value="${b}">${b}</option>`).join("")}</select>
+        <label for="ct-cc">Cost center ของงานนี้ (5 หลัก)</label>
+        <input id="ct-cc" maxlength="5" inputmode="numeric"
+               value="${(state.me && state.me.cost_center) || ''}"
+               placeholder="เช่น 12345" />
+        <div class="field-note">${(state.me && state.me.cost_center)
+          ? "เติมจากโปรไฟล์ของคุณให้แล้ว แก้ได้ถ้างานนี้ลงบัญชีหน่วยอื่น"
+          : "บัญชีของคุณไม่มี cost center กรุณาระบุของหน่วยที่จะลงบัญชีงานนี้"}</div>
         <div id="ct-driver-avail" class="field-note" style="margin-top:8px;">กำลังเช็คจำนวนคนขับว่าง...</div>
         <div class="grid2">
           <div>
@@ -2657,6 +2685,10 @@ function openCreateTask(prefill){
     const reqType = overlay.querySelector("#ct-type").value;
     const scheduled = overlay.querySelector("#ct-scheduled").value;
     if(reqType === "Booking" && !scheduled){ toast("กรุณาระบุวันเวลานัดหมาย"); return; }
+    // Checked in the order the fields appear, so the message always points at
+    // the first thing still missing as you read down the sheet.
+    const costCenter = overlay.querySelector("#ct-cc").value.trim();
+    if(!/^\d{5}$/.test(costCenter)){ toast("cost center ต้องเป็นตัวเลข 5 หลัก"); return; }
     if(!fromValue || !fromValue.value){ toast("กรุณาเลือกจุดต้นทาง"); return; }
     if(!toValue || !toValue.value){ toast("กรุณาเลือกจุดปลายทาง"); return; }
     // The field now starts empty, so an empty one is a real mistake rather
@@ -2668,6 +2700,7 @@ function openCreateTask(prefill){
         request_type: reqType,
         scheduled_at: reqType === "Booking" ? scheduled : null,
         bu: overlay.querySelector("#ct-bu").value,
+        cost_center: costCenter,
         from_zone: fromValue.zone, from_location: fromValue.value,
         to_zone: toValue.zone, to_location: toValue.value,
         pallet_qty: palletQty,
@@ -2820,7 +2853,7 @@ function renderProfile(main){
   const pf = el(`<div class="card">
     <label>ชื่อ-นามสกุล</label><input id="pf-name" value="${me.full_name || ''}" />
     <label>อีเมล @central.co.th (ไม่บังคับ — ใช้ล็อกอินแทนรหัสพนักงานได้)</label>
-    <input id="pf-email" type="email" placeholder="somchai@central.co.th" value="${me.email || ''}" />
+    <input id="pf-email" type="email" placeholder="เช่น somchai@central.co.th" value="${me.email || ''}" />
     <label>เบอร์ติดต่อ</label><input id="pf-contact" value="${me.contact || ''}" />
     ${state.role === "USER" ? `<label>Cost Center (5 หลัก)</label><input id="pf-cc" maxlength="5" value="${me.cost_center || ''}" />` : ""}
     <button class="primary" id="pf-submit">บันทึกข้อมูล</button>
@@ -3238,7 +3271,7 @@ function renderDriverTab(main){
     const bd = el(`<div class="card">
       <button class="btn red" id="bd-self" style="width:100%;">แจ้งปัญหาของตัวเอง</button>
       <div class="grid2" style="margin-top:10px;">
-        <div><label>รหัสรถ</label><input id="bd-vehicle" placeholder="WH-01" /></div>
+        <div><label>รหัสรถ</label><input id="bd-vehicle" placeholder="เช่น WH-14" /></div>
         <div><label>&nbsp;</label><button class="btn red" id="bd-vehicle-submit" style="width:100%;">แจ้งปัญหารถ</button></div>
       </div>
       <label>รายละเอียด</label><textarea id="bd-desc" rows="2" placeholder="เกิดอะไรขึ้น?"></textarea>
@@ -4535,6 +4568,7 @@ function renderOperationPeople(main){
   const summary = el(`<div class="stat-grid" style="margin-bottom:14px;">
     <div class="stat"><div class="n">${onlineDrivers}/${totalDrivers}</div><div class="l">คนขับออนไลน์ตอนนี้</div></div>
     <div class="stat"><div class="n">${state.allUsers.filter(u=>u.role==='USER').length}</div><div class="l">ผู้ขอใช้งาน (User)</div></div>
+    <div class="stat"><div class="n">${state.allUsers.filter(u=>u.role==='DISPATCH').length}</div><div class="l">ผู้กระจายงาน</div></div>
     <div class="stat"><div class="n">${state.allUsers.filter(u=>u.role==='ADMIN').length}</div><div class="l">แอดมิน</div></div>
   </div>`);
   main.appendChild(summary);
@@ -4544,9 +4578,10 @@ function renderOperationPeople(main){
       <div><label>ค้นหา (ชื่อ / รหัสพนักงาน / อีเมล)</label><input id="op-people-search" placeholder="พิมพ์เพื่อค้นหา..." value="${state.peopleFilter}" /></div>
       <div><label>Role</label><select id="op-people-role">
         <option value="">ทั้งหมด</option>
-        <option value="USER">User</option>
-        <option value="DRIVER">Driver</option>
-        <option value="ADMIN">Admin</option>
+        <option value="USER">ผู้ขอ</option>
+        <option value="DRIVER">คนขับ</option>
+        <option value="DISPATCH">ผู้กระจายงาน</option>
+        <option value="ADMIN">แอดมิน</option>
       </select></div>
     </div>
   </div>`);
@@ -4599,10 +4634,10 @@ function openCreateDriverSheet(){
       <div class="sheet">
         <div class="sheet-head"><h2>เพิ่มพนักงานใหม่ (คนขับ)</h2><button class="sheet-close">✕</button></div>
         <div class="field-note">ถ้าพนักงานสมัครสมาชิกเป็น User ไว้แล้ว ให้ใช้ "แก้ไข" ในหน้ารายชื่อเพื่อ Promote เป็น Driver แทน — ฟอร์มนี้สำหรับสร้างบัญชีใหม่ตั้งแต่ต้นเท่านั้น</div>
-        <label>รหัสพนักงาน</label><input id="nd-emp" placeholder="driver004" />
+        <label>รหัสพนักงาน</label><input id="nd-emp" placeholder="เช่น 82640" />
         <label>ชื่อ-นามสกุล</label><input id="nd-name" placeholder="เช่น วิชัย ขยัน" />
         <label>อีเมล @central.co.th (ไม่บังคับ — ใช้ล็อกอินแทนรหัสพนักงานได้)</label>
-        <input id="nd-email" type="email" placeholder="wichai@central.co.th" />
+        <input id="nd-email" type="email" placeholder="เช่น wichai@central.co.th" />
         <label>สิทธิ์ขับรถเริ่มต้น (ไม่บังคับ เพิ่มทีหลังได้)</label>
         <div class="chip-row">
           ${state.vehicleTypes.map(vt=>`<label class="chip" style="cursor:pointer;"><input type="checkbox" value="${vt.type_key}" style="width:auto;margin-right:4px;" />${vt.type_name_th}</label>`).join("")}
@@ -4711,7 +4746,7 @@ function openCreateVehicleSheet(){
       <div class="sheet">
         <div class="sheet-head"><h2>เพิ่มรถใหม่</h2><button class="sheet-close">✕</button></div>
         <div class="grid2">
-          <div><label>รหัสรถ</label><input id="nv-code" placeholder="RT-003" /></div>
+          <div><label>รหัสรถ</label><input id="nv-code" placeholder="เช่น WH-14" /></div>
           <div><label>ประเภทรถ</label><select id="nv-type">${state.vehicleTypes.map(vt=>`<option value="${vt.type_key}">${vt.type_name_th}</option>`).join("")}</select></div>
         </div>
         <button class="primary" id="nv-submit">เพิ่มรถ</button>
@@ -4841,13 +4876,22 @@ function openUserEditSheet(userId){
 
         <div class="section-title">สิทธิ์และบัญชี</div>
         <label>สิทธิ์การใช้งาน (Role)</label>
-        <select id="ue-role">
-          ${["USER","DRIVER","ADMIN"].map(r=>`<option value="${r}" ${r===u.role?"selected":""}>${r}</option>`).join("")}
+        <select id="ue-role" ${canManageUser(u) ? "" : "disabled"}>
+          ${(() => {
+            // Always show their current role, even one this person cannot
+            // grant, so the dropdown never misreports who someone is.
+            const opts = rolesICanGrant().slice();
+            if(!opts.includes(u.role)) opts.unshift(u.role);
+            return opts.map(r=>`<option value="${r}" ${r===u.role?"selected":""}>${ROLE_TH[r] || r} (${r})</option>`).join("");
+          })()}
         </select>
-        <button class="primary" id="ue-submit">บันทึกสิทธิ์</button>
+        ${canManageUser(u) ? "" : `<div class="field-note" style="color:var(--warn);margin-top:6px;line-height:1.6;">
+          บัญชีนี้เป็นแอดมิน เฉพาะแอดมินเท่านั้นที่เปลี่ยนสิทธิ์ รีเซ็ตรหัสผ่าน หรือลบบัญชีนี้ได้
+        </div>`}
+        <button class="primary" id="ue-submit" ${canManageUser(u) ? "" : "disabled"}>บันทึกสิทธิ์</button>
         <div class="grid2" style="margin-top:10px;">
-          <button class="btn amber" id="ue-reset-pw" style="width:100%;">รีเซ็ตรหัสผ่าน</button>
-          <button class="btn red" id="ue-delete" style="width:100%;">ลบผู้ใช้นี้</button>
+          <button class="btn amber" id="ue-reset-pw" style="width:100%;" ${canManageUser(u) ? "" : "disabled"}>รีเซ็ตรหัสผ่าน</button>
+          <button class="btn red" id="ue-delete" style="width:100%;" ${canManageUser(u) ? "" : "disabled"}>ลบผู้ใช้นี้</button>
         </div>
         <div id="ue-license-section" style="margin-top:20px;${u.role==='DRIVER'?'':'display:none;'}">
           <div class="section-title" style="margin-top:0;">ใบอนุญาตขับรถ</div>
@@ -5250,14 +5294,14 @@ function renderAdminSettings(main){
     main.appendChild(el(`<div class="section-title">เพิ่มโซนใหม่</div>`));
     const form = el(`<div class="card">
       <div class="grid2">
-        <div><label>รหัสโซน (ภาษาอังกฤษ, ไม่ซ้ำ)</label><input id="zn-key" placeholder="COLD_STORAGE" /></div>
-        <div><label>ชื่อโซน (ไทย)</label><input id="zn-name" placeholder="ห้องเย็น" /></div>
+        <div><label>รหัสโซน (ภาษาอังกฤษ, ไม่ซ้ำ)</label><input id="zn-key" placeholder="เช่น COLD_STORAGE" /></div>
+        <div><label>ชื่อโซน (ไทย)</label><input id="zn-name" placeholder="เช่น ห้องเย็น" /></div>
       </div>
       <label>Pattern (regular expression)</label>
-      <input id="zn-pattern" placeholder="^COLD-[1-9]$" class="mono" />
+      <input id="zn-pattern" placeholder="เช่น ^COLD-[1-9]$" class="mono" />
       <div class="field-note">ตัวอย่าง: ^COLD-[1-9]$ จะยอมรับ COLD-1 ถึง COLD-9 เท่านั้น</div>
       <label>ตัวอย่างรหัสที่ถูกต้อง</label>
-      <input id="zn-example" placeholder="COLD-3" />
+      <input id="zn-example" placeholder="เช่น COLD-3" />
       <label style="display:flex;align-items:center;gap:8px;margin-top:12px;">
         <input type="checkbox" id="zn-multi" style="width:auto;" /> เลือกได้หลายจุดในงานเดียว
       </label>
@@ -5349,8 +5393,8 @@ function renderAdminSettings(main){
     main.appendChild(el(`<div class="section-title">เพิ่มประเภทรถใหม่</div>`));
     const form = el(`<div class="card">
       <div class="grid2">
-        <div><label>รหัสประเภท (อังกฤษ)</label><input id="vt-key" placeholder="CRANE" /></div>
-        <div><label>ชื่อ (ไทย)</label><input id="vt-name" placeholder="เครน" /></div>
+        <div><label>รหัสประเภท (อังกฤษ)</label><input id="vt-key" placeholder="เช่น CRANE" /></div>
+        <div><label>ชื่อ (ไทย)</label><input id="vt-name" placeholder="เช่น เครน" /></div>
       </div>
       <label>คำอธิบาย</label><input id="vt-desc" placeholder="ไม่บังคับ" />
       <label>รหัสเชิญ (ไม่บังคับ)</label>
@@ -5419,7 +5463,7 @@ function buildTaskDetailActions(t){
     if(["Assigned","In Progress","Pause"].includes(t.status)) return `<button class="btn green" data-join="${t.id}">เข้าร่วม</button><button class="btn blue" data-take-over="${t.id}">รับช่วงแทน</button>`;
     return "";
   }
-  if(state.role === "ADMIN"){
+  if(isOps()){
     if(t.status === "Waiting") return `<button class="btn amber" data-assign="${t.id}">มอบหมายงาน</button>`;
     if(["Assigned","In Progress","Pause"].includes(t.status)) return `<button class="btn blue" data-reassign="${t.id}">แก้ไขการมอบหมาย</button>${isChat}${t.status !== "Assigned" ? `<button class="btn green" data-admin-complete="${t.id}">ทำเครื่องหมายเสร็จ</button>` : ""}<button class="btn red" data-action="cancel">ยกเลิก</button>`;
     return isChat;
@@ -5869,7 +5913,7 @@ async function refreshAll(opts={}){
   // hit instead of fourteen.
   let scope = "core";
   if(state.role === "DRIVER") scope = "driver";
-  else if(state.role === "ADMIN"){
+  else if(isOps()){
     scope = (state.tab === "dashboard") ? "admin_dash" : "admin_ops";
   }
   // Only one refresh in flight at a time. A manual tap, a push-triggered
@@ -5908,7 +5952,7 @@ async function refreshAll(opts={}){
     // even though the underlying numbers rarely change that often. The
     // dashboard reloads when opened, when the period changes, or via its own
     // manual/pull-to-refresh.
-    const onAdminDashboard = state.role === "ADMIN" && state.tab === "dashboard";
+    const onAdminDashboard = isOps() && state.tab === "dashboard";
     // Third condition, and the important one for how the app FEELS: if the
     // payload is byte-identical to the last one we rendered, there is nothing
     // to repaint. Most polls return unchanged data, and rebuilding the whole
