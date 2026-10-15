@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261014.1421"
+APP_VERSION = "TTLOD.261015.0847"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -813,15 +813,31 @@ CREATE TABLE IF NOT EXISTS driver_licenses (
 
 CREATE TABLE IF NOT EXISTS zones (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Immutable. Every task ever created stores this string in from_zone /
+    -- to_zone, and four zones have their own hand-built picker keyed on it,
+    -- so renaming it would orphan history and silently drop those pickers.
+    -- The editable name is zone_name_th.
     zone_key TEXT UNIQUE NOT NULL,
     zone_name_th TEXT NOT NULL,
     code_pattern TEXT NOT NULL,
     allow_multiple INTEGER NOT NULL DEFAULT 0,
     example_code TEXT,
     sort_order INTEGER NOT NULL DEFAULT 0,
-    free_text INTEGER NOT NULL DEFAULT 0
+    free_text INTEGER NOT NULL DEFAULT 0,
+    -- Can only be a job's origin (empty pallets are collected, never delivered).
+    origin_only INTEGER NOT NULL DEFAULT 0,
+    -- The zone IS the location: picking it saves straight away with no detail
+    -- to type (Sort Yard, empty pallets).
+    no_location INTEGER NOT NULL DEFAULT 0,
+    -- Retired zones stay here so old tasks still read properly; they just
+    -- stop being offered when creating a job.
+    active INTEGER NOT NULL DEFAULT 1
 );
 
+-- UNUSED since the vehicle-type/zone matrix was removed. Kept rather than
+-- dropped: a DROP TABLE on the live database cannot be undone, and an
+-- unread table costs nothing. Delete it in a later release if it is still
+-- unused then.
 CREATE TABLE IF NOT EXISTS vehicle_type_zones (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vehicle_type TEXT NOT NULL,
@@ -1126,6 +1142,11 @@ NEW_COLUMNS = [
     ("task_assignments", "is_active_for_driver", "INTEGER NOT NULL DEFAULT 1", None),
     # Per-type invite code, replacing the two fixed invite_code_pe/rt settings.
     ("vehicle_types", "invite_code", "TEXT", None),
+    # Zone behaviour, moved out of hand-written branches into data so an admin
+    # can maintain it without a deploy.
+    ("zones", "origin_only", "INTEGER NOT NULL DEFAULT 0", None),
+    ("zones", "no_location", "INTEGER NOT NULL DEFAULT 0", None),
+    ("zones", "active", "INTEGER NOT NULL DEFAULT 1", None),
 ]
 
 
@@ -1206,6 +1227,34 @@ def ensure_columns():
                 if rows:
                     log.info("Backfilled first/last name for %d user(s)", len(rows))
 
+            # Zone behaviour for the zones that already exist. Done here, in
+            # the path that runs on every boot for both backends, because
+            # seed_master_data only fills an EMPTY zones table — a live
+            # database would otherwise get the columns and never the values.
+            try:
+                for zone_key, flags in (
+                    # Empty pallets are collected, never delivered, and the
+                    # zone itself is the location.
+                    ("EMPTY_PALLET", {"origin_only": 1, "no_location": 1}),
+                    # The sort yard is one place; it had no detail to type
+                    # anyway, via a hand-written branch that this replaces.
+                    ("SORT_YARD", {"no_location": 1}),
+                ):
+                    row = db.execute("SELECT sort_order FROM zones WHERE zone_key=?", (zone_key,)).fetchone()
+                    if not row:
+                        continue
+                    sets = ", ".join(f"{k}=?" for k in flags)
+                    db.execute(f"UPDATE zones SET {sets} WHERE zone_key=?",
+                               tuple(flags.values()) + (zone_key,))
+                # Staging and empty pallets both landed on sort_order 7 on
+                # databases built by the migration path, so their order in the
+                # picker differed from a fresh install. Pin them.
+                for zone_key, order in (("STAGING", 7), ("EMPTY_PALLET", 8)):
+                    db.execute("UPDATE zones SET sort_order=? WHERE zone_key=?", (order, zone_key))
+                log.info("Migrated: zone flags and ordering applied")
+            except Exception as ex:
+                log.warning("Could not apply zone flags: %s", ex)
+
             # Invite codes moved from two fixed app_config rows onto the
             # vehicle type they grant. This has to happen here, not in
             # migrate_db(), which only ever runs on SQLite — on an existing
@@ -1229,22 +1278,6 @@ def ensure_columns():
             except Exception as ex:
                 log.warning("Could not move invite codes onto vehicle types: %s", ex)
 
-            # Any vehicle type that predates the zone matrix being populated
-            # per type can work nowhere, which fails every assignment using
-            # it. Give a type with no zone rows at all the full set.
-            try:
-                for vt in db.execute("SELECT type_key FROM vehicle_types").fetchall():
-                    has = db.execute("SELECT 1 FROM vehicle_type_zones WHERE vehicle_type=?",
-                                     (vt["type_key"],)).fetchone()
-                    if has:
-                        continue
-                    for z in db.execute("SELECT zone_key FROM zones").fetchall():
-                        db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) "
-                                   "VALUES (?,?) ON CONFLICT DO NOTHING",
-                                   (vt["type_key"], z["zone_key"]))
-                    log.info("Migrated: opened every zone for vehicle type %s", vt["type_key"])
-            except Exception as ex:
-                log.warning("Could not backfill vehicle_type_zones: %s", ex)
     except Exception as e:
         log.warning("ensure_columns skipped: %s", e)
 
@@ -1304,10 +1337,6 @@ def migrate_db():
                 "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) "
                 "VALUES ('STAGING','Staging (อื่นๆ)','^.+$',0,'ระบุจุดเอง',7,1)"
             )
-            # Free-text zone, so every vehicle type can serve it.
-            for vt in ("RT", "PE"):
-                db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) "
-                           "ON CONFLICT DO NOTHING", (vt, "STAGING"))
             log.info("Migrated database: added STAGING zone")
 
 
@@ -1389,26 +1418,19 @@ def seed_master_data(db):
 
     if not db.execute("SELECT 1 FROM zones LIMIT 1").fetchone():
         db.execute(
-            "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) VALUES "
-            "('CONCRETE_YARD','ลานปูน','^ลานปูน-[1-7]$',0,'ลานปูน-3',1,0),"
-            "('GATE','ประตู','^ประตู-([1-9]|[1-7][0-9]|8[0-5])$',1,'ประตู-12',2,0),"
-            "('SORT_YARD','ลาน Sort','^ลาน Sort$',0,'ลาน Sort',3,0),"
-            "('MEZZANINE','Mezzanine','^Mezzanine-[1-4]-(ซ้าย \\(Cross dock\\)|ขวา \\(Double Deep\\))$',0,'Mezzanine-2-ซ้าย (Cross dock)',4,0),"
-            "('SELECTIVE_RACK','Selective Rack','^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$',1,'BAA01A1',5,0),"
-            "('DOUBLE_DEEP','Double Deep','^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$',1,'AAA01G1',6,0),"
-            "('STAGING','Staging (อื่นๆ)','^.+$',0,'ระบุจุดเอง',7,1),"
-            "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า-จุดจ่าย',8,1)"
+            "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, "
+            "sort_order, free_text, origin_only, no_location) VALUES "
+            "('CONCRETE_YARD','ลานปูน','^ลานปูน-[1-7]$',0,'ลานปูน-3',1,0,0,0),"
+            "('GATE','ประตู','^ประตู-([1-9]|[1-7][0-9]|8[0-5])$',1,'ประตู-12',2,0,0,0),"
+            "('SORT_YARD','ลาน Sort','^ลาน Sort$',0,'ลาน Sort',3,0,0,1),"
+            "('MEZZANINE','Mezzanine','^Mezzanine-[1-4]-(ซ้าย \\(Cross dock\\)|ขวา \\(Double Deep\\))$',0,'Mezzanine-2-ซ้าย (Cross dock)',4,0,0,0),"
+            "('SELECTIVE_RACK','Selective Rack','^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$',1,'BAA01A1',5,0,0,0),"
+            "('DOUBLE_DEEP','Double Deep','^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$',1,'AAA01G1',6,0,0,0),"
+            "('STAGING','Staging (อื่นๆ)','^.+$',0,'ระบุจุดเอง',7,1,0,0),"
+            "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า',8,1,1,1)"
         )
         log.info("Seeded master data: zones")
 
-    if not db.execute("SELECT 1 FROM vehicle_type_zones LIMIT 1").fetchone():
-        # Default: every vehicle type can work every zone. Admin narrows this
-        # down later via the vehicle-type <-> zone matrix in Settings.
-        zone_keys = ["CONCRETE_YARD", "GATE", "SORT_YARD", "MEZZANINE", "SELECTIVE_RACK", "DOUBLE_DEEP"]
-        for vt in ("RT", "PE"):
-            for zk in zone_keys:
-                db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) ON CONFLICT DO NOTHING", (vt, zk))
-        log.info("Seeded master data: vehicle_type_zones")
 
     if not db.execute("SELECT 1 FROM task_rules LIMIT 1").fetchone():
         db.execute(
@@ -1470,11 +1492,20 @@ def infer_task_type(db, from_zone: str, to_zone: str) -> str:
     return TASK_TYPE_PLACEHOLDER
 
 
-def validate_location_string(db, zone_key: str, value: str) -> str:
+def validate_location_string(db, zone_key: str, value: str, *, is_destination: bool = False) -> str:
     zone = db.execute("SELECT * FROM zones WHERE zone_key=?", (zone_key,)).fetchone()
     if not zone:
         raise HTTPException(400, f"ไม่พบโซน {zone_key}")
+    if is_destination and zone["origin_only"]:
+        raise HTTPException(400, f"โซน {zone['zone_name_th']} เลือกเป็นจุดปลายทางไม่ได้ "
+                                 f"(ใช้เป็นจุดต้นทางเท่านั้น)")
+    if not zone["active"]:
+        raise HTTPException(400, f"โซน {zone['zone_name_th']} ถูกปิดใช้งานแล้ว กรุณาเลือกโซนอื่น")
     value = (value or "").strip()
+    # The zone itself is the location, so there is nothing to type and nothing
+    # to validate: the name goes in as the location.
+    if zone["no_location"]:
+        return zone["zone_name_th"]
     if not value:
         raise HTTPException(400, "กรุณาระบุตำแหน่ง")
     raw_parts = [p.strip() for p in value.split(",") if p.strip()]
@@ -1497,17 +1528,6 @@ def validate_location_string(db, zone_key: str, value: str) -> str:
         if not pattern.match(p):
             raise HTTPException(400, f"รูปแบบตำแหน่งไม่ถูกต้อง: '{p}' (ตัวอย่างที่ถูกต้อง: {zone['example_code']})")
     return ",".join(parts)
-
-
-def zone_capability_issue(db, vehicle_type: str, zone_key: str) -> Optional[str]:
-    row = db.execute(
-        "SELECT 1 FROM vehicle_type_zones WHERE vehicle_type=? AND zone_key=?", (vehicle_type, zone_key)
-    ).fetchone()
-    if row:
-        return None
-    zone = db.execute("SELECT zone_name_th FROM zones WHERE zone_key=?", (zone_key,)).fetchone()
-    zone_name = zone["zone_name_th"] if zone else zone_key
-    return f"ประเภทรถ {vehicle_type} ไม่สามารถทำงานในโซน {zone_name} ได้"
 
 
 # ---------------------------------------------------------------------------
@@ -1710,6 +1730,12 @@ def start_assignment(db, assignment, actor_id, *, announce=True):
         )
     db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
                (assignment["driver_id"], assignment["vehicle_id"], row["id"]))
+    # The vehicle is back out on a job. Finishing the previous one released it
+    # a moment ago, so without this the fleet page and the dashboard would
+    # show a vehicle as free while the driver is away using it.
+    if assignment["vehicle_id"]:
+        db.execute("UPDATE vehicles SET status='Busy' WHERE id=? AND status!='Breakdown'",
+                   (assignment["vehicle_id"],))
     recompute_driver_status(db, assignment["driver_id"])
     if announce:
         post_system_message(db, row["id"], assignment["driver_id"],
@@ -2300,12 +2326,22 @@ class ZoneBody(BaseModel):
     allow_multiple: bool = False
     example_code: Optional[str] = None
     free_text: bool = False
+    origin_only: bool = False
+    no_location: bool = False
 
 
 @app.get("/zones")
 def list_zones(user=Depends(current_user)):
+    """Zones for picking a location.
+
+    A retired zone is withheld from everyone but an admin: the pickers must
+    not offer it, while the admin page has to list it to switch it back on.
+    """
     with get_db() as db:
-        return [dict(r) for r in db.execute("SELECT * FROM zones ORDER BY sort_order, id").fetchall()]
+        rows = db.execute("SELECT * FROM zones ORDER BY sort_order, id").fetchall()
+    if user["role"] == "ADMIN":
+        return [dict(r) for r in rows]
+    return [dict(r) for r in rows if r["active"]]
 
 
 @app.post("/zones")
@@ -2319,68 +2355,108 @@ def add_zone(body: ZoneBody, user=Depends(require_role("ADMIN"))):
             raise HTTPException(400, f"รูปแบบ pattern ไม่ถูกต้อง: {e}")
         max_order = db.execute("SELECT COALESCE(MAX(sort_order),0) m FROM zones").fetchone()["m"]
         db.execute(
-            "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, sort_order, free_text) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, "
+            "sort_order, free_text, origin_only, no_location) VALUES (?,?,?,?,?,?,?,?,?)",
             (body.zone_key, body.zone_name_th, body.code_pattern, int(body.allow_multiple),
-             body.example_code, max_order + 1, int(body.free_text)),
+             body.example_code, max_order + 1, int(body.free_text),
+             int(body.origin_only), int(body.no_location)),
         )
         audit(db, user["id"], "add_zone", body.zone_key)
         return {"ok": True}
 
 
+class ZoneUpdateBody(BaseModel):
+    """Everything about a zone except its key, which is immutable."""
+    zone_name_th: Optional[str] = None
+    code_pattern: Optional[str] = None
+    example_code: Optional[str] = None
+    allow_multiple: Optional[bool] = None
+    free_text: Optional[bool] = None
+    origin_only: Optional[bool] = None
+    no_location: Optional[bool] = None
+    active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+@app.put("/zones/{zone_key}")
+def update_zone(zone_key: str, body: ZoneUpdateBody, user=Depends(require_role("ADMIN"))):
+    """Change a zone in place.
+
+    There was no way to do this at all: the only routes were add and delete,
+    so fixing a name meant deleting the zone — which took its settings with it
+    and left every past task pointing at a key that no longer existed. The key
+    stays fixed for exactly that reason; everything else is editable.
+    """
+    with get_db() as db:
+        row = db.execute("SELECT * FROM zones WHERE zone_key=?", (zone_key,)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบโซนนี้")
+        fields = {}
+        if body.zone_name_th is not None:
+            name = body.zone_name_th.strip()
+            if not name:
+                raise HTTPException(400, "ชื่อโซนต้องไม่เว้นว่าง")
+            fields["zone_name_th"] = name
+        if body.code_pattern is not None:
+            pattern = body.code_pattern.strip() or "^.+$"
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                raise HTTPException(400, f"รูปแบบรหัสใช้ไม่ได้: {e}")
+            fields["code_pattern"] = pattern
+        if body.example_code is not None:
+            fields["example_code"] = body.example_code.strip() or None
+        for flag in ("allow_multiple", "free_text", "origin_only", "no_location", "active"):
+            val = getattr(body, flag)
+            if val is not None:
+                fields[flag] = 1 if val else 0
+        if body.sort_order is not None:
+            fields["sort_order"] = int(body.sort_order)
+        if not fields:
+            return {"ok": True, "unchanged": True}
+        # A pattern that rejects its own example would make the zone
+        # unusable, and the person would only find out when someone tried to
+        # create a job.
+        final_pattern = fields.get("code_pattern", row["code_pattern"])
+        final_example = fields.get("example_code", row["example_code"])
+        free_text = fields.get("free_text", row["free_text"])
+        no_location = fields.get("no_location", row["no_location"])
+        if final_example and not free_text and not no_location:
+            if not re.compile(final_pattern, re.IGNORECASE).match(final_example):
+                raise HTTPException(400, f"ตัวอย่าง '{final_example}' ไม่ผ่านรูปแบบที่ตั้งไว้ "
+                                         f"— แก้ตัวอย่างหรือรูปแบบให้ตรงกันก่อน")
+        db.execute(f"UPDATE zones SET {', '.join(f'{k}=?' for k in fields)} WHERE zone_key=?",
+                   tuple(fields.values()) + (zone_key,))
+        audit(db, user["id"], "update_zone", f"{zone_key}: {', '.join(sorted(fields))}")
+        return {"ok": True}
+
+
 @app.delete("/zones/{zone_key}")
 def delete_zone(zone_key: str, user=Depends(require_role("ADMIN"))):
+    """Retire a zone.
+
+    A zone any task has ever used is switched off rather than removed, so the
+    history of those tasks still reads properly — the task table stores the
+    key as plain text, and deleting the row turned old jobs into raw keys
+    nobody could interpret. Only a zone nothing refers to is deleted for real.
+    """
     with get_db() as db:
-        in_use = db.execute(
+        row = db.execute("SELECT * FROM zones WHERE zone_key=?", (zone_key,)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบโซนนี้")
+        used_by_tasks = db.execute(
+            "SELECT COUNT(*) n FROM tasks WHERE from_zone=? OR to_zone=?", (zone_key, zone_key)
+        ).fetchone()["n"]
+        used_by_rules = db.execute(
             "SELECT 1 FROM task_rules WHERE from_zone=? OR to_zone=?", (zone_key, zone_key)
         ).fetchone()
-        if in_use:
-            raise HTTPException(400, "ลบไม่ได้ เพราะยังมีกฎประเภทงานอ้างอิงโซนนี้อยู่ กรุณาลบกฎที่เกี่ยวข้องก่อน")
+        if used_by_tasks or used_by_rules:
+            db.execute("UPDATE zones SET active=0 WHERE zone_key=?", (zone_key,))
+            audit(db, user["id"], "deactivate_zone", f"{zone_key} (tasks={used_by_tasks})")
+            return {"ok": True, "deactivated": True, "task_count": used_by_tasks}
         db.execute("DELETE FROM zones WHERE zone_key=?", (zone_key,))
-        db.execute("DELETE FROM vehicle_type_zones WHERE zone_key=?", (zone_key,))
         audit(db, user["id"], "delete_zone", zone_key)
-        return {"ok": True}
-
-
-@app.get("/vehicle-type-zones")
-def get_vehicle_type_zones(user=Depends(require_role("ADMIN"))):
-    with get_db() as db:
-        vehicle_types = [r["vehicle_type"] for r in db.execute(
-            "SELECT DISTINCT vehicle_type FROM vehicles WHERE retired_at IS NULL ORDER BY vehicle_type"
-        ).fetchall()]
-        zones = [dict(r) for r in db.execute("SELECT zone_key, zone_name_th FROM zones ORDER BY sort_order, id").fetchall()]
-        rows = db.execute("SELECT vehicle_type, zone_key FROM vehicle_type_zones").fetchall()
-        matrix = {}
-        for vt in vehicle_types:
-            matrix[vt] = {z["zone_key"]: False for z in zones}
-        for r in rows:
-            if r["vehicle_type"] in matrix:
-                matrix[r["vehicle_type"]][r["zone_key"]] = True
-        return {"vehicle_types": vehicle_types, "zones": zones, "matrix": matrix}
-
-
-class VehicleTypeZoneBody(BaseModel):
-    vehicle_type: str
-    zone_key: str
-    allowed: bool
-
-
-@app.post("/vehicle-type-zones")
-def set_vehicle_type_zone(body: VehicleTypeZoneBody, user=Depends(require_role("ADMIN"))):
-    with get_db() as db:
-        if body.allowed:
-            db.execute(
-                "INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) "
-                "ON CONFLICT DO NOTHING",
-                (body.vehicle_type, body.zone_key),
-            )
-        else:
-            db.execute(
-                "DELETE FROM vehicle_type_zones WHERE vehicle_type=? AND zone_key=?",
-                (body.vehicle_type, body.zone_key),
-            )
-        audit(db, user["id"], "set_vehicle_type_zone", f"{body.vehicle_type}/{body.zone_key}={body.allowed}")
-        return {"ok": True}
+        return {"ok": True, "deleted": True}
 
 
 class TaskRuleBody(BaseModel):
@@ -2488,6 +2564,21 @@ def tasks_to_dicts(rows, db, viewer_role: Optional[str] = None) -> list:
     ).fetchall()
     for a in arows:
         assignments_by_task.setdefault(a["task_id"], []).append(a)
+
+    # 1a2. Where each waiting request sits in the queue. One pass over the
+    #      waiting tasks rather than a position query per card.
+    #
+    #      Only "ขอทันที" requests count. A booking for three o'clock is also
+    #      "Waiting", and counting it would tell someone they are eighth in
+    #      line when only two requests are actually competing with them now.
+    queue_pos = {}
+    if any(d["status"] == "Waiting" for d in dicts):
+        waiting = db.execute(
+            "SELECT id FROM tasks WHERE status='Waiting' AND request_type='Request Now' "
+            "ORDER BY created_at, id"
+        ).fetchall()
+        for i, r in enumerate(waiting):
+            queue_pos[r["id"]] = i + 1
 
     # 1b. For paused tasks, the most recent hold: who raised it, which side,
     #     and what they said. One query for all of them, never per card.
@@ -2599,6 +2690,11 @@ def tasks_to_dicts(rows, db, viewer_role: Optional[str] = None) -> list:
             if a["vehicle_type"]:
                 counts[a["vehicle_type"]] = counts.get(a["vehicle_type"], 0) + 1
         d["driver_counts"] = counts
+        # 1 = next to be handed out. Absent once the job is no longer waiting,
+        # so the card simply stops showing a position rather than freezing on
+        # the last one it saw.
+        d["queue_position"] = queue_pos.get(d["id"])
+        d["queue_total"] = len(queue_pos) or None
         d["pause_info"] = pause_by_task.get(d["id"])
         out.append(d)
     return out
@@ -2618,7 +2714,7 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER"))):
         raise HTTPException(400, f"BU ไม่ถูกต้อง ต้องเป็นหนึ่งใน: {', '.join(BU_LIST)}")
     with get_db() as db:
         from_location = validate_location_string(db, body.from_zone, body.from_location)
-        to_location = validate_location_string(db, body.to_zone, body.to_location)
+        to_location = validate_location_string(db, body.to_zone, body.to_location, is_destination=True)
         task_type = infer_task_type(db, body.from_zone, body.to_zone)
         code = generate_task_code(db)
         cur = db.execute(
@@ -2664,7 +2760,8 @@ def update_task(task_id: int, body: TaskUpdate, user=Depends(require_role("USER"
             fields["from_location"] = validate_location_string(db, from_zone, fields.get("from_location", row["from_location"]))
             fields["from_zone"] = from_zone
         if "to_location" in fields or "to_zone" in fields:
-            fields["to_location"] = validate_location_string(db, to_zone, fields.get("to_location", row["to_location"]))
+            fields["to_location"] = validate_location_string(
+                db, to_zone, fields.get("to_location", row["to_location"]), is_destination=True)
             fields["to_zone"] = to_zone
         task_type = infer_task_type(db, from_zone, to_zone)
         set_clause = ", ".join(f"{k}=?" for k in fields.keys())
@@ -2916,13 +3013,10 @@ def eligibility_issues(db, driver, vehicle, task_row, vehicle_type=None) -> List
     if vehicle and vehicle["status"] == "Breakdown":
         issues.append("รถคันนี้ถูกแจ้งว่าเสีย")
 
-    from_issue = zone_capability_issue(db, vtype, task_row["from_zone"])
-    if from_issue:
-        issues.append(from_issue)
-    if task_row["to_zone"] != task_row["from_zone"]:
-        to_issue = zone_capability_issue(db, vtype, task_row["to_zone"])
-        if to_issue:
-            issues.append(to_issue)
+    # The vehicle-type/zone matrix used to be consulted here. It is gone: the
+    # type is how the dispatcher organises work, not a restriction on the job,
+    # and in practice the matrix mostly produced refusals nobody wanted — a
+    # type added later could work nowhere until someone filled in a grid.
     return issues
 
 
@@ -3043,9 +3137,13 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
 
     vtype = vehicle["vehicle_type"] if vehicle else vehicle_type
     # If this driver already has a job in hand, the new one joins their queue
-    # rather than displacing it. Reassigning is the exception: it replaces the
-    # crew on this task, so whoever lands on it takes it up straight away.
-    takes_it_up = is_reassign or not driver_active_assignment(db, driver["id"])
+    # rather than displacing it — including on a reassign. Handing a live job
+    # to someone who is mid-job elsewhere cannot make them start it this
+    # second, and marking it as though they had would have given that driver
+    # two jobs in hand at once, which the rest of the queue logic assumes can
+    # never happen. The caller puts the task back to "Assigned" when this
+    # leaves nobody actually on it.
+    takes_it_up = not driver_active_assignment(db, driver["id"])
     try:
         db.execute(
             "INSERT INTO task_assignments (task_id, driver_id, vehicle_id, assigned_vehicle_type, assigned_by, "
@@ -3177,7 +3275,20 @@ def reassign_task(task_id: int, body: AssignBody, user=Depends(require_role("ADM
                    is_reassign=True, vehicle_type=type0)
         for drv, veh, vtype, _ in resolved[1:]:
             _attach_extra_driver(db, row, drv, veh, user["id"], body.reason, vehicle_type=vtype)
-        return {"ok": True, "overridden_issues": issues if issues else None}
+        # If everyone it was handed to is mid-job elsewhere, it is theirs but
+        # nobody is on it yet. Say so rather than leaving it reading "กำลัง
+        # ดำเนินการ" with no one working it.
+        queued_only = not task_has_active_worker(db, task_id)
+        if queued_only and row["status"] == "In Progress":
+            db.execute("UPDATE tasks SET status='Assigned' WHERE id=?", (task_id,))
+            db.execute(
+                "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
+                "VALUES (?,?,?,?,?)", (task_id, "In Progress", "Assigned", user["id"], now_iso()),
+            )
+            post_system_message(db, task_id, user["id"],
+                                "มอบหมายใหม่แล้ว — อยู่ในคิวของคนขับ จะเริ่มเมื่อเขาทำงานปัจจุบันเสร็จ")
+        return {"ok": True, "overridden_issues": issues if issues else None,
+                "queued": queued_only}
 
 
 @app.post("/tasks/{task_id}/make-active")
@@ -3763,12 +3874,76 @@ def get_task_messages(task_id: int, user=Depends(current_user)):
             raise HTTPException(404, "ไม่พบงานนี้")
         if not task_chat_allowed(db, row, user):
             raise HTTPException(403, "คุณไม่ได้อยู่ในห้องแชทของงานนี้")
+        # sender_name was never selected here, even though the chat renderer
+        # already read it — so it was always undefined and every line fell
+        # back to the employee id. The team chat had it; this one didn't.
         rows = db.execute(
-            "SELECT task_messages.*, users.employee_id AS sender_employee_id, users.role AS sender_role "
+            "SELECT task_messages.*, users.employee_id AS sender_employee_id, "
+            "users.role AS sender_role, users.full_name AS sender_full_name, "
+            "users.first_name AS sender_first_name "
             "FROM task_messages JOIN users ON users.id = task_messages.sender_id "
             "WHERE task_id=? ORDER BY created_at, task_messages.id", (task_id,)
         ).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["sender_name"] = ((r["sender_full_name"] or "").strip()
+                                or (r["sender_first_name"] or "").strip()
+                                or r["sender_employee_id"])
+            out.append(d)
+        return out
+
+
+@app.get("/tasks/{task_id}/people")
+def get_task_people(task_id: int, user=Depends(current_user)):
+    """Everyone in this job's chat, with the details needed to reach them.
+
+    Loaded once when the chat opens rather than attached to every message:
+    a chat of fifty lines would otherwise repeat the same phone number fifty
+    times, on every poll.
+    """
+    with get_db() as db:
+        row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบงานนี้")
+        if not task_chat_allowed(db, row, user):
+            raise HTTPException(403, "คุณไม่ได้อยู่ในห้องแชทของงานนี้")
+        ids = set()
+        if row["requester_id"]:
+            ids.add(row["requester_id"])
+        for r in db.execute(
+            "SELECT DISTINCT driver_id FROM task_assignments WHERE task_id=?", (task_id,)
+        ).fetchall():
+            ids.add(r["driver_id"])
+        # Anyone who has spoken in the chat — an admin who stepped in, a
+        # driver who has since left the job — so tapping their name works.
+        for r in db.execute(
+            "SELECT DISTINCT sender_id FROM task_messages WHERE task_id=?", (task_id,)
+        ).fetchall():
+            ids.add(r["sender_id"])
+        ids.discard(None)
+        if not ids:
+            return []
+        rows = db.execute(
+            "SELECT id, employee_id, full_name, first_name, role, cost_center, contact, email "
+            f"FROM users WHERE id IN ({_placeholders(len(ids))})", tuple(ids),
+        ).fetchall()
+        crew = {r["driver_id"] for r in db.execute(
+            "SELECT driver_id FROM task_assignments WHERE task_id=? AND assignment_status='Active'",
+            (task_id,)).fetchall()}
+        out = []
+        for r in rows:
+            out.append({
+                "employee_id": r["employee_id"],
+                "full_name": (r["full_name"] or "").strip() or r["employee_id"],
+                "role": r["role"],
+                "cost_center": r["cost_center"],
+                "contact": r["contact"],
+                "email": r["email"],
+                "is_requester": r["id"] == row["requester_id"],
+                "is_crew": r["id"] in crew,
+            })
+        return out
 
 
 @app.post("/tasks/{task_id}/messages")
@@ -3999,11 +4174,6 @@ def dispatch_board(user=Depends(require_role("ADMIN"))):
     """
     with get_db() as db:
         # --- reference data, once ---------------------------------------
-        zone_types = {}          # zone_key -> set(vehicle_type)
-        for r in db.execute("SELECT vehicle_type, zone_key FROM vehicle_type_zones").fetchall():
-            zone_types.setdefault(r["zone_key"], set()).add(r["vehicle_type"])
-        zone_names = {r["zone_key"]: r["zone_name_th"]
-                      for r in db.execute("SELECT zone_key, zone_name_th FROM zones").fetchall()}
         licences = {}            # driver_id -> set(vehicle_type)
         for r in db.execute("SELECT driver_id, vehicle_type FROM driver_licenses").fetchall():
             licences.setdefault(r["driver_id"], set()).add(r["vehicle_type"])
@@ -4070,9 +4240,6 @@ def dispatch_board(user=Depends(require_role("ADMIN"))):
             vt = d["vehicle_type"]
             if vt not in (d["licenses"] or []):
                 out.append(f"ไม่มีใบอนุญาตรถ {vt}")
-            for zone in {t["from_zone"], t["to_zone"]}:
-                if vt not in zone_types.get(zone, set()):
-                    out.append(f"รถ {vt} เข้าโซน{zone_names.get(zone, zone)}ไม่ได้")
             return out
 
         board = []
@@ -4194,9 +4361,6 @@ def create_vehicle_type(body: VehicleTypeCreate, user=Depends(require_role("ADMI
             check_invite_code_unique(db, code)
         db.execute("INSERT INTO vehicle_types (type_key, type_name_th, description, invite_code) "
                    "VALUES (?,?,?,?)", (key, body.type_name_th, body.description, code))
-        for z in db.execute("SELECT zone_key FROM zones").fetchall():
-            db.execute("INSERT INTO vehicle_type_zones (vehicle_type, zone_key) VALUES (?,?) "
-                       "ON CONFLICT DO NOTHING", (key, z["zone_key"]))
         audit(db, user["id"], "create_vehicle_type", f"{key} invite={'set' if code else '-'}")
         return {"ok": True, "invite_code": code}
 
@@ -4245,7 +4409,6 @@ def delete_vehicle_type(type_key: str, user=Depends(require_role("ADMIN"))):
             raise HTTPException(400, f"ลบไม่ได้ เพราะยังมีรถที่ใช้ประเภทนี้อยู่ {live} คัน "
                                      f"(ปลดระวางรถทั้งหมดก่อน)")
         db.execute("DELETE FROM vehicle_types WHERE type_key=?", (type_key,))
-        db.execute("DELETE FROM vehicle_type_zones WHERE vehicle_type=?", (type_key,))
         # Licences for a type that no longer exists would keep counting toward
         # what a driver may operate.
         db.execute("DELETE FROM driver_licenses WHERE vehicle_type=?", (type_key,))
