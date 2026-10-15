@@ -388,6 +388,22 @@
   /* A queued job's position, in place of the status chip: on the driver's own
      screen "ลำดับที่ 2" answers the question they actually have, where the
      status (which is just "มอบหมายแล้ว" for every queued job) does not. */
+  /* Where a waiting request sits in line. Sits under the card header, above
+     the route, because it is the thing the requester opens the app to check. */
+  .wait-line{font-size:12px;color:var(--ink-dim);background:var(--panel-2);
+    border-radius:8px;padding:7px 10px;margin:8px 0 2px;}
+  .wait-line b{color:var(--amber);font-size:13px;}
+  /* A sender's name in the chat: readable as a name, tappable as a link. */
+  .chat-msg .who-link{color:inherit;text-decoration:underline;text-decoration-style:dotted;
+    text-underline-offset:2px;}
+  .chat-msg .who-role{opacity:.75;font-weight:500;}
+  .zone-row{padding:10px 0;border-bottom:1px solid var(--line);}
+  .zone-row:last-child{border-bottom:none;}
+  /* A switched-off zone is still listed so it can be switched back on, but it
+     should not read as something people can pick. */
+  .zone-row.is-off{opacity:.55;}
+  .zone-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;}
+  .btn.sm:disabled{opacity:.35;cursor:not-allowed;}
   .queue-chip{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;
     background:var(--panel-2);border:1px solid var(--line);color:var(--ink-dim);white-space:nowrap;}
 
@@ -1554,7 +1570,7 @@ function offerRegistration(identifier){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>ยังไม่มีบัญชีนี้</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>ยังไม่มีบัญชีนี้</h2><button class="sheet-close">✕</button></div>
         <div class="field-note" style="line-height:1.6;">
           ไม่พบบัญชีที่ใช้${what} <b>${identifier}</b> ในระบบ<br>
           ต้องการสมัครสมาชิกด้วย${what}นี้หรือไม่
@@ -1565,7 +1581,7 @@ function offerRegistration(identifier){
     </div>`);
   document.body.appendChild(overlay);
   const close = ()=> closeSheet(overlay);
-  overlay.querySelector("#sh-close").onclick = close;
+  overlay.querySelector(".sheet-close").onclick = close;
   overlay.querySelector("#or-cancel").onclick = close;
   overlay.onclick = (e)=>{ if(e.target === overlay) close(); };
   overlay.querySelector("#or-go").onclick = ()=>{ close(); renderRegister(guess); };
@@ -1928,6 +1944,10 @@ function markActiveTab(){
 async function renderContent(){
   markActiveTab();
   const main = document.getElementById("main");
+  // No shell on screen (login, or the install page) — nothing to draw into.
+  // A refresh triggered from a sheet could otherwise throw here and abort
+  // whatever else that handler was doing.
+  if(!main) return;
   const scrollY = window.scrollY;
   main.innerHTML = "";
   // The guide is the same screen for everyone, differing only in which role's
@@ -1948,7 +1968,8 @@ async function renderContent(){
 // dangling divider.
 // Who put a job on hold, from which side, and why — the three things anyone
 // looking at a stopped job needs before they can do anything about it.
-const PAUSE_ROLE_TH = {DRIVER: "คนขับ", USER: "ผู้ขอ", ADMIN: "แอดมิน"};
+const ROLE_TH = {DRIVER: "คนขับ", USER: "ผู้ขอ", ADMIN: "แอดมิน"};
+const PAUSE_ROLE_TH = ROLE_TH;   // same map; kept under the old name too
 
 function pauseLine(t){
   const p = t.pause_info;
@@ -2036,6 +2057,10 @@ function taskCard(t, actionsHtml, opts={}){
           ? `<span class="queue-chip">คิวที่ ${opts.queuePos}</span>`
           : `<span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span>`}
       </div>
+      ${t.status === "Waiting" && t.queue_position
+        ? `<div class="wait-line">รออยู่ลำดับที่ <b>${t.queue_position}</b>${
+             t.queue_total > 1 ? ` จาก ${t.queue_total} คำขอที่รออยู่` : ""}</div>`
+        : ""}
       ${t.blocked_reason ? `<div class="blocked-banner">⚠️ ถูกตีกลับ: ${t.blocked_reason}</div>` : ""}
       ${pauseBannerHTML(t)}
       <div class="route">${t.from_location}<span class="arrow">→</span>${t.to_location}
@@ -2232,7 +2257,7 @@ function openRatingSheet(taskId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>ให้คะแนนงานนี้</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>ให้คะแนนงานนี้</h2><button class="sheet-close">✕</button></div>
         <div id="rt-stars" class="star-row">
           ${[1,2,3,4,5].map(n=>`<button type="button" class="star" data-n="${n}" aria-label="${n} ดาว">☆</button>`).join("")}
         </div>
@@ -2245,7 +2270,7 @@ function openRatingSheet(taskId){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const starsEl = overlay.querySelector("#rt-stars");
   const commentWrap = overlay.querySelector("#rt-comment-wrap");
@@ -2362,9 +2387,12 @@ function buildLocationPicker(container, zones, initial){
       });
       drawChips();
       body.appendChild(row); body.appendChild(hint); body.appendChild(chipRow);
-    } else if(zk === "SORT_YARD"){
-      singleValue = "ลาน Sort";
-      body.appendChild(el(`<div class="field-note">จุดเดียว ไม่ต้องเลือกเพิ่ม</div>`));
+    } else if(currentZone.no_location){
+      // The zone is the whole answer — the sort yard, a pallet pick-up. Used
+      // to be a branch hard-coded on SORT_YARD; it is a zone flag now, so an
+      // admin can give a new zone the same behaviour without a deploy.
+      singleValue = currentZone.zone_name_th;
+      body.appendChild(el(`<div class="field-note">จุดเดียว ไม่ต้องระบุตำแหน่งเพิ่ม</div>`));
     } else if(zk === "MEZZANINE"){
       const s1 = el("<select></select>");
       for(let i=1;i<=4;i++) s1.appendChild(new Option("ชั้น "+i, i));
@@ -2487,6 +2515,12 @@ function buildLocationPicker(container, zones, initial){
   renderBody();
 }
 
+// Zones that may be a job's destination. Empty pallets are collected, never
+// delivered, so offering the zone there only produced a refusal on submit.
+function destinationZones(zones){
+  return (zones || []).filter(z=> !z.origin_only);
+}
+
 function displayZoneValue(zones, val){
   if(!val || !val.value) return null;
   const z = zones.find(x=> x.zone_key === val.zone);
@@ -2497,14 +2531,14 @@ function openLocationPickerPopup(title, zones, initial, onConfirm){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>${title}</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>${title}</h2><button class="sheet-close">✕</button></div>
         <div id="lp-picker-wrap"></div>
         <button class="primary" id="lp-confirm">ยืนยันจุดนี้</button>
       </div>
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const wrap = overlay.querySelector("#lp-picker-wrap");
   const confirmBtn = overlay.querySelector("#lp-confirm");
@@ -2539,7 +2573,7 @@ function openCreateTask(prefill){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>สร้างงานใหม่</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>สร้างงานใหม่</h2><button class="sheet-close">✕</button></div>
         <label>ประเภทคำขอ</label>
         <select id="ct-type"><option value="Request Now">ขอทันที</option><option value="Booking">จองล่วงหน้า</option></select>
         <div id="ct-booking-wrap" style="display:none;">
@@ -2569,7 +2603,7 @@ function openCreateTask(prefill){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#ct-type").onchange = (e)=>{
     overlay.querySelector("#ct-booking-wrap").style.display = e.target.value === "Booking" ? "block" : "none";
@@ -2598,7 +2632,7 @@ function openCreateTask(prefill){
   };
   toBtn.onclick = async ()=>{
     const zones = await ensureZones();
-    openLocationPickerPopup("จุดปลายทาง", zones, toValue, (val)=>{
+    openLocationPickerPopup("จุดปลายทาง", destinationZones(zones), toValue, (val)=>{
       toValue = val;
       toBtn.textContent = displayZoneValue(zones, val);
     });
@@ -2653,7 +2687,7 @@ function openEditTask(taskId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>แก้ไขงาน ${t.task_code}</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>แก้ไขงาน ${t.task_code}</h2><button class="sheet-close">✕</button></div>
         <div class="field-note">แก้ไขได้เฉพาะขณะสถานะ "รอดำเนินการ" เท่านั้น</div>
         ${isBooking ? `<label>วันเวลานัดหมาย</label><input id="et-scheduled" type="datetime-local" value="${(t.scheduled_at||'').slice(0,16)}" />` : ""}
         <div class="grid2">
@@ -2676,7 +2710,7 @@ function openEditTask(taskId){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   let fromValue = {zone: t.from_zone, value: t.from_location};
@@ -2701,7 +2735,7 @@ function openEditTask(taskId){
   };
   toBtn.onclick = async ()=>{
     const zones = await ensureZones();
-    openLocationPickerPopup("จุดปลายทาง", zones, toValue, (val)=>{
+    openLocationPickerPopup("จุดปลายทาง", destinationZones(zones), toValue, (val)=>{
       toValue = val;
       toBtn.textContent = displayZoneValue(zones, val);
     });
@@ -2730,14 +2764,14 @@ function openPhotoUpload(taskId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>เพิ่มรูปภาพ</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>เพิ่มรูปภาพ</h2><button class="sheet-close">✕</button></div>
         <input type="file" id="ph-file" accept="image/*" />
         <button class="primary" id="ph-submit">อัปโหลด</button>
       </div>
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#ph-submit").onclick = async ()=>{
     const file = overlay.querySelector("#ph-file").files[0];
@@ -3249,7 +3283,7 @@ function openDriverStatusSheet(){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>ปรับสถานะของฉัน</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>ปรับสถานะของฉัน</h2><button class="sheet-close">✕</button></div>
         <div class="grid2">
           ${["Available","Busy","Pause","Breakdown"].map(s=>`<button class="btn" data-st="${s}" style="padding:14px;">${DRIVER_STATUS_LABEL[s]}</button>`).join("")}
         </div>
@@ -3257,7 +3291,7 @@ function openDriverStatusSheet(){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelectorAll("[data-st]").forEach(b=>{
     b.onclick = async ()=>{
@@ -3276,7 +3310,7 @@ function openVehicleCheckSheet(opts={}){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>เช็คอิน / เช็คเอาท์รถ</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>เช็คอิน / เช็คเอาท์รถ</h2><button class="sheet-close">✕</button></div>
         <div class="field-note" style="margin-bottom:10px;">${
           opts.reason ? opts.reason
           : meVehicle ? 'รถปัจจุบัน: <b>'+meVehicle.code+'</b>'
@@ -3291,7 +3325,7 @@ function openVehicleCheckSheet(opts={}){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   let picked = null;
   (async ()=>{
@@ -3335,14 +3369,14 @@ function openAdminSearchSheet(){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>ค้นหา</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>ค้นหา</h2><button class="sheet-close">✕</button></div>
         <input id="admin-search-input" placeholder="พิมพ์รหัสงาน / ชื่อคน / รหัสรถ..." autofocus />
         <div id="admin-search-results" style="margin-top:14px;"></div>
       </div>
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const input = overlay.querySelector("#admin-search-input");
   const results = overlay.querySelector("#admin-search-results");
@@ -3417,13 +3451,13 @@ function openChatMenuSheet(){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>แชททั้งหมด</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>แชททั้งหมด</h2><button class="sheet-close">✕</button></div>
         <div class="card" id="chat-menu-list"></div>
       </div>
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const list = overlay.querySelector("#chat-menu-list");
   const teamRow = el(`<div class="list-row" style="cursor:pointer;"><span>💬 <b>แชททีม</b></span><span class="field-note">Admin + คนขับ</span></div>`);
@@ -3494,14 +3528,14 @@ function openBatterySheet(taskId, mode){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>${title}</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>${title}</h2><button class="sheet-close">✕</button></div>
         <div class="field-note">จะใช้รถคันที่คุณเช็คอินไว้โดยอัตโนมัติ</div>
         <button class="primary" id="bt-submit">ยืนยัน</button>
       </div>
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#bt-submit").onclick = async ()=>{
     const endpoint = mode === "self-assign" ? `/tasks/${taskId}/self-assign`
@@ -3535,7 +3569,7 @@ function openPauseSheet(taskId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>แจ้งปัญหา</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>แจ้งปัญหา</h2><button class="sheet-close">✕</button></div>
         ${canReportVehicle ? `<label>สาเหตุมาจาก</label>
         <div class="grid2">
           <button class="btn amber" id="ps-cat-user" style="padding:12px;">ฝั่งผู้ขอ (พื้นที่/ของ)</button>
@@ -3550,7 +3584,7 @@ function openPauseSheet(taskId){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   function renderChips(){
@@ -4149,7 +4183,7 @@ function openSendBackSheet(taskId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>ตีกลับงานให้ผู้ขอ</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>ตีกลับงานให้ผู้ขอ</h2><button class="sheet-close">✕</button></div>
         <div class="field-note">งานจะกลับไปให้ User แก้ไขและกดส่งใหม่เอง</div>
         <label>เหตุผลที่ใกล้เคียง</label>
         <div class="chip-row" id="sb-chips"></div>
@@ -4160,7 +4194,7 @@ function openSendBackSheet(taskId){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const chipBox = overlay.querySelector("#sb-chips");
   SEND_BACK_PRESETS.forEach(p=>{
@@ -4184,7 +4218,7 @@ function openPrioritySheet(taskId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>เปลี่ยนความสำคัญ</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>เปลี่ยนความสำคัญ</h2><button class="sheet-close">✕</button></div>
         <div class="grid3">
           ${["Low","Normal","High"].map(p=>`<button class="btn sm" data-p="${p}" style="padding:12px 0;">${PRIORITY_LABEL[p]}</button>`).join("")}
         </div>
@@ -4192,7 +4226,7 @@ function openPrioritySheet(taskId){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelectorAll("[data-p]").forEach(b=>{
     b.onclick = async ()=>{
@@ -4210,7 +4244,7 @@ function openVehicleEditSheet(vehicleId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>แก้ไขรถ ${v.code}</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>แก้ไขรถ ${v.code}</h2><button class="sheet-close">✕</button></div>
         <label>ประเภทรถ</label>
         <input id="ve-type" value="${v.vehicle_type}" />
         <button class="primary" id="ve-submit">บันทึก</button>
@@ -4218,7 +4252,7 @@ function openVehicleEditSheet(vehicleId){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#ve-submit").onclick = async ()=>{
     try{
@@ -4319,7 +4353,7 @@ async function openAssignSheet(taskId, isReassign){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>${before.size ? "แก้ไขการมอบหมาย" : "มอบหมายงาน"}</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>${before.size ? "แก้ไขการมอบหมาย" : "มอบหมายงาน"}</h2><button class="sheet-close">✕</button></div>
 
         <div class="as-detail">
           <div class="as-code">${t.task_code || ""} <span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status || ""}</span></div>
@@ -4365,7 +4399,7 @@ async function openAssignSheet(taskId, isReassign){
       </div>
     </div>`);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   const submitBtn = overlay.querySelector("#as-submit");
@@ -4563,7 +4597,7 @@ function openCreateDriverSheet(){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>เพิ่มพนักงานใหม่ (คนขับ)</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>เพิ่มพนักงานใหม่ (คนขับ)</h2><button class="sheet-close">✕</button></div>
         <div class="field-note">ถ้าพนักงานสมัครสมาชิกเป็น User ไว้แล้ว ให้ใช้ "แก้ไข" ในหน้ารายชื่อเพื่อ Promote เป็น Driver แทน — ฟอร์มนี้สำหรับสร้างบัญชีใหม่ตั้งแต่ต้นเท่านั้น</div>
         <label>รหัสพนักงาน</label><input id="nd-emp" placeholder="driver004" />
         <label>ชื่อ-นามสกุล</label><input id="nd-name" placeholder="เช่น วิชัย ขยัน" />
@@ -4578,7 +4612,7 @@ function openCreateDriverSheet(){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#nd-submit").onclick = async ()=>{
     const types = Array.from(overlay.querySelectorAll('input[type=checkbox]:checked')).map(c=>c.value);
@@ -4675,7 +4709,7 @@ function openCreateVehicleSheet(){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>เพิ่มรถใหม่</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>เพิ่มรถใหม่</h2><button class="sheet-close">✕</button></div>
         <div class="grid2">
           <div><label>รหัสรถ</label><input id="nv-code" placeholder="RT-003" /></div>
           <div><label>ประเภทรถ</label><select id="nv-type">${state.vehicleTypes.map(vt=>`<option value="${vt.type_key}">${vt.type_name_th}</option>`).join("")}</select></div>
@@ -4685,7 +4719,7 @@ function openCreateVehicleSheet(){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#nv-submit").onclick = async ()=>{
     try{
@@ -4743,7 +4777,7 @@ function openResolveBreakdownSheet(breakdownId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>ทำเครื่องหมายว่าแก้ไขแล้ว</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>ทำเครื่องหมายว่าแก้ไขแล้ว</h2><button class="sheet-close">✕</button></div>
         <label>บันทึกวิธีแก้ไข (ไม่บังคับ — ผู้แจ้งจะเห็นข้อความนี้ในแจ้งเตือน)</label>
         <textarea id="rb-note" rows="3" placeholder="เช่น เปลี่ยนแบตเตอรี่ใหม่แล้ว"></textarea>
         <button class="primary" id="rb-submit">ยืนยันว่าแก้ไขแล้ว</button>
@@ -4751,7 +4785,7 @@ function openResolveBreakdownSheet(breakdownId){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#rb-submit").onclick = async ()=>{
     try{
@@ -4793,7 +4827,7 @@ function openUserEditSheet(userId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>${u.full_name || u.employee_id}</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>${u.full_name || u.employee_id}</h2><button class="sheet-close">✕</button></div>
 
         <div class="section-title" style="margin-top:0;">ข้อมูลส่วนตัว</div>
         <div class="card" style="padding:12px 14px;">
@@ -4841,7 +4875,7 @@ function openUserEditSheet(userId){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   overlay.querySelector("#ue-role").onchange = (e)=>{
@@ -4941,12 +4975,94 @@ function openUserEditSheet(userId){
   };
 }
 
+const ADMIN_SETTINGS_SUBTABS = ["system", "zones", "vehicletypes", "audit"];
+
+// Editing a zone in place. The key is shown but locked: tasks store it as
+// plain text and four zones have their own picker keyed on it, so changing it
+// would orphan history and silently drop the custom picker.
+function openZoneEditSheet(zoneKey){
+  const z = (state.zones || []).find(x=> x.zone_key === zoneKey);
+  if(!z) return;
+  const overlay = el(`
+    <div class="sheet-overlay">
+      <div class="sheet">
+        <div class="sheet-head"><h2>แก้ไขโซน</h2><button class="sheet-close">✕</button></div>
+        <div class="card" style="padding:12px 14px;">
+          <div class="as-d"><span>รหัสโซน</span><b class="mono">${z.zone_key}</b></div>
+          <div class="field-note" style="margin-top:6px;line-height:1.6;">
+            รหัสโซนแก้ไม่ได้ เพราะงานทุกงานที่เคยสร้างอ้างอิงรหัสนี้อยู่
+            ถ้าเปลี่ยน ประวัติงานเก่าจะอ่านไม่ออก — แก้ที่ชื่อโซนด้านล่างได้เลย
+          </div>
+        </div>
+        <label for="ze-name">ชื่อโซน (ไทย)</label>
+        <input id="ze-name" value="${z.zone_name_th}" />
+        <label for="ze-pattern">รูปแบบรหัส (regular expression)</label>
+        <input id="ze-pattern" class="mono" value="${z.code_pattern}" />
+        <label for="ze-example">ตัวอย่างรหัสที่ถูกต้อง</label>
+        <input id="ze-example" value="${z.example_code || ''}" />
+        <div class="field-note">ระบบจะเช็คว่าตัวอย่างนี้ผ่านรูปแบบที่ตั้งไว้ ก่อนบันทึก</div>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:12px;">
+          <input type="checkbox" id="ze-multi" style="width:auto;" ${z.allow_multiple ? "checked" : ""} /> เลือกได้หลายจุดในงานเดียว
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="ze-free" style="width:auto;" ${z.free_text ? "checked" : ""} /> พิมพ์อิสระ (ไม่ตรวจรูปแบบ)
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="ze-origin" style="width:auto;" ${z.origin_only ? "checked" : ""} /> เลือกได้เฉพาะจุดต้นทาง
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="ze-noloc" style="width:auto;" ${z.no_location ? "checked" : ""} /> ไม่ต้องระบุตำแหน่ง (กดโซนแล้วบันทึกเลย)
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="ze-active" style="width:auto;" ${z.active ? "checked" : ""} /> เปิดใช้งาน (ให้เลือกได้ตอนสร้างงาน)
+        </label>
+        <button class="primary" id="ze-submit">บันทึก</button>
+        <button class="btn red" id="ze-off" style="width:100%;margin-top:8px;">ปิดใช้งานโซนนี้</button>
+        <div class="field-note" style="margin-top:6px;line-height:1.6;">
+          ปิดใช้งานแล้วโซนจะหายจากเมนูเลือกจุด แต่ประวัติงานที่เคยใช้โซนนี้ยังอ่านออกครบ
+          (โซนที่ไม่มีงานไหนอ้างอิงเลย ระบบจะลบทิ้งให้จริง)
+        </div>
+      </div>
+    </div>`);
+  document.body.appendChild(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
+  overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
+  overlay.querySelector("#ze-submit").onclick = async ()=>{
+    try{
+      await api(`/zones/${zoneKey}`, {method:"PUT", body: JSON.stringify({
+        zone_name_th: overlay.querySelector("#ze-name").value,
+        code_pattern: overlay.querySelector("#ze-pattern").value,
+        example_code: overlay.querySelector("#ze-example").value,
+        allow_multiple: overlay.querySelector("#ze-multi").checked,
+        free_text: overlay.querySelector("#ze-free").checked,
+        origin_only: overlay.querySelector("#ze-origin").checked,
+        no_location: overlay.querySelector("#ze-noloc").checked,
+        active: overlay.querySelector("#ze-active").checked,
+      })});
+      toast("บันทึกโซนแล้ว");
+      closeSheet(overlay);
+      await refreshAll();
+    }catch(e){ toast(e.message); }
+  };
+  overlay.querySelector("#ze-off").onclick = async ()=>{
+    if(!confirm(`ปิดใช้งานโซน ${z.zone_name_th}?\n\nจะหายจากเมนูเลือกจุด แต่ประวัติงานเก่ายังอยู่ครบ`)) return;
+    try{
+      const r = await api(`/zones/${zoneKey}`, {method:"DELETE"});
+      toast(r.deleted ? "ลบโซนแล้ว (ไม่มีงานไหนอ้างอิง)" : `ปิดใช้งานแล้ว (มี ${r.task_count} งานอ้างอิงอยู่)`);
+      closeSheet(overlay);
+      await refreshAll();
+    }catch(e){ toast(e.message); }
+  };
+}
+
 function renderAdminSettings(main){
-  if(!state.subtab) setTab(state.tab, "system");
+  // "matrix" used to be one of these. Someone whose last-used subtab was that
+  // one has it in localStorage, so without this they would come back to a
+  // blank page after the update.
+  if(!ADMIN_SETTINGS_SUBTABS.includes(state.subtab)) setTab(state.tab, "system");
   const subtabs = el(`<div class="subtabs">
     <button data-s="system">ตั้งค่าระบบ</button>
     <button data-s="zones">โซน</button>
-    <button data-s="matrix">เมทริกซ์รถ-โซน</button>
     <button data-s="vehicletypes">ประเภทรถ</button>
     <button data-s="audit">บันทึกตรวจสอบ</button>
   </div>`);
@@ -4967,7 +5083,9 @@ function renderAdminSettings(main){
       let cfg;
       try{ cfg = await api("/admin/config", {background:true}); }
       catch(e){ box.innerHTML = ""; box.appendChild(el(`<div class="err">${e.message}</div>`)); return; }
-      const v = cfg.values;
+      // A response without `values` would otherwise throw halfway through
+      // building the form and leave the whole settings page blank.
+      const v = (cfg && cfg.values) || {};
       box.innerHTML = "";
 
       // Invite codes used to be two fixed fields here, which left any vehicle
@@ -5085,21 +5203,50 @@ function renderAdminSettings(main){
     main.appendChild(el(`<div class="section-title">โซนทั้งหมด</div>`));
     main.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">ไม่ต้องสร้างรหัสตำแหน่งทีละอัน — กำหนดแค่รูปแบบ (pattern) ของโซน ระบบจะตรวจสอบรหัสที่พิมพ์เข้ามาอัตโนมัติ</div>`));
     const list = el(`<div class="card"></div>`);
-    state.zones.forEach(z=>{
-      list.appendChild(el(`<div class="list-row">
-        <div><div class="l-main">${z.zone_name_th} <span class="field-note">(${z.zone_key})</span></div>
-          <div class="l-sub mono">${z.code_pattern} ${z.allow_multiple ? '· เลือกได้หลายจุด' : ''}</div></div>
-        <button class="btn sm red" data-del-zone="${z.zone_key}">ลบ</button>
+    const zonesSorted = (state.zones || []).slice()
+      .sort((a,b)=> (a.sort_order - b.sort_order) || (a.id - b.id));
+    zonesSorted.forEach((z, i)=>{
+      const tags = [
+        z.allow_multiple ? "เลือกได้หลายจุด" : "",
+        z.free_text ? "พิมพ์อิสระ" : "",
+        z.origin_only ? "ต้นทางเท่านั้น" : "",
+        z.no_location ? "ไม่ต้องระบุจุด" : "",
+      ].filter(Boolean).join(" · ");
+      list.appendChild(el(`<div class="zone-row${z.active ? "" : " is-off"}">
+        <div class="zone-head">
+          <div>
+            <div class="l-main">${z.zone_name_th}
+              <span class="field-note">(${z.zone_key})</span>
+              ${z.active ? "" : `<span class="badge">ปิดใช้งาน</span>`}</div>
+            <div class="l-sub mono">${z.no_location ? "—" : z.code_pattern}${tags ? " · " + tags : ""}</div>
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <button class="btn sm" data-zone-up="${z.zone_key}" ${i === 0 ? "disabled" : ""} title="เลื่อนขึ้น">↑</button>
+            <button class="btn sm" data-zone-down="${z.zone_key}" ${i === zonesSorted.length - 1 ? "disabled" : ""} title="เลื่อนลง">↓</button>
+            <button class="btn sm amber" data-zone-edit="${z.zone_key}">แก้ไข</button>
+          </div>
+        </div>
       </div>`));
     });
     main.appendChild(list);
-    list.querySelectorAll("[data-del-zone]").forEach(b=>{
-      b.onclick = async ()=>{
-        if(!confirm("ยืนยันลบโซนนี้?")) return;
-        try{ await api(`/zones/${b.dataset.delZone}`, {method:"DELETE"}); toast("ลบโซนแล้ว"); await refreshAll(); }
-        catch(e){ toast(e.message); }
-      };
+    list.querySelectorAll("[data-zone-edit]").forEach(b=>{
+      b.onclick = ()=> openZoneEditSheet(b.dataset.zoneEdit);
     });
+    // Reordering by swapping sort_order with the neighbour, so the list the
+    // requester sees can be put in the order they actually walk the warehouse.
+    const move = async (key, dir)=>{
+      const i = zonesSorted.findIndex(z=> z.zone_key === key);
+      const j = i + dir;
+      if(i < 0 || j < 0 || j >= zonesSorted.length) return;
+      const a = zonesSorted[i], bz = zonesSorted[j];
+      try{
+        await api(`/zones/${a.zone_key}`, {method:"PUT", body: JSON.stringify({sort_order: bz.sort_order})});
+        await api(`/zones/${bz.zone_key}`, {method:"PUT", body: JSON.stringify({sort_order: a.sort_order})});
+        await refreshAll();
+      }catch(e){ toast(e.message); }
+    };
+    list.querySelectorAll("[data-zone-up]").forEach(b=> b.onclick = ()=> move(b.dataset.zoneUp, -1));
+    list.querySelectorAll("[data-zone-down]").forEach(b=> b.onclick = ()=> move(b.dataset.zoneDown, 1));
     main.appendChild(el(`<div class="section-title">เพิ่มโซนใหม่</div>`));
     const form = el(`<div class="card">
       <div class="grid2">
@@ -5114,6 +5261,15 @@ function renderAdminSettings(main){
       <label style="display:flex;align-items:center;gap:8px;margin-top:12px;">
         <input type="checkbox" id="zn-multi" style="width:auto;" /> เลือกได้หลายจุดในงานเดียว
       </label>
+      <label style="display:flex;align-items:center;gap:8px;">
+        <input type="checkbox" id="zn-free" style="width:auto;" /> พิมพ์อิสระ (ไม่ตรวจรูปแบบ)
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;">
+        <input type="checkbox" id="zn-origin" style="width:auto;" /> เลือกได้เฉพาะจุดต้นทาง
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;">
+        <input type="checkbox" id="zn-noloc" style="width:auto;" /> ไม่ต้องระบุตำแหน่ง (กดโซนแล้วบันทึกเลย)
+      </label>
       <button class="primary" id="zn-submit">เพิ่มโซน</button>
     </div>`);
     form.querySelector("#zn-submit").onclick = async ()=>{
@@ -5123,46 +5279,15 @@ function renderAdminSettings(main){
           zone_name_th: form.querySelector("#zn-name").value.trim(),
           code_pattern: form.querySelector("#zn-pattern").value.trim(),
           allow_multiple: form.querySelector("#zn-multi").checked,
+          free_text: form.querySelector("#zn-free").checked,
+          origin_only: form.querySelector("#zn-origin").checked,
+          no_location: form.querySelector("#zn-noloc").checked,
           example_code: form.querySelector("#zn-example").value.trim(),
         })});
         toast("เพิ่มโซนแล้ว"); await refreshAll();
       }catch(e){ toast(e.message); }
     };
     main.appendChild(form);
-  } else if(state.subtab === "matrix"){
-    main.appendChild(el(`<div class="section-title">ประเภทรถไหนทำงานโซนไหนได้บ้าง</div>`));
-    const card = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-    main.appendChild(card);
-    (async ()=>{
-      try{
-        const data = await api("/vehicle-type-zones", {background:true});
-        card.innerHTML = "";
-        const table = el(`<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12.5px;">
-          <thead><tr><th style="text-align:left;padding:6px;"></th>
-            ${data.zones.map(z=>`<th style="padding:6px;text-align:center;font-weight:600;">${z.zone_name_th}</th>`).join("")}
-          </tr></thead>
-          <tbody>
-            ${data.vehicle_types.map(vt=>`<tr>
-              <td style="padding:6px;font-weight:700;">${vt}</td>
-              ${data.zones.map(z=>`<td style="padding:6px;text-align:center;">
-                <input type="checkbox" data-vt="${vt}" data-zk="${z.zone_key}" ${data.matrix[vt][z.zone_key] ? "checked" : ""} style="width:26px;height:26px;" />
-              </td>`).join("")}
-            </tr>`).join("")}
-          </tbody>
-        </table></div>`);
-        table.querySelectorAll("input[type=checkbox]").forEach(cb=>{
-          cb.onchange = async ()=>{
-            try{
-              await api("/vehicle-type-zones", {method:"POST", body: JSON.stringify({
-                vehicle_type: cb.dataset.vt, zone_key: cb.dataset.zk, allowed: cb.checked,
-              })});
-              toast("บันทึกแล้ว");
-            }catch(e){ toast(e.message); cb.checked = !cb.checked; }
-          };
-        });
-        card.appendChild(table);
-      }catch(e){ card.innerHTML = ""; card.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`)); }
-    })();
   } else if(state.subtab === "vehicletypes"){
     main.appendChild(el(`<div class="section-title">ประเภทรถทั้งหมด</div>`));
     main.appendChild(el(`<div class="field-note" style="margin-bottom:10px;line-height:1.6;">
@@ -5364,13 +5489,13 @@ async function openTaskDetailSheet(taskId){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>รายละเอียดงาน</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>รายละเอียดงาน</h2><button class="sheet-close">✕</button></div>
         <div id="td-card"></div>
       </div>
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const holder = overlay.querySelector("#td-card");
   holder.appendChild(el(taskCard(t, buildTaskDetailActions(t), {showRequester: state.role !== "USER"})));
@@ -5419,7 +5544,7 @@ function openNotifications(){
           <h2>การแจ้งเตือน</h2>
           <div style="display:flex;align-items:center;gap:14px;">
             ${hasUnread ? `<button id="notif-read-all" style="background:none;border:none;color:var(--amber);font-size:12px;font-weight:600;cursor:pointer;padding:0;">อ่านทั้งหมด</button>` : ""}
-            <button id="sh-close">✕</button>
+            <button class="sheet-close">✕</button>
           </div>
         </div>
         <div id="notif-list"></div>
@@ -5427,7 +5552,7 @@ function openNotifications(){
     </div>
   `);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const list = overlay.querySelector("#notif-list");
   if(state.notifications.length === 0){ list.appendChild(el(`<div class="empty">ยังไม่มีการแจ้งเตือน</div>`)); }
@@ -5499,11 +5624,48 @@ function chatDetailsHTML(t){
   ${pauseBannerHTML(t)}`;
 }
 
+// The card behind a name in the chat: who they are and how to reach them.
+// The phone stays off the job card to keep it readable, and lives here
+// instead, one tap from any message they sent.
+function openPersonSheet(employeeId, people){
+  const p = (people || []).find(x=> x.employee_id === employeeId);
+  const overlay = el(`
+    <div class="sheet-overlay">
+      <div class="sheet">
+        <div class="sheet-head"><h2>${p ? p.full_name : employeeId}</h2><button class="sheet-close">✕</button></div>
+        ${p ? `
+          <div class="card" style="padding:12px 14px;">
+            <div class="as-d"><span>ชื่อ-นามสกุล</span><b>${p.full_name}</b></div>
+            <div class="as-d"><span>รหัสพนักงาน</span><b class="mono">${p.employee_id}</b></div>
+            <div class="as-d"><span>สิทธิ์</span><b>${ROLE_TH[p.role] || p.role}${
+              p.is_requester ? " · ผู้ของานนี้" : p.is_crew ? " · คนขับในงานนี้" : ""}</b></div>
+            <div class="as-d"><span>Cost center</span><b>${p.cost_center || "ไม่มี"}</b></div>
+            <div class="as-d"><span>เบอร์ติดต่อ</span><b>${p.contact
+              ? `<a href="#" class="copy-phone" data-phone="${p.contact}">${fmtPhone(p.contact)}</a>
+                 <span class="copy-hint">กดเพื่อคัดลอก</span>`
+              : "ไม่มี"}</b></div>
+            ${p.email ? `<div class="as-d"><span>อีเมล</span><b>${p.email}</b></div>` : ""}
+          </div>`
+        : `<div class="empty">ไม่พบข้อมูลของ ${employeeId}</div>`}
+      </div>
+    </div>`);
+  document.body.appendChild(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
+  overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
+  overlay.querySelectorAll(".copy-phone").forEach(a=>{
+    a.onclick = async (e)=>{
+      e.preventDefault();
+      try{ await navigator.clipboard.writeText(a.dataset.phone); toast(`คัดลอกเบอร์ ${fmtPhone(a.dataset.phone)} แล้ว`); }
+      catch(_){ toast(`เบอร์: ${fmtPhone(a.dataset.phone)}`); }
+    };
+  });
+}
+
 async function openChatSheet(taskId){
   const overlay = el(`
     <div class="sheet-overlay" data-chat-task="${taskId}">
       <div class="sheet sheet-full">
-        <div class="sheet-head"><h2>แชทงาน</h2><button id="sh-close">✕</button></div>
+        <div class="sheet-head"><h2>แชทงาน</h2><button class="sheet-close">✕</button></div>
         <div id="chat-top"><div class="empty">กำลังโหลด...</div></div>
         <div class="chat-log" id="chat-log"></div>
         <div class="chat-input-row">
@@ -5513,7 +5675,7 @@ async function openChatSheet(taskId){
       </div>
     </div>`);
   document.body.appendChild(overlay);
-  overlay.querySelector("#sh-close").onclick = ()=> closeSheet(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   const top = overlay.querySelector("#chat-top");
@@ -5554,6 +5716,14 @@ async function openChatSheet(taskId){
     }catch(e){ top.innerHTML = ""; top.appendChild(el(`<div class="err">${e.message}</div>`)); }
   }
 
+  // Who is in this chat, with the details to reach them. Fetched once on open
+  // rather than carried on every message — the poll runs every three seconds.
+  let people = [];
+  async function loadPeople(){
+    try{ people = await api(`/tasks/${taskId}/people`, {background:true}); }
+    catch(e){ people = []; }
+  }
+
   let lastCount = -1;
   async function loadMessages(){
     if(document.activeElement === overlay.querySelector("#chat-input")) return; // don't yank focus while typing
@@ -5575,10 +5745,19 @@ async function openChatSheet(taskId){
           return;
         }
         const mine = m.sender_employee_id === state.employee_id;
+        // The name, not the employee id — and tappable, because "who is
+        // ประตู-12 asking about" is usually followed by "what is their
+        // number".
+        const who = mine ? "คุณ"
+          : `<a href="#" class="who-link" data-who="${m.sender_employee_id}">${m.sender_name || m.sender_employee_id}</a>`
+            + ` <span class="who-role">${ROLE_TH[m.sender_role] || m.sender_role}</span>`;
         log.appendChild(el(`<div class="chat-msg ${mine ? 'mine' : 'theirs'}">
-          <div class="who">${mine ? 'คุณ' : m.sender_employee_id + ' ('+m.sender_role+')'}</div>
+          <div class="who">${who}</div>
           ${m.message}
         </div>`));
+      });
+      log.querySelectorAll(".who-link").forEach(a=>{
+        a.onclick = (e)=>{ e.preventDefault(); openPersonSheet(a.dataset.who, people); };
       });
       log.scrollTop = log.scrollHeight;
       if(newSystem) loadTask();
@@ -5598,6 +5777,7 @@ async function openChatSheet(taskId){
   overlay.querySelector("#chat-send").onclick = send;
   overlay.querySelector("#chat-input").addEventListener("keydown", (e)=>{ if(e.key==="Enter") send(); });
 
+  await loadPeople();
   await Promise.all([loadTask(), loadMessages()]);
   if(chatPollTimer) clearInterval(chatPollTimer);
   chatPollTimer = setInterval(loadMessages, 3000);
