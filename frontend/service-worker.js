@@ -36,10 +36,14 @@ self.addEventListener("push", (event) => {
   }
   const options = {
     body: data.body,
-    icon: undefined,
-    badge: undefined,
+    // Served by the app itself, so it is there on every deployment.
+    icon: "/icon-192.png",
     data: { url: data.url || "/" },
-    tag: "scdc-notification",
+    // The server sends a tag per job (and one per chat thread). Every
+    // notification used to share one fixed tag, which meant each new one
+    // REPLACED the last: three jobs arriving together showed as one line and
+    // the first two were never seen.
+    tag: data.tag || ("scdc-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8)),
     renotify: true,
   };
   event.waitUntil(
@@ -48,6 +52,44 @@ self.addEventListener("push", (event) => {
       notifyClientsToRefresh(),
     ])
   );
+});
+
+// The browser can replace a push subscription on its own — Chrome does it
+// after an update or when storage is cleared. Nothing in the page runs at that
+// moment, so unless the new address is registered from here, notifications for
+// this device stop dead and nothing anywhere says so: the app still shows
+// "เปิดแจ้งเตือนแล้ว" while every send goes to an address that no longer exists.
+self.addEventListener("pushsubscriptionchange", (event) => {
+  event.waitUntil((async () => {
+    try {
+      const oldSub = event.oldSubscription || (await self.registration.pushManager.getSubscription());
+      let key = event.oldSubscription && event.oldSubscription.options
+        && event.oldSubscription.options.applicationServerKey;
+      if (!key) {
+        const res = await fetch("/push/vapid-public-key");
+        const { publicKey } = await res.json();
+        const padded = publicKey + "=".repeat((4 - publicKey.length % 4) % 4);
+        const raw = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
+        key = Uint8Array.from([...raw].map((ch) => ch.charCodeAt(0)));
+      }
+      const fresh = event.newSubscription || (await self.registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: key,
+      }));
+      const json = fresh.toJSON();
+      await fetch("/push/resubscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          old_endpoint: oldSub ? oldSub.endpoint : "",
+          endpoint: json.endpoint,
+          keys: json.keys,
+        }),
+      });
+    } catch (e) {
+      // Nothing useful to do here — the page re-registers on the next sign-in.
+    }
+  })());
 });
 
 self.addEventListener("notificationclick", (event) => {

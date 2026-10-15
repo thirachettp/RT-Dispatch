@@ -5,6 +5,14 @@
 <meta name="viewport" id="viewport-meta" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <title>CRL ForkliftDispatch — Warehouse Forklift Request &amp; Dispatch</title>
 <link rel="manifest" href="/manifest.json">
+<!-- iOS takes its home-screen icon from here, and that icon is what every
+     notification from the installed app is shown with. Both are served by the
+     app itself, so neither can go missing from a deployment. -->
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="ForkliftDispatch">
 <meta name="theme-color" content="#f5f6f8">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+Thai:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -557,16 +565,21 @@ function pushSupported(){
 // Now: a banner explains what they'd get and waits for a tap. The flag is only
 // written when the person actually dismisses it.
 async function maybeAutoPromptNotifications(){
-  if(localStorage.getItem(NOTIF_PROMPTED_KEY)) return;
+  if(localStorage.getItem(NOTIF_PROMPTED_KEY)) return;   // an explicit "no" is respected
   if(!pushSupported()) return;
   if(location.protocol !== "https:" && location.hostname !== "localhost") return;
-  if(Notification.permission !== "default") return;  // already decided at the browser level
+  // Denied is a decision the browser holds; Profile explains how to undo it.
+  if(Notification.permission === "denied") return;
   // On iOS there is no point asking until the app is installed — the request
   // cannot succeed from a Safari tab. Point them at the real first step.
   if(isIOS() && !isStandalone()){ showNotifBanner("ios-install"); return; }
   try{
     const status = await api("/push/status");
     if(!status.available || status.subscribed) return;
+    // Reached with permission already granted = this device is registered to
+    // nobody (a browser that dropped the subscription, or a shared phone whose
+    // previous owner signed out). ensurePushRegistration() has already tried
+    // silently by this point, so ask for the tap that can fix it.
     showNotifBanner("enable");
   }catch(e){ /* Profile page still offers the manual toggle + test */ }
 }
@@ -1466,6 +1479,23 @@ function logout(){
   if(token){
     fetch(API + "/auth/logout", {method:"POST", headers:{"Authorization":"Bearer " + token}})
       .catch(()=>{ /* offline: the 90-day prune is the backstop */ });
+    // Hand the device's notifications back too. Leaving them behind is how a
+    // shared tablet ended up pushing one person's jobs at the next person to
+    // pick it up. Fire-and-forget, and with the token captured above, because
+    // the state is cleared on the line below.
+    if("serviceWorker" in navigator){
+      navigator.serviceWorker.ready
+        .then(reg=> reg.pushManager.getSubscription())
+        .then(sub=>{
+          if(!sub) return;
+          return fetch(API + "/push/unsubscribe", {
+            method: "POST",
+            headers: {"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+            body: JSON.stringify({endpoint: sub.endpoint}),
+          }).then(()=> sub.unsubscribe());
+        })
+        .catch(()=>{ /* worst case the next sign-in re-registers it */ });
+    }
   }
   state.token=null; state.role=null; state.employee_id=null;
   localStorage.removeItem("scdc_token"); localStorage.removeItem("scdc_role"); localStorage.removeItem("scdc_emp");
@@ -2825,7 +2855,7 @@ function renderProfile(main){
   main.appendChild(el(`<div class="section-title">บัญชีผู้ใช้</div>`));
   main.appendChild(el(`<div class="card">
     <div class="meta-row"><span>รหัสพนักงาน: <b>${state.employee_id}</b> <span class="field-note">(แก้ไขไม่ได้)</span></span></div>
-    <div class="meta-row"><span>สิทธิ์การใช้งาน: <b>${state.role}</b> <span class="field-note">(แก้ไขไม่ได้)</span></span></div>
+    <div class="meta-row"><span>สิทธิ์การใช้งาน: <b>${ROLE_TH[state.role] || state.role}</b> <span class="field-note">(แก้ไขไม่ได้)</span></span></div>
   </div>`));
 
   if(state.role === "DRIVER"){
@@ -2855,7 +2885,11 @@ function renderProfile(main){
     <label>อีเมล @central.co.th (ไม่บังคับ — ใช้ล็อกอินแทนรหัสพนักงานได้)</label>
     <input id="pf-email" type="email" placeholder="เช่น somchai@central.co.th" value="${me.email || ''}" />
     <label>เบอร์ติดต่อ</label><input id="pf-contact" value="${me.contact || ''}" />
-    ${state.role === "USER" ? `<label>Cost Center (5 หลัก)</label><input id="pf-cc" maxlength="5" value="${me.cost_center || ''}" />` : ""}
+    <label for="pf-cc">Cost Center (5 หลัก)</label>
+    <input id="pf-cc" maxlength="5" inputmode="numeric" placeholder="เช่น 12345" value="${me.cost_center || ''}" />
+    <div class="field-note">${state.role === "USER"
+      ? "ใช้เป็นค่าตั้งต้นของงานที่คุณสร้าง"
+      : "ใช้เติมให้อัตโนมัติตอนคุณสร้างงานแทนคนอื่น — เว้นว่างได้"}</div>
     <button class="primary" id="pf-submit">บันทึกข้อมูล</button>
   </div>`);
   wirePhoneAutoFormat(pf.querySelector("#pf-contact"));
@@ -2866,7 +2900,7 @@ function renderProfile(main){
         contact: pf.querySelector("#pf-contact").value,
         email: pf.querySelector("#pf-email").value.trim() || null,
       };
-      if(state.role === "USER") body.cost_center = pf.querySelector("#pf-cc").value;
+      body.cost_center = pf.querySelector("#pf-cc").value;
       await api("/me", {method:"PUT", body: JSON.stringify(body)});
       toast("บันทึกข้อมูลแล้ว");
       state.me = await api("/me");
@@ -3079,6 +3113,40 @@ async function subscribeToPush(){
   });
   const json = sub.toJSON();
   await api("/push/subscribe", {method:"POST", body: JSON.stringify({endpoint: json.endpoint, keys: json.keys})});
+}
+
+// Runs on every sign-in. Two things used to go wrong without it, both silent:
+//
+//   1. A shared phone or tablet. The subscription is stored against whoever
+//      turned notifications on, and signing out never touched it — so the
+//      device kept receiving the previous person's notifications, and the
+//      person now holding it received none.
+//   2. A browser that dropped the subscription but kept the permission. The
+//      banner never appeared (permission was no longer "default") and Profile
+//      just showed "เปิดการแจ้งเตือน" with no hint anything was wrong.
+//
+// Nothing here can show a prompt: it only runs once permission is already
+// granted, so it is safe on iOS, where a prompt outside a tap is refused.
+async function ensurePushRegistration(){
+  if(!pushSupported()) return false;
+  if(location.protocol !== "https:" && location.hostname !== "localhost") return false;
+  if(Notification.permission !== "granted") return false;
+  try{
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if(!sub){
+      const { publicKey } = await api("/push/vapid-public-key");
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+    }
+    const json = sub.toJSON();
+    // The server moves the row onto the current user, so the device follows
+    // whoever is signed in rather than whoever first enabled it.
+    await api("/push/subscribe", {method:"POST", body: JSON.stringify({endpoint: json.endpoint, keys: json.keys})});
+    return true;
+  }catch(e){ return false; }
 }
 
 async function unsubscribeFromPush(){
@@ -4838,7 +4906,12 @@ function renderOperationBroadcast(main){
   main.appendChild(el(`<div class="section-title">ส่งประกาศ</div>`));
   const form = el(`<div class="card">
     <label>ส่งถึง</label>
-    <select id="bc-role"><option value="DRIVER">คนขับทั้งหมด</option><option value="USER">ผู้ใช้ทั้งหมด</option><option value="ALL">ทุกคน</option></select>
+    <select id="bc-role">
+      <option value="DRIVER">คนขับทั้งหมด</option>
+      <option value="USER">ผู้ขอทั้งหมด</option>
+      <option value="OPS">เจ้าหน้าที่ (ผู้กระจายงาน + แอดมิน)</option>
+      <option value="ALL">ทุกคนในระบบ</option>
+    </select>
     <label>ข้อความ</label>
     <textarea id="bc-msg" rows="3" placeholder="เช่น ประชุมความปลอดภัยเวลา 15:00 น. วันนี้"></textarea>
     <button class="primary" id="bc-submit">ส่งประกาศ</button>
@@ -6036,7 +6109,10 @@ async function bootstrap(){
   renderShell();
   await refreshAll();
   startPolling();
-  maybeAutoPromptNotifications(); // fire-and-forget; never blocks app usage
+  // Re-register this device for whoever just signed in, THEN decide whether a
+  // banner is needed — in that order, so the banner never appears for a device
+  // that the silent path just fixed.
+  ensurePushRegistration().then(maybeAutoPromptNotifications); // never blocks app usage
 }
 
 // Put the driver back in their usual vehicle when they open the app. Silent
