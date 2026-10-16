@@ -69,12 +69,12 @@
   .route{font-size:16px;font-weight:800;line-height:1.45;margin-bottom:12px;}
   .route .arrow{margin:0 9px;color:var(--ink-dim);font-weight:500;}
   .route-type{font-weight:500;color:var(--ink-dim);font-size:13px;margin-left:5px;}
-  .fact-strip{display:flex;align-items:stretch;gap:0;overflow-x:auto;
-    -webkit-overflow-scrolling:touch;padding-bottom:2px;}
-  .fact-strip::-webkit-scrollbar{display:none;}
-  .fact{display:flex;align-items:center;gap:8px;padding:0 14px;flex:none;
-    border-left:1px solid var(--line);}
-  .fact:first-child{padding-left:0;border-left:none;}
+  /* These used to sit on one 500px line that scrolled sideways on a 390px
+     screen, so the pallet count and the time were off the edge of every card
+     until you noticed you could swipe them. They wrap now — everything on a
+     card is visible at once. */
+  .fact-strip{display:flex;align-items:stretch;flex-wrap:wrap;gap:8px 18px;padding-bottom:2px;}
+  .fact{display:flex;align-items:center;gap:8px;flex:none;}
   .fact-ico{width:19px;height:19px;flex:none;color:var(--ink-dim);}
   .fact-ico svg{width:100%;height:100%;display:block;}
   .fact-l{font-size:11px;color:var(--ink-dim);line-height:1.3;white-space:nowrap;}
@@ -202,7 +202,9 @@
      and the input gets matching right padding so typed text never slides
      under it. */
   .pw-wrap{position:relative;}
-  .pw-wrap input{padding-right:50px;}
+  /* The show/hide eye is 44px so it can actually be tapped; the field has to
+     be at least that tall too, or the button hangs 3px out of its own box. */
+  .pw-wrap input{padding-right:50px;min-height:44px;}
   .pw-eye{position:absolute;top:0;right:0;height:100%;width:46px;min-height:44px;
     background:none;border:none;padding:0;cursor:pointer;color:var(--ink-dim);
     display:flex;align-items:center;justify-content:center;}
@@ -297,6 +299,11 @@
     justify-content:center;}
   .sheet{width:100%;max-width:520px;background:var(--panel);border-top:1px solid var(--line);
     border-radius:16px 16px 0 0;padding:18px 18px 26px;max-height:88vh;overflow-y:auto;display:flex;flex-direction:column;}
+  /* A flex child shrinks by default. Any sheet taller than 88vh was therefore
+     SQUEEZING its contents instead of scrolling: the personal-details card
+     collapsed to a sliver of clipped text, and on iOS the role dropdown lost
+     its label entirely. Children keep their own height; the sheet scrolls. */
+  .sheet > *{flex:0 0 auto;}
   .sheet h2{font-size:16px;margin:0 0 4px;}
   .sheet-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
   .sheet-head button{background:none;border:none;color:var(--ink-dim);font-size:20px;cursor:pointer;}
@@ -328,7 +335,16 @@
   .notif-row.unread .notif-msg{font-weight:600;}
   .notif-time{font-size:11px;color:var(--ink-dim);margin-top:3px;}
 
-  .stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:6px;}
+  /* Six tracks, three tiles to a row — so an incomplete last row can stretch
+     to fill the width instead of leaving one tile stranded on its own. */
+  .stat-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:6px;}
+  .stat-grid > *{grid-column:span 2;}
+  .stat-grid > *:last-child:nth-child(3n+1){grid-column:span 6;}
+  .stat-grid > *:nth-last-child(2):nth-child(3n+1){grid-column:span 3;}
+  .stat-grid > *:nth-last-child(2):nth-child(3n+1) ~ *{grid-column:span 3;}
+  /* Four related numbers read better as a square than as 3 + 1. */
+  .stat-grid.g2{grid-template-columns:repeat(2,1fr);}
+  .stat-grid.g2 > *{grid-column:span 1 !important;}
   .stat{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;text-align:center;}
   .stat .n{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;}
   .stat .l{font-size:10.5px;color:var(--ink-dim);margin-top:2px;}
@@ -1291,7 +1307,7 @@ function renderDriversNowPanel(container){
   const panel = el(`<div class="card"></div>`);
   panel.appendChild(el(`<div class="section-title" style="margin-top:0;">คนขับตอนนี้</div>`));
   const queuedTotal = snap.reduce((n, d)=> n + (d.queueLen || 0), 0);
-  panel.appendChild(el(`<div class="stat-grid" style="margin-bottom:10px;">
+  panel.appendChild(el(`<div class="stat-grid g2" style="margin-bottom:10px;">
     <div class="stat"><div class="n">${free.length}</div><div class="l">ว่าง</div></div>
     <div class="stat"><div class="n">${busy.length}</div><div class="l">ติดงาน</div></div>
     <div class="stat"><div class="n">${queuedTotal}</div><div class="l">งานในคิว</div></div>
@@ -1840,33 +1856,31 @@ function renderShell(){
   app.classList.remove("app-full");
   app.innerHTML = "";
   const unread = state.notifications.filter(n=>!n.is_read).length;
-  const isDriver = state.role === "DRIVER";
+  const isDriver = isCrew();
 
   let brandInner;
   if(isDriver){
     const meVehicle = (state.vehicles || []).find(v=> v.id === (state.me && state.me.checked_in_vehicle_id));
-    const sub = [ROLE_PILL_TH.DRIVER, meVehicle ? meVehicle.code : null].filter(Boolean).join(" · ");
+    const sub = [ROLE_PILL_TH[state.role] || state.role, meVehicle ? meVehicle.code : null]
+      .filter(Boolean).join(" · ");
     brandInner = `<b>${(state.me && state.me.full_name) || state.employee_id}</b><small>${sub}</small>`;
   } else {
     brandInner = `<b>${(state.me && state.me.full_name) || "SCDC Dispatch"}</b><small>${state.employee_id || ""}</small>`;
   }
 
-  let rightIcons;
-  if(isDriver){
-    const st = state.me && state.me.driver_status;
-    const stClass = st === "Available" ? "on" : st === "Breakdown" ? "bad" : st === "Busy" ? "busy" : "off";
-    rightIcons = `
-      <button class="driver-status-pill ${stClass}" id="hdr-status-btn" style="cursor:pointer;background:none;">${DRIVER_STATUS_LABEL[st] || '-'}</button>
-      <button class="bell-btn" id="chat-menu-btn">💬</button>
-      <button class="bell-btn" id="bell">🔔${unread ? '<span class="bell-dot"></span>' : ''}</button>
-    `;
-  } else {
-    rightIcons = `
-      ${isOps() ? `<button class="bell-btn" id="admin-search-btn">🔍</button>` : ""}
-      <span class="role-pill">${ROLE_PILL_TH[state.role] || state.role}</span>
-      <button class="bell-btn" id="bell">🔔${unread ? '<span class="bell-dot"></span>' : ''}</button>
-    `;
-  }
+  // A dispatcher who also drives is BOTH, so the icons are composed rather
+  // than chosen: they get the driver's status pill and the office's search in
+  // the same header. The role pill is only for people with neither, since the
+  // driver strip under the name already says who they are.
+  const st = state.me && state.me.driver_status;
+  const stClass = st === "Available" ? "on" : st === "Breakdown" ? "bad" : st === "Busy" ? "busy" : "off";
+  const rightIcons = `
+    ${isDriver ? `<button class="driver-status-pill ${stClass}" id="hdr-status-btn" style="cursor:pointer;background:none;">${DRIVER_STATUS_LABEL[st] || '-'}</button>` : ""}
+    ${isOps() ? `<button class="bell-btn" id="admin-search-btn">🔍</button>` : ""}
+    ${isDriver ? `<button class="bell-btn" id="chat-menu-btn">💬</button>` : ""}
+    ${!isDriver ? `<span class="role-pill">${ROLE_PILL_TH[state.role] || state.role}</span>` : ""}
+    <button class="bell-btn" id="bell">🔔${unread ? '<span class="bell-dot"></span>' : ''}</button>
+  `;
 
   const header = el(`
     <header class="topbar">
@@ -1879,15 +1893,15 @@ function renderShell(){
       </div>
     </header>
   `);
-  header.querySelector("#bell").onclick = ()=> openNotifications();
-  if(isDriver){
-    header.querySelector("#brand-btn").onclick = ()=>{ setTab("profile"); renderContent(); };
-    header.querySelector("#chat-menu-btn").onclick = ()=> openChatMenuSheet();
-    header.querySelector("#hdr-status-btn").onclick = ()=> openDriverStatusSheet();
-  }
-  if(isOps()){
-    header.querySelector("#admin-search-btn").onclick = ()=> openAdminSearchSheet();
-  }
+  // Wire whatever is actually there — which combination of icons a header has
+  // depends on the person, and a missing one must never throw and take the
+  // whole shell down with it.
+  const wire = (sel, fn)=>{ const node = header.querySelector(sel); if(node) node.onclick = fn; };
+  wire("#bell", ()=> openNotifications());
+  wire("#chat-menu-btn", ()=> openChatMenuSheet());
+  wire("#hdr-status-btn", ()=> openDriverStatusSheet());
+  wire("#admin-search-btn", ()=> openAdminSearchSheet());
+  if(isDriver) wire("#brand-btn", ()=>{ setTab("profile"); renderContent(); });
   app.appendChild(header);
 
   // Manual refresh lives here rather than as another header icon — the header
@@ -1916,7 +1930,7 @@ function renderShell(){
     return refreshNow();
   });
 
-  const tabsDef = {
+  let tabsDef = {
     USER: [["tasks","งานของฉัน"], ["history","ประวัติ"], ["help","วิธีใช้"], ["profile","โปรไฟล์"]],
     DRIVER: [["available","งานของฉัน"], ["history","ประวัติ"], ["help","วิธีใช้"], ["profile","โปรไฟล์"]],
     ADMIN: [["dashboard","แดชบอร์ด"], ["operation","ปฏิบัติการ"], ["settings","จัดการระบบ"], ["help","วิธีใช้"], ["profile","โปรไฟล์"]],
@@ -1926,6 +1940,12 @@ function renderShell(){
     // dispatches and drives has their role set to DRIVER for that shift.
     DISPATCH: [["dashboard","แดชบอร์ด"], ["operation","ปฏิบัติการ"], ["help","วิธีใช้"], ["profile","โปรไฟล์"]],
   }[state.role];
+  // A dispatcher who also drives works their own jobs from the same screen a
+  // driver does — checking in, starting, finishing — so they get that screen
+  // too, right after the two office ones.
+  if(state.role === "DISPATCH" && isCrew() && tabsDef){
+    tabsDef = [...tabsDef.slice(0, 2), ["available", "งานของฉัน"], ...tabsDef.slice(2)];
+  }
 
   if(!tabsDef){
     // Unknown/blank role — don't render a broken shell (that's the blank-page
@@ -1934,11 +1954,13 @@ function renderShell(){
     return;
   }
 
-  const tabs = el(`<nav class="tabs">${tabsDef.map(([k,l])=>`<button data-tab="${k}">${l}</button>`).join("")}
-    <button data-tab="logout" style="color:var(--red)">ออกจากระบบ</button></nav>`);
+  // Sign-out used to be the sixth item in this bar, which made it 411px wide
+  // on a 390px screen: the button sat half off the edge and the bar had to be
+  // scrolled sideways to reach it. It lives at the bottom of โปรไฟล์ now,
+  // with the other account actions, and every role's tabs fit again.
+  const tabs = el(`<nav class="tabs">${tabsDef.map(([k,l])=>`<button data-tab="${k}">${l}</button>`).join("")}</nav>`);
   tabs.querySelectorAll("button").forEach(b=>{
     b.onclick = ()=>{
-      if(b.dataset.tab === "logout"){ logout(); return; }
       setTab(b.dataset.tab, "");
       renderContent();
       // Switching tabs may need a different data scope (e.g. dashboard vs
@@ -1951,13 +1973,25 @@ function renderShell(){
   if(!tabsDef.find(([k])=>k===state.tab)) setTab(tabsDef[0][0], "");
   renderContent();
 
-  // Requesters raise their own work; admins and dispatchers raise what comes
-  // in by radio or phone, which is most of it.
-  if(state.role === "USER" || isOps()){
-    const fab = el(`<button class="fab" id="fab-add">+</button>`);
-    fab.onclick = ()=> openCreateTask();
-    app.appendChild(fab);
-  }
+  syncFab();
+}
+
+// The + button lives on exactly one screen per role: where that person's own
+// jobs are. It used to sit on every screen, so it covered the dashboard and
+// the settings page where creating a job makes no sense. Called from both
+// renderShell and renderContent, because switching tabs re-renders only the
+// content.
+function syncFab(){
+  const app = document.getElementById("app");
+  if(!app) return;
+  const wanted = (state.role === "USER" && state.tab === "tasks")
+              || (isOps() && state.tab === "operation");
+  const existing = document.getElementById("fab-add");
+  if(!wanted){ if(existing) existing.remove(); return; }
+  if(existing) return;
+  const fab = el(`<button class="fab" id="fab-add">+</button>`);
+  fab.onclick = ()=> openCreateTask();
+  app.appendChild(fab);
 }
 
 function setTab(tab, subtab){
@@ -1990,9 +2024,12 @@ async function renderContent(){
   // The guide is the same screen for everyone, differing only in which role's
   // steps it shows, so it is routed here rather than repeated in all three.
   if(state.tab === "help") renderHelpTab(main);
+  else if(state.tab === "available" && isCrew()) renderDriverTab(main);
   else if(state.role === "USER") renderUserTab(main);
   else if(state.role === "DRIVER") renderDriverTab(main);
   else if(isOps()) renderAdminTab(main);
+  syncFab();
+
   // Restore scroll position so the 3s auto-refresh poll doesn't yank the user
   // back to the top of a long list they were scrolled through. The page itself
   // scrolls (header uses position:sticky), not #main, so this targets window.
@@ -2007,7 +2044,13 @@ async function renderContent(){
 // looking at a stopped job needs before they can do anything about it.
 const ROLE_TH = {DRIVER: "คนขับ", USER: "ผู้ขอ", DISPATCH: "ผู้กระจายงาน", ADMIN: "แอดมิน"};
 const ROLE_PILL_TH = {DRIVER: "คนขับ", USER: "ผู้ขอ", DISPATCH: "กระจายงาน", ADMIN: "แอดมิน"};
+// A dispatcher who also drives. The licence is what makes them crew: a
+// dispatcher who never touches a forklift keeps the office screens only, and
+// never appears in the driver lists or the "คนขับว่าง" count.
+const myLicenses = ()=> (state.me && state.me.licenses) || [];
+const isCrew = ()=> state.role === "DRIVER" || (state.role === "DISPATCH" && myLicenses().length > 0);
 // A dispatcher runs the floor with an admin's screens, minus จัดการระบบ.
+const CREW_ROLES = ["DRIVER", "DISPATCH"];
 const OPS_ROLES = ["ADMIN", "DISPATCH"];
 const isOps = ()=> OPS_ROLES.includes(state.role);
 // Mirrors the server: an admin hands out any role, a dispatcher anything but
@@ -2858,7 +2901,7 @@ function renderProfile(main){
     <div class="meta-row"><span>สิทธิ์การใช้งาน: <b>${ROLE_TH[state.role] || state.role}</b> <span class="field-note">(แก้ไขไม่ได้)</span></span></div>
   </div>`));
 
-  if(state.role === "DRIVER"){
+  if(isCrew()){
     // Read-only: licences are granted and changed by an admin, never here.
     const lic = (state.me && state.me.licenses) || [];
     main.appendChild(el(`<div class="section-title">ใบอนุญาตขับรถ</div>`));
@@ -2939,6 +2982,10 @@ function renderProfile(main){
   const devCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
   main.appendChild(devCard);
   renderSessionsSection(devCard);
+
+  const signOut = el(`<button class="btn red" style="width:100%;margin-top:16px;">ออกจากระบบ</button>`);
+  signOut.onclick = ()=> logout();
+  main.appendChild(signOut);
 
   main.appendChild(el(`<div class="section-title">การซูมหน้าจอ</div>`));
   const zoomCard = el(`<div class="card">
@@ -3665,7 +3712,7 @@ const PAUSE_PRESETS = {
 function openPauseSheet(taskId){
   // Only a driver can report a VEHICLE fault — it takes their own vehicle out
   // of service. Everyone else is reporting a hold-up on the requester's side.
-  const canReportVehicle = state.role === "DRIVER";
+  const canReportVehicle = isCrew();
   let category = "user";
   const overlay = el(`
     <div class="sheet-overlay">
@@ -3775,7 +3822,7 @@ async function renderAdminDashboard(main){
   const perfCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
   main.appendChild(perfCard);
 
-  main.appendChild(el(`<div class="section-title">แนวโน้มปริมาณงาน (7 วันล่าสุด)</div>`));
+  main.appendChild(el(`<div class="section-title">ปริมาณงานตามเวลาที่เปิดงาน</div>`));
   const chartCard = el(`<div class="card" id="volume-chart-card"><div class="empty">กำลังโหลดกราฟ...</div></div>`);
   main.appendChild(chartCard);
 
@@ -3819,13 +3866,9 @@ async function renderAdminDashboard(main){
       perfCard.innerHTML = ""; perfCard.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`));
     }
     try{
-      const vol = await api("/dashboard/task-volume?days=7", {background:true});
+      const vol = await api(`/dashboard/volume-buckets?period=${state.dashPeriod}`, {background:true});
       chartCard.innerHTML = "";
-      chartCard.appendChild(buildStackedBarChart(vol.series));
-      const legend = el(`<div class="chip-row" style="margin-top:10px;">
-        ${Object.keys(CHART_COLORS).map(k=>`<span class="chip" style="cursor:default;"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${CHART_COLORS[k]};margin-right:5px;"></span>${TASK_STAT_LABEL[k]}</span>`).join("")}
-      </div>`);
-      chartCard.appendChild(legend);
+      renderVolumeChart(chartCard, vol);
     }catch(e){ chartCard.innerHTML = ""; chartCard.appendChild(el(`<div class="empty">โหลดกราฟไม่สำเร็จ</div>`)); }
     state.dashLastUpdated = new Date();
     const label = document.getElementById("dash-updated-at");
@@ -3852,31 +3895,95 @@ async function downloadExport(period){
   }catch(e){ toast(e.message); }
 }
 
-function buildStackedBarChart(series){
-  const W = 320, H = 160, padL = 4, padB = 18, padT = 6, barGap = 8;
-  const n = series.length;
-  const barW = (W - padL*2 - barGap*(n-1)) / n;
-  const statuses = Object.keys(CHART_COLORS);
-  const maxTotal = Math.max(1, ...series.map(d=> statuses.reduce((s,k)=> s + (d[k]||0), 0)));
-  const usableH = H - padT - padB;
-  let bars = "";
-  series.forEach((d, i)=>{
-    const x = padL + i * (barW + barGap);
-    let yCursor = H - padB;
-    statuses.forEach(st=>{
-      const v = d[st] || 0;
-      if(v <= 0) return;
-      const h = (v / maxTotal) * usableH;
-      yCursor -= h;
-      bars += `<rect x="${x}" y="${yCursor}" width="${barW}" height="${h}" fill="${CHART_COLORS[st]}" rx="2"></rect>`;
-    });
-    const label = d.date.slice(5).replace("-","/");
-    bars += `<text x="${x + barW/2}" y="${H-4}" font-size="9" fill="var(--ink-dim)" text-anchor="middle">${label}</text>`;
-  });
-  const svg = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;">${bars}</svg>`;
-  return el(`<div>${svg}</div>`);
+// Each bar is one hour (today) or one day (this week / month) of jobs, stacked
+// by where those jobs stand NOW — so the part of a bar that is not green is
+// exactly what is still outstanding from that slot. Replaces the plain
+// "ค้างงาน" number, which said how much was outstanding but never when it
+// came in or whether it was piling up.
+// 1, 2, 5, 10, 20, 50 ... — the familiar axis steps, so the top of the chart
+// is always a number someone can read a bar against.
+function niceMax(v){
+  const mag = Math.pow(10, Math.floor(Math.log10(Math.max(1, v))));
+  const r = v / mag;
+  return (r <= 1 ? 1 : r <= 2 ? 2 : r <= 5 ? 5 : 10) * mag;
 }
 
+const VOLUME_COLORS = {
+  waiting: "var(--warn)", active: "var(--amber)", done: "var(--green)", cancelled: "#a3b1c2",
+};
+
+function renderVolumeChart(card, data){
+  if(!state.volumeMetric) state.volumeMetric = "jobs";
+  const metric = state.volumeMetric;
+  const unit = metric === "jobs" ? "งาน" : "พาเลท";
+  const keys = data.groups.map(g=> g.key);
+
+  const toggle = el(`<div class="chip-row" style="margin-bottom:10px;">
+    <button class="chip ${metric === "jobs" ? "active" : ""}" data-metric="jobs">จำนวนงาน</button>
+    <button class="chip ${metric === "pallets" ? "active" : ""}" data-metric="pallets">จำนวนพาเลท</button>
+  </div>`);
+  toggle.querySelectorAll("[data-metric]").forEach(b=> b.onclick = ()=>{
+    state.volumeMetric = b.dataset.metric;
+    card.innerHTML = "";
+    renderVolumeChart(card, data);
+  });
+  card.appendChild(toggle);
+
+  const totals = data.totals[metric];
+  const grand = keys.reduce((n,k)=> n + (totals[k]||0), 0);
+  const outstanding = (totals.waiting||0) + (totals.active||0);
+  card.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">
+    เปิดงานรวม <b>${grand}</b> ${unit} · ยังไม่เสร็จ <b style="color:var(--warn);">${outstanding}</b> ${unit}
+  </div>`));
+
+  if(!grand){
+    card.appendChild(el(`<div class="empty">ยังไม่มีงานในช่วงนี้</div>`));
+    return;
+  }
+
+  const n = data.buckets.length;
+  const W = 340, H = 150, padT = 14, padB = 20, padL = 22, padR = 2;
+  const plotH = H - padT - padB, plotW = W - padL - padR;
+  const gap = n > 20 ? 1.5 : 4;
+  const barW = Math.max(3, (plotW - gap * (n - 1)) / n);
+  const max = Math.max(1, ...data.buckets.map(b=> keys.reduce((t,k)=> t + (b[metric][k]||0), 0)));
+  // A round number at or above the tallest bar, so the axis reads as a scale
+  // rather than as "whatever the biggest bar happened to be".
+  const top = niceMax(max);
+  const ticks = top % 2 === 0 ? [0, top/2, top] : [0, top];
+  // Label every bar when there is room, otherwise every 3rd (hours) or 5th (days).
+  const every = n <= 8 ? 1 : (n <= 24 ? 3 : 5);
+
+  let svg = "";
+  ticks.forEach(v=>{
+    const y = padT + plotH - (v / top) * plotH;
+    svg += `<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="var(--line)" stroke-width="1"></line>`;
+    svg += `<text x="${padL-4}" y="${y+3}" font-size="8" fill="var(--ink-dim)" text-anchor="end">${v}</text>`;
+  });
+  data.buckets.forEach((b, i)=>{
+    const x = padL + i * (barW + gap);
+    let y = padT + plotH;
+    keys.forEach(k=>{
+      const v = b[metric][k] || 0;
+      if(v <= 0) return;
+      const h = (v / top) * plotH;
+      y -= h;
+      svg += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${VOLUME_COLORS[k]}"><title>${b.label} · ${TH_GROUP[k]} ${v} ${unit}</title></rect>`;
+    });
+    if(i % every === 0){
+      svg += `<text x="${(x + barW/2).toFixed(1)}" y="${H-6}" font-size="8" fill="var(--ink-dim)" text-anchor="middle">${b.label}</text>`;
+    }
+  });
+  const axisNote = data.period === "today" ? "เวลาที่เปิดงาน (นาฬิกา)" : "วันที่เปิดงาน";
+  card.appendChild(el(`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;" role="img"
+    aria-label="ปริมาณงานแยกตาม${axisNote}">${svg}</svg>`));
+  card.appendChild(el(`<div class="field-note" style="text-align:center;margin-top:2px;">${axisNote}</div>`));
+  card.appendChild(el(`<div class="chip-row volume-legend" style="margin-top:10px;">
+    ${data.groups.map(g=>`<span class="chip" style="cursor:default;"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${VOLUME_COLORS[g.key]};margin-right:5px;"></span>${g.label} ${totals[g.key]||0}</span>`).join("")}
+  </div>`));
+}
+
+const TH_GROUP = {waiting:"รอดำเนินการ", active:"กำลังดำเนินการ", done:"เสร็จสิ้น", cancelled:"ยกเลิก"};
 function bindCardClickToDetail(container){
   container.querySelectorAll(".card[data-id]").forEach(card=>{
     card.style.cursor = "pointer";
@@ -4178,7 +4285,7 @@ function renderOperationJobs(main){
   const filterBar = el(`<div class="card">
     <label>ค้นหาเลขงาน</label>
     <input id="oj-q" placeholder="เช่น TK260922-005 หรือแค่ 005" autocomplete="off" />
-    <div class="grid2" style="margin-top:8px;">
+    <div style="margin-top:8px;">
       <div><label>สถานะ</label><select id="oj-status">
         <option value="active">ยังไม่เสร็จ (ไม่รวมเสร็จสิ้น/ยกเลิก)</option>
         <option value="all">ทั้งหมด</option>
@@ -4189,9 +4296,9 @@ function renderOperationJobs(main){
         <option value="Completed">เสร็จสิ้น</option>
         <option value="Cancelled">ยกเลิก</option>
       </select></div>
-      <div><label>&nbsp;</label><label style="display:flex;align-items:center;gap:8px;padding:11px 0;">
+      <label style="display:flex;align-items:center;gap:8px;padding:10px 0 0;">
         <input type="checkbox" id="oj-overdue" style="width:auto;" /> เฉพาะงานค้าง (Overdue)
-      </label></div>
+      </label>
     </div>
   </div>`);
   main.appendChild(filterBar);
@@ -4633,7 +4740,7 @@ function renderOperationPeople(main){
 
   const onlineDrivers = state.drivers.filter(d=> d.driver_status !== "Not Checked-in").length;
   const totalDrivers = state.drivers.length;
-  const summary = el(`<div class="stat-grid" style="margin-bottom:14px;">
+  const summary = el(`<div class="stat-grid g2" style="margin-bottom:14px;">
     <div class="stat"><div class="n">${onlineDrivers}/${totalDrivers}</div><div class="l">คนขับออนไลน์ตอนนี้</div></div>
     <div class="stat"><div class="n">${state.allUsers.filter(u=>u.role==='USER').length}</div><div class="l">ผู้ขอใช้งาน (User)</div></div>
     <div class="stat"><div class="n">${state.allUsers.filter(u=>u.role==='DISPATCH').length}</div><div class="l">ผู้กระจายงาน</div></div>
@@ -4680,7 +4787,7 @@ function renderOperationPeople(main){
     if(filtered.length === 0) list.appendChild(el(`<div class="empty">ไม่พบพนักงานตามที่ค้นหา</div>`));
     filtered.forEach(u=>{
       const driverInfo = state.drivers.find(d=> d.id === u.id);
-      const badge = u.role === "DRIVER" && driverInfo
+      const badge = CREW_ROLES.includes(u.role) && driverInfo
         ? `<span class="badge ${driverInfo.driver_status==='Available'?'ok':driverInfo.driver_status==='Breakdown'?'bad':'warn'}">${DRIVER_STATUS_LABEL[driverInfo.driver_status]||driverInfo.driver_status}</span>`
         : `<span class="badge">${u.role}</span>`;
       const expiredWarn = driverInfo && driverInfo.expired_count > 0 ? `<span class="badge bad">ใบอนุญาตหมดอายุ</span>` : "";
@@ -4966,7 +5073,7 @@ function openUserEditSheet(userId){
           <button class="btn amber" id="ue-reset-pw" style="width:100%;" ${canManageUser(u) ? "" : "disabled"}>รีเซ็ตรหัสผ่าน</button>
           <button class="btn red" id="ue-delete" style="width:100%;" ${canManageUser(u) ? "" : "disabled"}>ลบผู้ใช้นี้</button>
         </div>
-        <div id="ue-license-section" style="margin-top:20px;${u.role==='DRIVER'?'':'display:none;'}">
+        <div id="ue-license-section" style="margin-top:20px;${CREW_ROLES.includes(u.role)?'':'display:none;'}">
           <div class="section-title" style="margin-top:0;">ใบอนุญาตขับรถ</div>
           <div id="ue-license-list" class="card"><div class="empty">กำลังโหลด...</div></div>
           <div class="card">
@@ -4996,7 +5103,8 @@ function openUserEditSheet(userId){
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   overlay.querySelector("#ue-role").onchange = (e)=>{
-    overlay.querySelector("#ue-license-section").style.display = e.target.value === "DRIVER" ? "block" : "none";
+    overlay.querySelector("#ue-license-section").style.display =
+      CREW_ROLES.includes(e.target.value) ? "block" : "none";
   };
   overlay.querySelector("#ul-permanent").onchange = (e)=>{
     overlay.querySelector("#ul-expiry").disabled = e.target.checked;
@@ -5029,7 +5137,7 @@ function openUserEditSheet(userId){
       });
     }catch(e){ box.innerHTML=""; box.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`)); }
   }
-  if(u.role === "DRIVER") loadLicenses();
+  if(CREW_ROLES.includes(u.role)) loadLicenses();
 
   // Only vehicles of the chosen type can be someone's usual vehicle, so the
   // list follows the type picker instead of offering the whole fleet and
@@ -5522,7 +5630,10 @@ function buildTaskDetailActions(t){
     if(t.status === "Completed" && !t.rating) return `<button class="btn amber" data-rate="${t.id}">ให้คะแนน</button>${isChat}${dupBtn}`;
     return isChat + dupBtn;
   }
-  if(state.role === "DRIVER"){
+  // A dispatcher who also drives needs the driver's buttons on their own work
+  // screen and the dispatcher's buttons everywhere else — the same job, two
+  // different hats.
+  if(state.role === "DRIVER" || (isCrew() && state.tab === "available")){
     const mine = (t.drivers||[]).some(d=> d.employee_id === state.employee_id);
     const amPrimary = t.driver_employee_id === state.employee_id;
     const leaveBtn = ["Assigned","In Progress","Pause"].includes(t.status) ? `<button class="btn red" data-leave="${t.id}">ออกจากงาน</button>` : "";
@@ -5987,7 +6098,10 @@ async function refreshAll(opts={}){
   let scope = "core";
   if(state.role === "DRIVER") scope = "driver";
   else if(isOps()){
-    scope = (state.tab === "dashboard") ? "admin_dash" : "admin_ops";
+    // On their own work screen a dispatcher needs the driver payload (their
+    // vehicle, their jobs), not the operations one.
+    scope = (state.tab === "available" && isCrew()) ? "driver"
+          : (state.tab === "dashboard") ? "admin_dash" : "admin_ops";
   }
   // Only one refresh in flight at a time. A manual tap, a push-triggered
   // refresh and the background timer can all fire close together; without
@@ -6105,7 +6219,7 @@ async function bootstrap(){
   // back in it before the first render, so the common case is zero taps and
   // the screen never flashes "ยังไม่ได้เลือกรถ" on the way to the right
   // answer. Deliberately before refreshAll, never on a background poll.
-  if(state.role === "DRIVER") await autoBoardDefaultVehicle();
+  if(isCrew()) await autoBoardDefaultVehicle();
   renderShell();
   await refreshAll();
   startPolling();
