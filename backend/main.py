@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261015.1831"
+APP_VERSION = "TTLOD.261016.0802"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -1997,6 +1997,14 @@ def current_user(authorization: Optional[str] = Header(None)):
 
 ROLES = ("USER", "DRIVER", "DISPATCH", "ADMIN")
 
+# Who can be put on a job.
+#
+# Dispatchers run the floor, and one who also drives is crew like anybody
+# else — but only once they hold a licence. Without that condition every
+# dispatcher who never touches a forklift would show up in the driver list,
+# in "คนขับว่าง", and in the assignment suggestions.
+CREW_ROLES = ("DRIVER", "DISPATCH")
+
 # Who each role may set someone else's role to.
 ROLES_ASSIGNABLE_BY = {
     "ADMIN": ("USER", "DRIVER", "DISPATCH", "ADMIN"),
@@ -2040,6 +2048,11 @@ def require_role(*roles):
 # side of the line.
 def require_ops():
     return require_role("ADMIN", "DISPATCH")
+
+
+def require_crew():
+    """Anyone who may be on a job: a driver, or a dispatcher who also drives."""
+    return require_role(*CREW_ROLES)
 
 
 @app.post("/auth/login")
@@ -2257,8 +2270,9 @@ def me(user=Depends(current_user)):
            "full_name": user["full_name"], "contact": user["contact"], "cost_center": user["cost_center"],
            "email": user["email"],
            "driver_status": user["driver_status"], "checked_in_vehicle_id": user["checked_in_vehicle_id"]}
-    if user["role"] == "DRIVER":
-        # Read-only on the driver's own profile; only an admin changes these.
+    if user["role"] in CREW_ROLES:
+        # Read-only on their own profile; only an admin changes these. A
+        # dispatcher gets them too: holding one is what makes them crew.
         with get_db() as db:
             today = datetime.utcnow().strftime("%Y-%m-%d")
             out["licenses"] = [
@@ -2396,12 +2410,33 @@ def admin_update_user(user_id: int, body: UserAdminUpdateBody, user=Depends(requ
             if fields["role"] not in ROLES:
                 raise HTTPException(400, "role ไม่ถูกต้อง")
             require_can_grant_role(user, fields["role"])
+            # Moving someone off the floor mid-job would leave the job with a
+            # driver the system no longer treats as one.
+            if row["role"] in CREW_ROLES and fields["role"] not in CREW_ROLES:
+                active = db.execute(
+                    "SELECT tasks.task_code FROM task_assignments "
+                    "JOIN tasks ON tasks.id = task_assignments.task_id "
+                    "WHERE task_assignments.driver_id=? AND task_assignments.assignment_status='Active' "
+                    "AND tasks.status NOT IN ('Completed','Cancelled')", (user_id,)).fetchall()
+                if active:
+                    codes = ", ".join(a["task_code"] for a in active)
+                    raise HTTPException(
+                        400, f"เปลี่ยนสิทธิ์ไม่ได้ เพราะยังมีงานที่ทำอยู่ ({codes}) — "
+                             "กรุณาจบงานหรือมอบหมายใหม่ก่อน")
         if not fields:
             return {"ok": True}
         set_clause = ", ".join(f"{k}=?" for k in fields.keys())
         db.execute(f"UPDATE users SET {set_clause} WHERE id=?", list(fields.values()) + [user_id])
-        if fields.get("role") == "DRIVER" and row["role"] != "DRIVER":
+        new_role = fields.get("role")
+        if new_role in CREW_ROLES and row["role"] != new_role and row["driver_status"] is None:
             db.execute("UPDATE users SET driver_status='Not Checked-in' WHERE id=?", (user_id,))
+        # Someone moved off the floor should not keep a vehicle or a status
+        # that makes them look available for work.
+        if new_role and new_role not in CREW_ROLES and row["role"] in CREW_ROLES:
+            db.execute("UPDATE vehicles SET status='Available' WHERE id=? AND status!='Breakdown'",
+                       (row["checked_in_vehicle_id"],))
+            db.execute("UPDATE users SET driver_status=NULL, checked_in_vehicle_id=NULL WHERE id=?",
+                       (user_id,))
         audit(db, user["id"], "admin_update_user", f"{row['employee_id']}: {fields}")
         return {"ok": True}
 
@@ -2426,7 +2461,7 @@ def admin_delete_user(user_id: int, user=Depends(require_ops())):
             ).fetchone()["n"]
             if other_admins == 0:
                 raise HTTPException(400, "ลบไม่ได้ เพราะเป็น Admin คนสุดท้ายในระบบ")
-        if row["role"] == "DRIVER":
+        if row["role"] in CREW_ROLES:
             active = db.execute(
                 "SELECT tasks.task_code FROM task_assignments "
                 "JOIN tasks ON tasks.id = task_assignments.task_id "
@@ -2490,6 +2525,14 @@ class LicenseBody(BaseModel):
 @app.post("/admin/users/{user_id}/licenses")
 def set_driver_license(user_id: int, body: LicenseBody, user=Depends(require_ops())):
     _guard_target(user, user_id)
+    with get_db() as db:
+        target = db.execute("SELECT role, driver_status FROM users WHERE id=?", (user_id,)).fetchone()
+    if not target:
+        raise HTTPException(404, "ไม่พบผู้ใช้")
+    if target["role"] not in CREW_ROLES:
+        raise HTTPException(
+            400, "ออกใบอนุญาตได้เฉพาะคนขับและผู้กระจายงาน — "
+                 "ถ้าต้องการให้คนนี้ขับรถ กรุณาเปลี่ยนสิทธิ์ก่อน")
     if body.expiry_date:
         try:
             datetime.strptime(body.expiry_date, "%Y-%m-%d")
@@ -2509,6 +2552,11 @@ def set_driver_license(user_id: int, body: LicenseBody, user=Depends(require_ops
                     400, f"รถ {code} เป็นประเภท {v['vehicle_type']} "
                          f"จึงตั้งเป็นรถประจำของใบอนุญาต {body.vehicle_type} ไม่ได้")
             default_id = v["id"]
+        # A dispatcher's row has no driver_status until the day they are given
+        # a licence — give them one now, or they would be crew with no state
+        # and never appear as available to anybody.
+        if target["driver_status"] is None:
+            db.execute("UPDATE users SET driver_status='Not Checked-in' WHERE id=?", (user_id,))
         db.execute(
             "INSERT INTO driver_licenses (driver_id, vehicle_type, expiry_date, default_vehicle_id) "
             "VALUES (?,?,?,?) ON CONFLICT(driver_id, vehicle_type) DO UPDATE SET "
@@ -2969,7 +3017,7 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER", "ADMIN", "DI
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         result = task_to_dict(row, db, viewer_role=user["role"])
         available = db.execute(
-            "SELECT COUNT(*) n FROM users WHERE role='DRIVER' AND driver_status='Available' AND deleted_at IS NULL"
+            "SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND driver_status='Available' AND deleted_at IS NULL"
         ).fetchone()["n"]
         if available == 0:
             result["warning"] = "ตอนนี้ยังไม่มีคนขับว่าง งานอาจต้องใช้เวลาสักหน่อยกว่าจะมีคนขับรับงาน"
@@ -3265,7 +3313,7 @@ def resolve_crew(db, body, task_row):
     """
     out, problems = [], []
     for emp in body.drivers():
-        drv = db.execute("SELECT * FROM users WHERE employee_id=? AND role='DRIVER'", (emp,)).fetchone()
+        drv = db.execute("SELECT * FROM users WHERE employee_id=? AND (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id)))", (emp,)).fetchone()
         if not drv:
             raise HTTPException(404, f"ไม่พบคนขับ {emp}")
         veh = None
@@ -3527,7 +3575,7 @@ def reassign_task(task_id: int, body: AssignBody, user=Depends(require_ops())):
 
 
 @app.post("/tasks/{task_id}/make-active")
-def make_task_active(task_id: int, user=Depends(require_role("DRIVER"))):
+def make_task_active(task_id: int, user=Depends(require_crew())):
     """Work this queued job now instead of the one the system picked.
 
     The queue is served oldest-first by default, but a driver who is already
@@ -3572,7 +3620,7 @@ class SelfAssignBody(BaseModel):
 
 
 @app.post("/tasks/{task_id}/self-assign")
-def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_role("DRIVER"))):
+def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_crew())):
     """A driver takes a Waiting task themselves, using the vehicle they already checked in with."""
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -3600,7 +3648,7 @@ def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_ro
 
 
 @app.post("/tasks/{task_id}/take-over")
-def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_role("DRIVER"))):
+def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_crew())):
     """A driver takes over a task another driver is already working, using their
     own checked-in vehicle. Functionally a driver-initiated reassign."""
     with get_db() as db:
@@ -3636,7 +3684,7 @@ class AcceptBody(BaseModel):
 
 
 @app.post("/tasks/{task_id}/accept")
-def accept_task(task_id: int, body: AcceptBody, user=Depends(require_role("DRIVER"))):
+def accept_task(task_id: int, body: AcceptBody, user=Depends(require_crew())):
     """Driver acknowledges the assignment and reports current battery %.
     Status stays 'Assigned'; accept time is recorded separately so Admin/User
     can see the driver has acknowledged but not yet started."""
@@ -3659,7 +3707,7 @@ def accept_task(task_id: int, body: AcceptBody, user=Depends(require_role("DRIVE
 
 
 @app.post("/tasks/{task_id}/start")
-def start_task(task_id: int, user=Depends(require_role("DRIVER"))):
+def start_task(task_id: int, user=Depends(require_crew())):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -3675,7 +3723,7 @@ def start_task(task_id: int, user=Depends(require_role("DRIVER"))):
 
 
 @app.post("/tasks/{task_id}/complete")
-def complete_task(task_id: int, user=Depends(require_role("DRIVER"))):
+def complete_task(task_id: int, user=Depends(require_crew())):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -3785,7 +3833,7 @@ class JoinTaskBody(BaseModel):
 
 
 @app.post("/tasks/{task_id}/join")
-def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_role("DRIVER"))):
+def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_crew())):
     """A driver adds themself to a task someone else is already working, alongside
     them (not replacing) — for jobs that genuinely need more than one person."""
     with get_db() as db:
@@ -3846,7 +3894,7 @@ def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_ops
         if row["status"] not in ("Assigned", "In Progress", "Pause"):
             raise HTTPException(400, "เพิ่มคนขับได้เฉพาะงานที่กำลังดำเนินการเท่านั้น")
         driver = db.execute(
-            "SELECT * FROM users WHERE employee_id=? AND role='DRIVER'", (body.driver_employee_id,)
+            "SELECT * FROM users WHERE employee_id=? AND (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id)))", (body.driver_employee_id,)
         ).fetchone()
         if not driver:
             raise HTTPException(404, "ไม่พบคนขับคนนี้")
@@ -3877,7 +3925,7 @@ def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_ops
 
 
 @app.post("/tasks/{task_id}/leave")
-def leave_task(task_id: int, user=Depends(require_role("DRIVER"))):
+def leave_task(task_id: int, user=Depends(require_crew())):
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -3967,11 +4015,21 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
     """
     if body.category not in ("user", "vehicle"):
         raise HTTPException(400, "category must be 'user' or 'vehicle'")
-    if user["role"] != "DRIVER":
-        # Only a driver can report a VEHICLE fault, since that pulls their own
-        # vehicle out of service.
+    on_the_job = False
+    if user["role"] in CREW_ROLES:
+        with get_db() as db:
+            on_the_job = bool(db.execute(
+                "SELECT 1 FROM task_assignments WHERE task_id=? AND driver_id=? "
+                "AND assignment_status='Active'", (task_id, user["id"])).fetchone())
+    if not on_the_job:
+        # Only someone driving this job can report a VEHICLE fault, since that
+        # pulls their own vehicle out of service.
         if body.category != "user":
-            raise HTTPException(400, "เฉพาะคนขับเท่านั้นที่แจ้งปัญหารถได้")
+            raise HTTPException(400, "เฉพาะคนขับที่อยู่บนงานนี้เท่านั้นที่แจ้งปัญหารถได้")
+        if user["role"] == "DRIVER":
+            # Unchanged for drivers: a driver who is not on the job has no
+            # business pausing it.
+            raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
         with get_db() as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not row:
@@ -4448,7 +4506,7 @@ def dispatch_board(user=Depends(require_ops())):
             "   AND task_assignments.assignment_status='Active' "
             "LEFT JOIN tasks ON tasks.id = task_assignments.task_id "
             "   AND tasks.status NOT IN ('Completed','Cancelled') "
-            "WHERE users.role='DRIVER' AND users.deleted_at IS NULL "
+            "WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND users.deleted_at IS NULL "
             "ORDER BY users.full_name, users.employee_id"
         ).fetchall()
 
@@ -4520,7 +4578,7 @@ def drivers_availability_summary(user=Depends(current_user)):
     with get_db() as db:
         rows = db.execute(
             "SELECT driver_status, COUNT(*) n FROM users "
-            "WHERE role='DRIVER' AND deleted_at IS NULL GROUP BY driver_status"
+            "WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND deleted_at IS NULL GROUP BY driver_status"
         ).fetchall()
         counts = {r["driver_status"]: r["n"] for r in rows}
         available = counts.get("Available", 0)
@@ -4549,7 +4607,7 @@ def list_drivers(user=Depends(require_ops())):
             f"SUM(CASE WHEN driver_licenses.expiry_date IS NOT NULL AND driver_licenses.expiry_date < {today_expr} "
             "THEN 1 ELSE 0 END) AS expired_count "
             "FROM users LEFT JOIN driver_licenses ON driver_licenses.driver_id = users.id "
-            "WHERE users.role='DRIVER' AND users.deleted_at IS NULL GROUP BY users.id"
+            "WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND users.deleted_at IS NULL GROUP BY users.id"
         ).fetchall()
         # How much work each driver is holding. The dispatcher chose not to cap
         # queue length, so the only thing stopping jobs quietly piling onto one
@@ -4765,7 +4823,7 @@ def vehicle_holders(db):
     """
     rows = db.execute(
         "SELECT id, employee_id, full_name, first_name, driver_status, checked_in_vehicle_id "
-        "FROM users WHERE role='DRIVER' AND deleted_at IS NULL AND checked_in_vehicle_id IS NOT NULL"
+        "FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND deleted_at IS NULL AND checked_in_vehicle_id IS NOT NULL"
     ).fetchall()
     return {r["checked_in_vehicle_id"]: r for r in rows}
 
@@ -4776,7 +4834,7 @@ HOLD_PROTECTED_STATUSES = ("Busy", "Breakdown")
 
 
 @app.get("/vehicles/available-for-checkin")
-def vehicles_available_for_checkin(user=Depends(require_role("DRIVER"))):
+def vehicles_available_for_checkin(user=Depends(require_crew())):
     """Every vehicle this driver is licensed for, including ones another
     driver is currently in.
 
@@ -4821,7 +4879,7 @@ class DriverStatusBody(BaseModel):
 
 
 @app.post("/drivers/status")
-def set_driver_status(body: DriverStatusBody, user=Depends(require_role("DRIVER"))):
+def set_driver_status(body: DriverStatusBody, user=Depends(require_crew())):
     if body.status not in ("Not Checked-in", "Available", "Busy", "Pause", "Breakdown"):
         raise HTTPException(400, "สถานะไม่ถูกต้อง")
     with get_db() as db:
@@ -4846,7 +4904,7 @@ def valid_license_types(db, driver_id) -> set:
 
 
 @app.post("/vehicles/check-in")
-def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
+def vehicle_check_in(body: CheckInBody, user=Depends(require_crew())):
     with get_db() as db:
         v = db.execute("SELECT * FROM vehicles WHERE code=?", (body.vehicle_code,)).fetchone()
         if not v:
@@ -4869,7 +4927,7 @@ def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
         # changes hands at the end of a shift — unless they are mid-job, in
         # which case nothing may pull it out from under them.
         holder = db.execute(
-            "SELECT * FROM users WHERE role='DRIVER' AND deleted_at IS NULL "
+            "SELECT * FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND deleted_at IS NULL "
             "AND checked_in_vehicle_id=? AND id!=?", (v["id"], user["id"]),
         ).fetchone()
         if holder:
@@ -4924,7 +4982,7 @@ def vehicle_check_in(body: CheckInBody, user=Depends(require_role("DRIVER"))):
 
 
 @app.post("/vehicles/auto-board")
-def auto_board_default_vehicle(user=Depends(require_role("DRIVER"))):
+def auto_board_default_vehicle(user=Depends(require_crew())):
     """Put the driver back in their usual vehicle, called once when the app
     opens.
 
@@ -4968,7 +5026,7 @@ def auto_board_default_vehicle(user=Depends(require_role("DRIVER"))):
 
 
 @app.post("/vehicles/check-out")
-def vehicle_check_out(user=Depends(require_role("DRIVER"))):
+def vehicle_check_out(user=Depends(require_crew())):
     with get_db() as db:
         row = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if row["driver_status"] == "Busy":
@@ -4992,7 +5050,7 @@ def suggest_dispatch(task_id: int, user=Depends(require_ops())):
         for v in vehicles:
             drivers = db.execute(
                 "SELECT DISTINCT users.* FROM users JOIN driver_licenses ON driver_licenses.driver_id = users.id "
-                "WHERE users.role='DRIVER' AND users.driver_status='Available' AND users.deleted_at IS NULL "
+                "WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND users.driver_status='Available' AND users.deleted_at IS NULL "
                 "AND driver_licenses.vehicle_type=?",
                 (v["vehicle_type"],),
             ).fetchall()
@@ -5010,7 +5068,7 @@ def suggest_dispatch(task_id: int, user=Depends(require_ops())):
 # ---------------------------------------------------------------------------
 
 @app.get("/drivers/me/stats")
-def my_driver_stats(period: str = "day", date: Optional[str] = None, user=Depends(require_role("DRIVER"))):
+def my_driver_stats(period: str = "day", date: Optional[str] = None, user=Depends(require_crew())):
     if period not in ("day", "month"):
         raise HTTPException(400, "period must be 'day' or 'month'")
     if not date:
@@ -5059,7 +5117,7 @@ class BreakdownBody(BaseModel):
 
 
 @app.post("/breakdowns")
-def report_breakdown(body: BreakdownBody, user=Depends(require_role("DRIVER"))):
+def report_breakdown(body: BreakdownBody, user=Depends(require_crew())):
     with get_db() as db:
         if body.target_type == "driver":
             target_id = user["id"]
@@ -5349,10 +5407,10 @@ def dashboard(user=Depends(require_role("ADMIN"))):
         delayed = db.execute("SELECT COUNT(*) n FROM tasks WHERE status='Waiting' AND created_at<?", (cutoff,)).fetchone()["n"]
         task_counts["Delayed"] = delayed
 
-        avail_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE role='DRIVER' AND driver_status='Available' AND deleted_at IS NULL").fetchone()["n"]
-        total_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE role='DRIVER' AND deleted_at IS NULL").fetchone()["n"]
-        busy_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE role='DRIVER' AND driver_status='Busy' AND deleted_at IS NULL").fetchone()["n"]
-        breakdown_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE role='DRIVER' AND driver_status='Breakdown' AND deleted_at IS NULL").fetchone()["n"]
+        avail_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND driver_status='Available' AND deleted_at IS NULL").fetchone()["n"]
+        total_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND deleted_at IS NULL").fetchone()["n"]
+        busy_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND driver_status='Busy' AND deleted_at IS NULL").fetchone()["n"]
+        breakdown_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND driver_status='Breakdown' AND deleted_at IS NULL").fetchone()["n"]
 
         avail_vehicles = db.execute("SELECT COUNT(*) n FROM vehicles WHERE status='Available'").fetchone()["n"]
         total_vehicles = db.execute("SELECT COUNT(*) n FROM vehicles").fetchone()["n"]
@@ -5396,6 +5454,92 @@ def dashboard_task_volume(days: int = 7, user=Depends(require_ops())):
             "this_month": count_since(30),
         }
         return {"series": series, "summary": summary}
+
+
+# Bangkok time, because "today" on a dashboard means the warehouse's today.
+# Everything is stored in UTC, so a job opened at 06:00 local was landing in
+# YESTERDAY's column on every count that used the UTC date.
+BKK_OFFSET = timedelta(hours=7)
+
+# Six statuses are too many segments to read on a phone-width bar, so they are
+# grouped into the four states anyone looking at a backlog actually asks about.
+VOLUME_GROUPS = (
+    ("waiting", "รอดำเนินการ", ("Waiting",)),
+    ("active", "กำลังดำเนินการ", ("Assigned", "In Progress", "Pause")),
+    ("done", "เสร็จสิ้น", ("Completed",)),
+    ("cancelled", "ยกเลิก", ("Cancelled",)),
+)
+_GROUP_OF = {st: key for key, _, sts in VOLUME_GROUPS for st in sts}
+
+
+def _to_bkk(iso_utc: str) -> Optional[datetime]:
+    if not iso_utc:
+        return None
+    try:
+        return datetime.fromisoformat(iso_utc.replace("Z", "").split("+")[0]) + BKK_OFFSET
+    except ValueError:
+        return None
+
+
+@app.get("/dashboard/volume-buckets")
+def dashboard_volume_buckets(period: str = "today", user=Depends(require_ops())):
+    """How much work was opened, when, and where it stands now.
+
+    One bar per hour (today) or per day (this week / this month), stacked by
+    what each job's status is now — so the part of the bar that is not yet
+    green is the backlog from that slot, in the shape it actually arrived in.
+    Both measures come back together: the screen's งาน/พาเลท switch flips
+    between them without another round-trip.
+    """
+    if period not in ("today", "week", "month"):
+        raise HTTPException(400, "period ต้องเป็น today, week หรือ month")
+    now_bkk = datetime.utcnow() + BKK_OFFSET
+    if period == "today":
+        start_bkk = now_bkk.replace(hour=0, minute=0, second=0, microsecond=0)
+        step, count, fmt = timedelta(hours=1), 24, lambda d: d.strftime("%H")
+    else:
+        days = 7 if period == "week" else 30
+        start_bkk = (now_bkk - timedelta(days=days - 1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        step, count, fmt = timedelta(days=1), days, lambda d: d.strftime("%-d/%-m")
+
+    buckets = []
+    for i in range(count):
+        at = start_bkk + step * i
+        buckets.append({
+            "label": fmt(at),
+            "start": at.isoformat(timespec="seconds"),
+            "jobs": {g[0]: 0 for g in VOLUME_GROUPS},
+            "pallets": {g[0]: 0 for g in VOLUME_GROUPS},
+        })
+
+    since_utc = (start_bkk - BKK_OFFSET).isoformat(timespec="seconds") + "Z"
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT created_at, status, pallet_qty FROM tasks WHERE created_at >= ?",
+            (since_utc,),
+        ).fetchall()
+    for r in rows:
+        at = _to_bkk(r["created_at"])
+        if not at:
+            continue
+        idx = int((at - start_bkk) / step)
+        if not (0 <= idx < count):
+            continue
+        g = _GROUP_OF.get(r["status"])
+        if not g:
+            continue
+        buckets[idx]["jobs"][g] += 1
+        buckets[idx]["pallets"][g] += int(r["pallet_qty"] or 0)
+
+    totals = {m: {g[0]: sum(b[m][g[0]] for b in buckets) for g in VOLUME_GROUPS}
+              for m in ("jobs", "pallets")}
+    return {
+        "period": period,
+        "buckets": buckets,
+        "totals": totals,
+        "groups": [{"key": k, "label": lbl} for k, lbl, _ in VOLUME_GROUPS],
+    }
 
 
 @app.get("/dashboard/overview")
@@ -5464,8 +5608,8 @@ def dashboard_overview(period: str = "today", user=Depends(require_ops())):
         ).fetchone()["n"]
         overdue = waiting_overdue + inprogress_overdue
 
-        total_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE role='DRIVER' AND deleted_at IS NULL").fetchone()["n"]
-        busy_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE role='DRIVER' AND driver_status='Busy' AND deleted_at IS NULL").fetchone()["n"]
+        total_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND deleted_at IS NULL").fetchone()["n"]
+        busy_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND driver_status='Busy' AND deleted_at IS NULL").fetchone()["n"]
         total_vehicles = db.execute("SELECT COUNT(*) n FROM vehicles").fetchone()["n"]
         busy_vehicles = db.execute("SELECT COUNT(*) n FROM vehicles WHERE status='Busy'").fetchone()["n"]
 
