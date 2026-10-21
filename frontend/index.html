@@ -2774,12 +2774,13 @@ function openCreateTask(prefill){
     <div class="sheet-overlay">
       <div class="sheet">
         <div class="sheet-head"><h2>สร้างงานใหม่</h2><button class="sheet-close">✕</button></div>
+        ${BOOKING_ENABLED ? `
         <label>ประเภทคำขอ</label>
         <select id="ct-type"><option value="Request Now">ขอทันที</option><option value="Booking">จองล่วงหน้า</option></select>
         <div id="ct-booking-wrap" style="display:none;">
           <label>วันเวลาที่ต้องการ</label>
           <input id="ct-scheduled" type="datetime-local" />
-        </div>
+        </div>` : ""}
         <label>BU</label>
         <select id="ct-bu">${BU_LIST.map(b=>`<option value="${b}">${b}</option>`).join("")}</select>
         <label for="ct-cc">Cost center ของงานนี้ (5 หลัก)</label>
@@ -2812,9 +2813,11 @@ function openCreateTask(prefill){
   document.body.appendChild(overlay);
   overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
-  overlay.querySelector("#ct-type").onchange = (e)=>{
-    overlay.querySelector("#ct-booking-wrap").style.display = e.target.value === "Booking" ? "block" : "none";
-  };
+  if(BOOKING_ENABLED){
+    overlay.querySelector("#ct-type").onchange = (e)=>{
+      overlay.querySelector("#ct-booking-wrap").style.display = e.target.value === "Booking" ? "block" : "none";
+    };
+  }
 
   // Let a User see at a glance whether a driver is likely free before they
   // even submit — the actual "might take a while" warning still comes back
@@ -2861,8 +2864,12 @@ function openCreateTask(prefill){
   }
 
   overlay.querySelector("#ct-submit").onclick = async ()=>{
-    const reqType = overlay.querySelector("#ct-type").value;
-    const scheduled = overlay.querySelector("#ct-scheduled").value;
+    // With booking switched off these two controls are not in the sheet at
+    // all, so read them defensively — every job is simply an immediate one.
+    const typeEl = overlay.querySelector("#ct-type");
+    const schedEl = overlay.querySelector("#ct-scheduled");
+    const reqType = typeEl ? typeEl.value : "Request Now";
+    const scheduled = schedEl ? schedEl.value : "";
     if(reqType === "Booking" && !scheduled){ toast("กรุณาระบุวันเวลานัดหมาย"); return; }
     // Checked in the order the fields appear, so the message always points at
     // the first thing still missing as you read down the sheet.
@@ -4143,6 +4150,13 @@ function renderVolumeChart(card, data){
     ${data.groups.map(g=>`<span class="chip" style="cursor:default;"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${VOLUME_COLORS[g.key]};margin-right:5px;"></span>${g.label} ${totals[g.key]||0}</span>`).join("")}
   </div>`));
 }
+
+// Advance booking ("จองล่วงหน้า") is switched off, not deleted. The picker
+// and the appointment field are hidden and every new job is an immediate
+// request — but a job booked BEFORE this still shows its appointment time
+// everywhere it used to, and can still have that time corrected. Turning it
+// back on is this one line and its twin in main.py.
+const BOOKING_ENABLED = false;
 
 const TH_GROUP = {waiting:"รอดำเนินการ", active:"กำลังดำเนินการ", done:"เสร็จสิ้น", cancelled:"ยกเลิก"};
 function bindCardClickToDetail(container){

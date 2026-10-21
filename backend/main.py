@@ -140,7 +140,16 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261021.1932"
+APP_VERSION = "TTLOD.261021.2145"
+
+# Advance booking ("จองล่วงหน้า") is switched off, not deleted.
+#
+# Nothing offers it any more and the server refuses it, but the columns, the
+# stored appointment times and the report column all stay exactly as they
+# were: jobs booked before this still show their time and still export
+# correctly. Turning it back on is this one line here and its twin in
+# index.html — nothing else has to be rebuilt.
+BOOKING_ENABLED = False
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -3104,8 +3113,13 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER", "ADMIN", "DI
     requester on the job — they are the one the drivers will talk to in the
     chat and the one who gets told when it is done.
     """
-    if body.request_type == "Booking" and not body.scheduled_at:
-        raise HTTPException(400, "การจองล่วงหน้าต้องระบุวันเวลา")
+    if body.request_type == "Booking":
+        if not BOOKING_ENABLED:
+            raise HTTPException(400, "ระบบจองล่วงหน้าปิดใช้งานอยู่ — ทุกงานเป็นการขอทันที")
+        if not body.scheduled_at:
+            raise HTTPException(400, "การจองล่วงหน้าต้องระบุวันเวลา")
+    if body.request_type not in ("Request Now", "Booking"):
+        raise HTTPException(400, "ประเภทคำขอไม่ถูกต้อง")
     if body.bu not in BU_LIST:
         raise HTTPException(400, f"BU ไม่ถูกต้อง ต้องเป็นหนึ่งใน: {', '.join(BU_LIST)}")
     # The job's own cost centre, defaulting to the requester's. An admin or
