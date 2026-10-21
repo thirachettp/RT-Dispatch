@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261016.0802"
+APP_VERSION = "TTLOD.261021.1932"
 
 # Thai labels for statuses that appear inside user-facing error messages. The
 # frontend has its own copies for rendering; these exist so a message built on
@@ -793,6 +793,17 @@ CREATE TABLE IF NOT EXISTS users (
 -- accounts without one (the common case) never collide with each other.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS driver_zones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    driver_id INTEGER NOT NULL REFERENCES users(id),
+    -- The zone's immutable key, the same string tasks store in from_zone.
+    zone_key TEXT NOT NULL,
+    -- 1 = โซนหลัก, at most one per person. 2 = โซนรอง, as many as they like.
+    priority INTEGER NOT NULL DEFAULT 2,
+    created_at TEXT NOT NULL,
+    UNIQUE(driver_id, zone_key)
+);
+
 CREATE TABLE IF NOT EXISTS vehicle_types (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type_key TEXT UNIQUE NOT NULL,
@@ -1041,6 +1052,7 @@ CREATE TABLE IF NOT EXISTS task_photos (
 # EVERY authenticated request and, with no index, that was a full scan of a
 # table which grows with every login the system has ever seen.
 INDEX_STATEMENTS = [
+    "CREATE INDEX IF NOT EXISTS idx_driver_zones_driver ON driver_zones(driver_id)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token)",
     "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
     "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)",
@@ -1170,6 +1182,32 @@ def _column_exists(db, table, column):
             (table, column),
         ).fetchone())
     return column in [r["name"] for r in db.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+# Tables added after the first release.
+#
+# Same trap as NEW_COLUMNS, one level up: on Postgres, init_db() applies SCHEMA
+# only when the database is FRESH, so a table added to SCHEMA alone would never
+# exist on the live one and every screen that touched it would 500. This runs
+# on every boot for both backends instead.
+NEW_TABLES = ("driver_zones",)
+
+
+def ensure_tables():
+    try:
+        with get_db() as db:
+            for name in NEW_TABLES:
+                m = re.search(r"CREATE TABLE IF NOT EXISTS " + name + r" \(.*?\n\);", SCHEMA, re.S)
+                if not m:
+                    log.warning("No CREATE statement in SCHEMA for %s", name)
+                    continue
+                ddl = m.group(0)
+                if IS_POSTGRES:
+                    ddl = (ddl.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+                              .replace("BLOB", "BYTEA"))
+                db.execute(ddl)
+    except Exception as e:
+        log.warning("ensure_tables skipped: %s", e)
 
 
 def ensure_columns():
@@ -2271,6 +2309,8 @@ def me(user=Depends(current_user)):
            "email": user["email"],
            "driver_status": user["driver_status"], "checked_in_vehicle_id": user["checked_in_vehicle_id"]}
     if user["role"] in CREW_ROLES:
+        with get_db() as db:
+            out["home_zones"] = read_home_zones(db, user["id"])
         # Read-only on their own profile; only an admin changes these. A
         # dispatcher gets them too: holding one is what makes them crew.
         with get_db() as db:
@@ -2520,6 +2560,89 @@ class LicenseBody(BaseModel):
     expiry_date: Optional[str] = None  # None = permanent, never expires
     # The driver's usual vehicle of this type. "" / None clears it.
     default_vehicle_code: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Home zones ("โซนประจำ")
+# ---------------------------------------------------------------------------
+# A driver works an area, not a vehicle type, so this lives on the person
+# rather than on the licence the way รถประจำ does. One โซนหลัก, any number of
+# โซนรอง (the zones they also help out in), or none at all — which is the
+# default and means they see every zone's work equally, exactly as before.
+#
+# Nothing here ever BLOCKS a job: zones only change the order work is shown in
+# and add a label. A zone with one person off sick must not become a zone whose
+# jobs nobody can see.
+MAX_HOME_ZONES = 20
+
+
+def read_home_zones(db, user_id: int):
+    rows = db.execute(
+        "SELECT zone_key, priority FROM driver_zones WHERE driver_id=? ORDER BY priority, zone_key",
+        (user_id,),
+    ).fetchall()
+    primary = next((r["zone_key"] for r in rows if r["priority"] == 1), None)
+    return {"primary": primary,
+            "secondary": [r["zone_key"] for r in rows if r["priority"] != 1]}
+
+
+def write_home_zones(db, user_id: int, primary: Optional[str], secondary):
+    """Replaces whatever they had. An empty primary and an empty list is a
+    valid answer — 'ไม่ระบุโซนประจำ' is a choice, not a missing value."""
+    primary = (primary or "").strip() or None
+    wanted = []
+    for key in ([primary] if primary else []) + list(secondary or []):
+        key = (key or "").strip()
+        # The primary wins if it was also ticked as a secondary.
+        if key and key not in wanted:
+            wanted.append(key)
+    if len(wanted) > MAX_HOME_ZONES:
+        raise HTTPException(400, f"เลือกโซนได้ไม่เกิน {MAX_HOME_ZONES} โซน")
+    for key in wanted:
+        # Checked against zone_key, not the Thai name: the name is editable and
+        # the key is what every task stores.
+        if not db.execute("SELECT 1 FROM zones WHERE zone_key=?", (key,)).fetchone():
+            raise HTTPException(400, f"ไม่พบโซน {key}")
+    db.execute("DELETE FROM driver_zones WHERE driver_id=?", (user_id,))
+    now = now_iso()
+    for key in wanted:
+        db.execute(
+            "INSERT INTO driver_zones (driver_id, zone_key, priority, created_at) VALUES (?,?,?,?)",
+            (user_id, key, 1 if key == primary else 2, now))
+    return read_home_zones(db, user_id)
+
+
+class HomeZonesBody(BaseModel):
+    primary_zone: Optional[str] = None
+    secondary_zones: List[str] = []
+
+
+@app.put("/me/zones")
+def update_my_zones(body: HomeZonesBody, user=Depends(require_crew())):
+    """A driver sets their own. Admins and dispatchers can set it for them
+    through the staff sheet — same rules, same validation."""
+    with get_db() as db:
+        return write_home_zones(db, user["id"], body.primary_zone, body.secondary_zones)
+
+
+@app.get("/admin/users/{user_id}/zones")
+def admin_get_zones(user_id: int, user=Depends(require_ops())):
+    with get_db() as db:
+        return read_home_zones(db, user_id)
+
+
+@app.put("/admin/users/{user_id}/zones")
+def admin_set_zones(user_id: int, body: HomeZonesBody, user=Depends(require_ops())):
+    _guard_target(user, user_id)
+    with get_db() as db:
+        target = db.execute("SELECT role, employee_id FROM users WHERE id=?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "ไม่พบผู้ใช้")
+        if target["role"] not in CREW_ROLES:
+            raise HTTPException(400, "ตั้งโซนประจำได้เฉพาะคนขับและผู้กระจายงานที่ขับรถ")
+        out = write_home_zones(db, user_id, body.primary_zone, body.secondary_zones)
+        audit(db, user["id"], "set_home_zones", f"{target['employee_id']}: {out}")
+        return out
 
 
 @app.post("/admin/users/{user_id}/licenses")
@@ -4618,10 +4741,23 @@ def list_drivers(user=Depends(require_ops())):
             "WHERE ta.assignment_status='Active' AND ta.is_active_for_driver=0 "
             "AND t.status NOT IN ('Completed','Cancelled') GROUP BY ta.driver_id"
         ).fetchall()}
+        # Home zones for everyone in one query, so the assignment sheet can put
+        # the people whose area this job is in at the top without asking per
+        # driver (this list is rebuilt on every refresh).
+        zones_by_driver = {}
+        for r in db.execute(
+            "SELECT driver_id, zone_key, priority FROM driver_zones ORDER BY priority, zone_key"
+        ).fetchall():
+            z = zones_by_driver.setdefault(r["driver_id"], {"primary": None, "secondary": []})
+            if r["priority"] == 1:
+                z["primary"] = r["zone_key"]
+            else:
+                z["secondary"].append(r["zone_key"])
         out = []
         for r in rows:
             d = dict(r)
             d["queue_len"] = queued.get(r["id"], 0)
+            d["home_zones"] = zones_by_driver.get(r["id"], {"primary": None, "secondary": []})
             out.append(d)
         return out
 
@@ -5856,6 +5992,7 @@ try:
         # /healthz report the import error as the root cause.
         raise RuntimeError(f"Postgres driver import failed: {_IMPORT_ERROR}")
     init_db()
+    ensure_tables()
     ensure_columns()
     widen_role_constraint()
     try:

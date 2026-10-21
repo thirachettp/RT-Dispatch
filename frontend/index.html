@@ -61,9 +61,13 @@
   /* Task card, laid out as: code chip + status pill / route / icon fact strip
      / actions. The strip scrolls sideways on narrow phones rather than
      wrapping into a ragged block. */
-  .card-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;}
+  /* Wraps rather than squeezes: with a zone tag alongside the status chip the
+     job number was being crushed into three stacked lines. */
+  .card-top{display:flex;align-items:center;justify-content:space-between;gap:8px;
+    flex-wrap:wrap;margin-bottom:10px;}
   .task-code{display:inline-flex;align-items:center;gap:8px;background:var(--panel-2);
-    border-radius:10px;padding:7px 12px;font-weight:800;font-size:14px;letter-spacing:.02em;}
+    border-radius:10px;padding:7px 12px;font-weight:800;font-size:14px;letter-spacing:.02em;
+    white-space:nowrap;flex:none;}
   .tc-ico{width:17px;height:17px;display:block;color:var(--blue);}
   .tc-ico svg{width:100%;height:100%;display:block;}
   .route{font-size:16px;font-weight:800;line-height:1.45;margin-bottom:12px;}
@@ -181,6 +185,16 @@
   .logo-mark svg{width:16px;height:16px;display:block;}
   .brand b{letter-spacing:.02em;}
   .brand small{display:block;color:var(--ink-dim);font-size:11px;letter-spacing:.03em;}
+  .zone-pick{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px;}
+  .zone-opt{display:flex;align-items:center;gap:7px;padding:8px 12px;border:1px solid var(--line);
+    border-radius:999px;font-size:12.5px;cursor:pointer;background:var(--panel);}
+  .zone-opt input{width:auto;margin:0;}
+  .zone-opt.is-off{opacity:.45;cursor:not-allowed;}
+  .zone-tag{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:700;
+    padding:3px 8px;border-radius:999px;white-space:nowrap;}
+  .zone-tag.zm-1{background:var(--amber-dim);color:var(--amber);}
+  .zone-tag.zm-2{background:var(--green-dim);color:var(--green);}
+  .zone-tag.zm-3{background:var(--panel-2);color:var(--ink-dim);}
   .role-pill{font-size:11px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;color:var(--ink-dim);
     letter-spacing:.03em;max-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   main{flex:1;padding:16px;padding-bottom:90px;}
@@ -1273,6 +1287,66 @@ function fmtDuration(mins){
 
 // Each driver's current vehicle and live task, worked out from data the page
 // already holds — so the panel adds no extra request to every refresh.
+// One editor, used both by the person themselves in โปรไฟล์ and by an admin
+// in the staff sheet, so the two can never drift apart. Returns the card plus
+// a read() for whatever is currently ticked.
+function buildHomeZoneEditor(current){
+  const cur = current || EMPTY_ZONES;
+  const sec = new Set(cur.secondary || []);
+  // Retired zones stay listed when they are already chosen — dropping them
+  // silently would change someone's setting behind their back.
+  const options = (state.zones || [])
+    .filter(z=> z.active || z.zone_key === cur.primary || sec.has(z.zone_key))
+    .sort((a,b)=> (a.sort_order||0) - (b.sort_order||0));
+  const tag = (z)=> z.active ? "" : " (ปิดใช้งานแล้ว)";
+  const card = el(`<div class="card">
+    <label for="hz-primary">โซนหลัก</label>
+    <select id="hz-primary">
+      <option value="">— ไม่ระบุโซนประจำ —</option>
+      ${options.map(z=>`<option value="${z.zone_key}" ${z.zone_key===cur.primary?"selected":""}>${z.zone_name_th}${tag(z)}</option>`).join("")}
+    </select>
+    <div class="field-note">งานที่ต้นทางอยู่โซนนี้จะถูกยกขึ้นบนสุดของรายการงานที่รับได้</div>
+    <label style="margin-top:14px;">โซนรอง (ไว้ช่วยคนอื่น — เลือกได้หลายโซน)</label>
+    <div class="zone-pick">
+      ${options.map(z=>`<label class="zone-opt">
+        <input type="checkbox" value="${z.zone_key}" ${sec.has(z.zone_key)?"checked":""} />
+        <span>${z.zone_name_th}${tag(z)}</span>
+      </label>`).join("")}
+    </div>
+    <div class="field-note" id="hz-note"></div>
+  </div>`);
+  const primary = card.querySelector("#hz-primary");
+  const boxes = [...card.querySelectorAll(".zone-pick input")];
+  const note = card.querySelector("#hz-note");
+  const sync = ()=>{
+    // The primary is already the primary; offering it as a secondary too only
+    // invites the question of which one wins.
+    boxes.forEach(b=>{
+      const isPrimary = b.value === primary.value && primary.value;
+      b.disabled = isPrimary;
+      if(isPrimary) b.checked = false;
+      b.closest(".zone-opt").classList.toggle("is-off", isPrimary);
+    });
+    const picked = boxes.filter(b=> b.checked && !b.disabled).length;
+    note.textContent = !primary.value && !picked
+      ? "ยังไม่ได้ระบุโซนประจำ — จะเห็นงานทุกโซนเรียงตามเวลาเหมือนเดิม"
+      : picked > 5
+        ? `เลือกโซนรองไว้ ${picked} โซน — เยอะขนาดนี้แทบไม่ต่างจากไม่ระบุโซน`
+        : "";
+    note.style.color = picked > 5 ? "var(--warn)" : "var(--ink-dim)";
+  };
+  primary.onchange = sync;
+  boxes.forEach(b=> b.onchange = sync);
+  sync();
+  return {
+    card,
+    read: ()=> ({
+      primary_zone: primary.value || null,
+      secondary_zones: boxes.filter(b=> b.checked && !b.disabled).map(b=> b.value),
+    }),
+  };
+}
+
 function driverSnapshot(){
   const vehById = {};
   (state.vehicles || []).forEach(v=> vehById[v.id] = v);
@@ -1294,6 +1368,7 @@ function driverSnapshot(){
       task: t || null,
       busyMins: t ? minutesAgo(t.started_at || t.accepted_at || t.created_at) : null,
       queueLen: d.queue_len || 0,
+      zones: d.home_zones || EMPTY_ZONES,
     };
   });
 }
@@ -2048,6 +2123,36 @@ const ROLE_PILL_TH = {DRIVER: "คนขับ", USER: "ผู้ขอ", DISPAT
 // dispatcher who never touches a forklift keeps the office screens only, and
 // never appears in the driver lists or the "คนขับว่าง" count.
 const myLicenses = ()=> (state.me && state.me.licenses) || [];
+const EMPTY_ZONES = {primary: null, secondary: []};
+const myZones = ()=> (state.me && state.me.home_zones) || EMPTY_ZONES;
+const zoneName = (key)=> {
+  const z = (state.zones || []).find(z=> z.zone_key === key);
+  return z ? z.zone_name_th : key;
+};
+const zoneIsRetired = (key)=> {
+  const z = (state.zones || []).find(z=> z.zone_key === key);
+  return !!z && !z.active;
+};
+
+// Where a job sits relative to someone's home zones. Origin first, because
+// that is where they have to physically be to start it; a job that only ENDS
+// in their area is worth flagging but not worth ranking above their own.
+// Returns null when they have no home zone, which is the default — then every
+// job ranks the same and nothing on screen changes.
+function zoneMatchOf(task, zones){
+  const z = zones || EMPTY_ZONES;
+  const sec = z.secondary || [];
+  if(!z.primary && !sec.length) return null;
+  // `label` is how it reads to the person themselves, `short` how it reads to
+  // a dispatcher looking at someone else's name.
+  if(task.from_zone && task.from_zone === z.primary)
+    return {rank:1, label:"โซนหลักของคุณ", short:"โซนหลัก", cls:"zm-1"};
+  if(task.from_zone && sec.includes(task.from_zone))
+    return {rank:2, label:"โซนรองของคุณ", short:"โซนรอง", cls:"zm-2"};
+  if(task.to_zone && (task.to_zone === z.primary || sec.includes(task.to_zone)))
+    return {rank:3, label:"ปลายทางอยู่โซนคุณ", short:"ปลายทางโซนนี้", cls:"zm-3"};
+  return null;
+}
 const isCrew = ()=> state.role === "DRIVER" || (state.role === "DISPATCH" && myLicenses().length > 0);
 // A dispatcher runs the floor with an admin's screens, minus จัดการระบบ.
 const CREW_ROLES = ["DRIVER", "DISPATCH"];
@@ -2147,6 +2252,7 @@ function taskCard(t, actionsHtml, opts={}){
     <div class="card ${cls}" data-id="${t.id}">
       <div class="card-top">
         <span class="task-code mono"><span class="tc-ico">${ICO.box}</span>${t.task_code}</span>
+        ${opts.zoneTag ? `<span class="zone-tag ${opts.zoneTag.cls}">${opts.zoneTag.label}</span>` : ""}
         ${opts.queuePos
           ? `<span class="queue-chip">คิวที่ ${opts.queuePos}</span>`
           : `<span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span>`}
@@ -2921,6 +3027,24 @@ function renderProfile(main){
     </div>`));
   }
 
+  if(isCrew()){
+    main.appendChild(el(`<div class="section-title">โซนประจำ</div>`));
+    const zoneEditor = buildHomeZoneEditor(myZones());
+    main.appendChild(zoneEditor.card);
+    const zoneSave = el(`<button class="primary" style="width:100%;margin-top:10px;">บันทึกโซนประจำ</button>`);
+    zoneSave.onclick = async ()=>{
+      zoneSave.disabled = true;
+      try{
+        const saved = await api("/me/zones", {method:"PUT", body: JSON.stringify(zoneEditor.read())});
+        if(state.me) state.me.home_zones = saved;
+        toast("บันทึกโซนประจำแล้ว");
+        renderContent();
+      }catch(e){ toast(e.message); }
+      finally{ zoneSave.disabled = false; }
+    };
+    main.appendChild(zoneSave);
+  }
+
   main.appendChild(el(`<div class="section-title">แก้ไขข้อมูลส่วนตัว</div>`));
   const me = state.me || {};
   const pf = el(`<div class="card">
@@ -3348,19 +3472,56 @@ function renderDriverTab(main){
     pillRow.querySelector("#vehicle-pill-btn").onclick = ()=> openVehicleCheckSheet();
 
     // ---------------- 3. งานที่รับได้ ----------------
-    // Oldest first: a queue of unclaimed work is served front-to-back, so the
-    // job that has waited longest is the one at the top.
-    const avail = state.tasks
-      .filter(t=> t.status === "Waiting")
+    // Within the same zone it is still oldest-first — a queue of unclaimed work
+    // is served front to back. The home zone only decides which queue comes
+    // first: their own area, then the areas they help out in, then everyone
+    // else's. Someone with no home zone sees exactly what they saw before.
+    const zones = myZones();
+    const hasZones = !!(zones.primary || (zones.secondary || []).length);
+    const matchOf = new Map();
+    const waiting = state.tasks.filter(t=> t.status === "Waiting");
+    waiting.forEach(t=> matchOf.set(t.id, zoneMatchOf(t, zones)));
+    if(state.zoneOnly === undefined){
+      try{ state.zoneOnly = localStorage.getItem("scdc_zone_only") === "1"; }catch(e){ state.zoneOnly = false; }
+    }
+    const inMyZones = waiting.filter(t=> matchOf.get(t.id));
+    const avail = (state.zoneOnly && hasZones ? inMyZones : waiting)
       .slice()
-      .sort((a,b)=> String(a.created_at||"").localeCompare(String(b.created_at||"")));
+      .sort((a,b)=> ((matchOf.get(a.id) || {rank:9}).rank - (matchOf.get(b.id) || {rank:9}).rank)
+                 || String(a.created_at||"").localeCompare(String(b.created_at||"")));
     main.appendChild(el(`<div class="section-title">งานที่รับได้ (${avail.length})</div>`));
     main.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">${
       meVehicle ? `กดรับงานได้ทันทีด้วยรถ ${meVehicle.code}` : "กดรับงานแล้วเลือกรถได้เลย"
     }</div>`));
-    if(!avail.length) main.appendChild(el(`<div class="empty">ยังไม่มีงานว่างในขณะนี้</div>`));
+    if(hasZones){
+      // Never a hard filter by default: a zone whose one driver is off sick
+      // must not become a zone whose jobs nobody can see.
+      const zoneBar = el(`<label class="card" id="zone-only-row"
+        style="display:flex;align-items:center;gap:10px;margin-bottom:10px;cursor:pointer;">
+        <input type="checkbox" id="zone-only" style="width:auto;" ${state.zoneOnly ? "checked" : ""} />
+        <span style="flex:1;">
+          <b style="font-size:13px;">เฉพาะโซนของฉัน</b>
+          <div class="field-note" style="margin-top:2px;">
+            ${zones.primary ? `โซนหลัก ${zoneName(zones.primary)}` : "ยังไม่ได้ตั้งโซนหลัก"}${
+              (zones.secondary||[]).length ? ` · รอง ${(zones.secondary).map(zoneName).join(", ")}` : ""}
+            — มีงานในโซนคุณ ${inMyZones.length} งาน จากทั้งหมด ${waiting.length}
+          </div>
+        </span>
+      </label>`);
+      zoneBar.querySelector("#zone-only").onchange = (e)=>{
+        state.zoneOnly = e.target.checked;
+        try{ localStorage.setItem("scdc_zone_only", state.zoneOnly ? "1" : "0"); }catch(err){}
+        renderContent();
+      };
+      main.appendChild(zoneBar);
+    }
+    if(!avail.length) main.appendChild(el(`<div class="empty">${
+      state.zoneOnly && hasZones && waiting.length
+        ? `ไม่มีงานในโซนของคุณตอนนี้ — ยังมีอีก ${waiting.length} งานในโซนอื่น เอาเครื่องหมายถูกออกเพื่อดู`
+        : "ยังไม่มีงานว่างในขณะนี้"}</div>`));
     avail.forEach(t=>{
-      main.appendChild(el(taskCard(t, `<button class="btn amber" data-self-assign="${t.id}">รับงานนี้</button>`, {showRequester:true})));
+      main.appendChild(el(taskCard(t, `<button class="btn amber" data-self-assign="${t.id}">รับงานนี้</button>`,
+        {showRequester:true, zoneTag: matchOf.get(t.id)})));
     });
     main.querySelectorAll("[data-self-assign]").forEach(b=> b.onclick = (ev)=>{
       ev.stopPropagation(); claimTask(b.dataset.selfAssign, "self-assign");
@@ -4516,6 +4677,9 @@ async function openAssignSheet(taskId, isReassign){
         emp: d.emp, name: d.name, type,
         veh: mustSwap ? null : d.vehicleCode, hasVehicle: !mustSwap && !!d.vehicleCode,
         issues, k: key(d.emp, type),
+        // Whose area this job is in. A suggestion, never a restriction — the
+        // dispatcher can still pick anybody on the list.
+        zone: zoneMatchOf(t, d.zones),
       });
     });
   });
@@ -4542,7 +4706,11 @@ async function openAssignSheet(taskId, isReassign){
   // so groups with nobody available are folded shut and the ones the
   // dispatcher is working in come first.
   const GROUPS = allVehicleTypes(rows.map(r=> r.type)).map(k=> ({key: k, title: typeLabel(k)}));
+  // Already on the job, then whose zone this is, then who is free, then name.
+  // Zone sits above readiness on purpose: someone standing in the right aisle
+  // with one job queued usually beats someone idle at the far end of the shed.
   const byReadiness = (a,b)=> (before.has(b.k) - before.has(a.k))
+    || ((a.zone ? a.zone.rank : 9) - (b.zone ? b.zone.rank : 9))
     || (a.issues.length - b.issues.length) || a.name.localeCompare(b.name, "th");
 
   const waitMins = minutesAgo(t.created_at);
@@ -4552,7 +4720,8 @@ async function openAssignSheet(taskId, isReassign){
       <input type="checkbox" data-k="${r.k}" data-type="${r.type}" ${now.has(r.k) ? "checked" : ""} />
       <span class="dp-body">
         <span class="dp-name">${r.name}</span>
-        <span class="dp-sub">${r.hasVehicle ? `${r.type} ${r.veh}` : `${r.type} · จะเลือกรถตอนรับงาน`}</span>
+        <span class="dp-sub">${r.hasVehicle ? `${r.type} ${r.veh}` : `${r.type} · จะเลือกรถตอนรับงาน`}${
+          r.zone ? ` <span class="zone-tag ${r.zone.cls}">${r.zone.short}</span>` : ""}</span>
         ${r.issues.length ? `<span class="dp-warn">⚠ ${r.issues.join(" · ")}</span>` : ""}
       </span>
       ${before.has(r.k) ? `<span class="tag-on">ทำงานอยู่</span>` : ""}
@@ -5073,6 +5242,10 @@ function openUserEditSheet(userId){
           <button class="btn amber" id="ue-reset-pw" style="width:100%;" ${canManageUser(u) ? "" : "disabled"}>รีเซ็ตรหัสผ่าน</button>
           <button class="btn red" id="ue-delete" style="width:100%;" ${canManageUser(u) ? "" : "disabled"}>ลบผู้ใช้นี้</button>
         </div>
+        <div id="ue-zone-section" style="margin-top:20px;${CREW_ROLES.includes(u.role)?'':'display:none;'}">
+          <div class="section-title" style="margin-top:0;">โซนประจำ</div>
+          <div id="ue-zone-host"><div class="card"><div class="empty">กำลังโหลด...</div></div></div>
+        </div>
         <div id="ue-license-section" style="margin-top:20px;${CREW_ROLES.includes(u.role)?'':'display:none;'}">
           <div class="section-title" style="margin-top:0;">ใบอนุญาตขับรถ</div>
           <div id="ue-license-list" class="card"><div class="empty">กำลังโหลด...</div></div>
@@ -5103,8 +5276,9 @@ function openUserEditSheet(userId){
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   overlay.querySelector("#ue-role").onchange = (e)=>{
-    overlay.querySelector("#ue-license-section").style.display =
-      CREW_ROLES.includes(e.target.value) ? "block" : "none";
+    const crewNow = CREW_ROLES.includes(e.target.value);
+    overlay.querySelector("#ue-license-section").style.display = crewNow ? "block" : "none";
+    overlay.querySelector("#ue-zone-section").style.display = crewNow ? "block" : "none";
   };
   overlay.querySelector("#ul-permanent").onchange = (e)=>{
     overlay.querySelector("#ul-expiry").disabled = e.target.checked;
@@ -5137,7 +5311,33 @@ function openUserEditSheet(userId){
       });
     }catch(e){ box.innerHTML=""; box.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`)); }
   }
-  if(CREW_ROLES.includes(u.role)) loadLicenses();
+  // Home zones, edited here exactly as the person edits them in their own
+  // profile — same component, so the rules cannot drift between the two.
+  async function loadZones(){
+    const host = overlay.querySelector("#ue-zone-host");
+    try{
+      const current = await api(`/admin/users/${u.id}/zones`, {background:true});
+      host.innerHTML = "";
+      const editor = buildHomeZoneEditor(current);
+      host.appendChild(editor.card);
+      const save = el(`<button class="primary" style="width:100%;margin-top:10px;"
+        ${canManageUser(u) ? "" : "disabled"}>บันทึกโซนประจำ</button>`);
+      save.onclick = async ()=>{
+        save.disabled = true;
+        try{
+          await api(`/admin/users/${u.id}/zones`, {method:"PUT", body: JSON.stringify(editor.read())});
+          toast("บันทึกโซนประจำแล้ว");
+          await refreshAll();
+        }catch(e){ toast(e.message); }
+        finally{ save.disabled = false; }
+      };
+      host.appendChild(save);
+    }catch(e){
+      host.innerHTML = "";
+      host.appendChild(el(`<div class="card"><div class="empty">โหลดโซนประจำไม่สำเร็จ</div></div>`));
+    }
+  }
+  if(CREW_ROLES.includes(u.role)){ loadLicenses(); loadZones(); }
 
   // Only vehicles of the chosen type can be someone's usual vehicle, so the
   // list follows the type picker instead of offering the whole fleet and
