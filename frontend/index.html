@@ -294,6 +294,11 @@
   .card-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;}
   .btn{border:1px solid var(--line);background:var(--panel-2);color:var(--ink);font-size:12.5px;font-weight:600;
     padding:8px 12px;border-radius:7px;cursor:pointer;}
+  /* A chosen point can be a long code ("Mezzanine-1-ซ้าย (Cross dock)"). It
+     wraps rather than spilling, and both buttons in the row stay the same
+     height so the form does not jump when one of them is filled in. */
+  .loc-btn{width:100%;text-align:left;flex:1;min-height:44px;line-height:1.45;
+    overflow-wrap:anywhere;}
   .btn.amber{background:var(--amber);color:#ffffff;border-color:var(--amber);}
   .btn.green{background:var(--green);color:#ffffff;border-color:var(--green);}
   .btn.red{background:transparent;color:var(--red);border-color:#fca5a5;}
@@ -2507,6 +2512,60 @@ function locationPatternRegex(zone){
   try{ return new RegExp(zone.code_pattern, "i"); }catch(e){ return /.*/; }
 }
 
+function zoneAccepts(zone, value){
+  return locationPatternRegex(zone).test(value);
+}
+
+// The text a zone's codes start with, read off its OWN example rather than
+// written into the picker. Three zones used to build their codes from a Thai
+// prefix typed into this file ("ประตู-" + number), so renaming the zone in
+// จัดการระบบ left the picker quietly producing codes under the old name —
+// and once the pattern was corrected to match the new name, every job in that
+// zone was refused by the server.
+function zonePrefix(zone, fallback){
+  const ex = String(zone.example_code || "").trim();
+  const cut = ex.lastIndexOf("-");
+  return cut > 0 ? ex.slice(0, cut + 1) : fallback;
+}
+
+// Which hand-built picker still SUITS this zone. A hand-built picker is only
+// offered while the zone accepts what it produces; after that the generic
+// pattern-checked field takes over, so an edited zone keeps working instead of
+// handing the server codes it will reject.
+function handBuiltPicker(zone){
+  const k = zone.zone_key;
+  if(k === "CONCRETE_YARD") return yardOptions(zone).length ? k : null;
+  if(k === "GATE") return zoneAccepts(zone, zonePrefix(zone, "ประตู-") + "12") ? k : null;
+  if(k === "MEZZANINE") return mezzOptions(zone).length ? k : null;
+  return null;
+}
+
+function yardOptions(zone){
+  const p = zonePrefix(zone, "ลานปูน-");
+  const out = [];
+  for(let i = 1; i <= 7; i++){
+    const v = p + i;
+    if(zoneAccepts(zone, v)) out.push(v);
+  }
+  return out;
+}
+
+function mezzOptions(zone){
+  const p = zonePrefix(zone, "Mezzanine-");
+  // The prefix stops at the LAST dash, but a Mezzanine code has two, so take
+  // the part before the floor number instead.
+  const base = String(zone.example_code || "Mezzanine-2-ซ้าย (Cross dock)").split("-")[0] + "-";
+  const sides = ["ซ้าย (Cross dock)", "ขวา (Double Deep)"];
+  const out = [];
+  for(let i = 1; i <= 4; i++){
+    sides.forEach(side=>{
+      const v = base + i + "-" + side;
+      if(zoneAccepts(zone, v)) out.push({ value: v, floor: String(i), side: side });
+    });
+  }
+  return out;
+}
+
 // Renders a zone-select + zone-specific sub-picker into `container`.
 // The 6 known zone_keys get a hand-built picker matching their real layout;
 // any other zone (added later by Admin) falls back to a generic
@@ -2536,13 +2595,13 @@ function buildLocationPicker(container, zones, initial){
     const body = wrap.querySelector(".zp-body");
     body.innerHTML = "";
     wrap.querySelector(".zp-err").textContent = "";
-    const zk = currentZone.zone_key;
+    const zk = handBuiltPicker(currentZone);
     if(zk === "CONCRETE_YARD"){
+      const opts = yardOptions(currentZone);
       const sel = el("<select></select>");
-      for(let i=1;i<=7;i++) sel.appendChild(new Option("ลานปูน-"+i, i));
-      const m = singleValue.match(/-(\d+)$/);
-      if(m) sel.value = m[1];
-      const upd = ()=>{ singleValue = "ลานปูน-"+sel.value; };
+      opts.forEach(v=> sel.appendChild(new Option(v, v)));
+      if(opts.includes(singleValue)) sel.value = singleValue;
+      const upd = ()=>{ singleValue = sel.value; };
       sel.onchange = upd; upd();
       body.appendChild(sel);
     } else if(zk === "GATE"){
@@ -2550,6 +2609,7 @@ function buildLocationPicker(container, zones, initial){
       // no separate "add" button: the sheet's own confirm button renames
       // itself to "เพิ่มจุดนี้" while a number is sitting in the box, so there
       // is one button to look for instead of two that do nearly the same job.
+      const gatePrefix = zonePrefix(currentZone, "ประตู-");
       const row = el(`<div><input type="number" min="1" max="85" placeholder="เลข 1-85" /></div>`);
       const hint = el(`<div class="field-note"></div>`);
       const chipRow = el(`<div class="chip-row" style="margin-top:8px;"></div>`);
@@ -2568,7 +2628,14 @@ function buildLocationPicker(container, zones, initial){
       container.addPendingEntry = ()=>{
         const n = parseInt(gateInput.value||0);
         if(n<1||n>85){ wrap.querySelector(".zp-err").textContent = "กรอกเลข 1-85"; return "invalid"; }
-        const v = "ประตู-"+n;
+        const v = gatePrefix + n;
+        // The number is in range, but the zone itself may have been narrowed
+        // since — say so here rather than letting the server refuse the job.
+        if(!zoneAccepts(currentZone, v)){
+          wrap.querySelector(".zp-err").textContent =
+            "โซนนี้ไม่รับรหัส " + v + (currentZone.example_code ? " (ตัวอย่างที่ถูกต้อง: " + currentZone.example_code + ")" : "");
+          return "invalid";
+        }
         if(chips.includes(v)){ wrap.querySelector(".zp-err").textContent = "ประตูนี้ถูกเพิ่มไปแล้ว"; return "dup"; }
         chips.push(v);
         wrap.querySelector(".zp-err").textContent = "";
@@ -2594,13 +2661,26 @@ function buildLocationPicker(container, zones, initial){
       singleValue = currentZone.zone_name_th;
       body.appendChild(el(`<div class="field-note">จุดเดียว ไม่ต้องระบุตำแหน่งเพิ่ม</div>`));
     } else if(zk === "MEZZANINE"){
+      const opts = mezzOptions(currentZone);
+      const floors = [...new Set(opts.map(o=> o.floor))];
       const s1 = el("<select></select>");
-      for(let i=1;i<=4;i++) s1.appendChild(new Option("ชั้น "+i, i));
-      const s2 = el(`<select style="margin-top:8px;"><option value="ซ้าย (Cross dock)">ซ้าย (Cross dock)</option><option value="ขวา (Double Deep)">ขวา (Double Deep)</option></select>`);
-      const fm = singleValue.match(/^Mezzanine-(\d)-(.+)$/);
-      if(fm){ s1.value = fm[1]; s2.value = fm[2]; }
-      const upd = ()=>{ singleValue = "Mezzanine-"+s1.value+"-"+s2.value; };
-      s1.onchange = upd; s2.onchange = upd; upd();
+      floors.forEach(f=> s1.appendChild(new Option("ชั้น " + f, f)));
+      const s2 = el(`<select style="margin-top:8px;"></select>`);
+      const current = opts.find(o=> o.value === singleValue);
+      if(current) s1.value = current.floor;
+      const fillSides = ()=>{
+        const forFloor = opts.filter(o=> o.floor === s1.value);
+        s2.innerHTML = "";
+        forFloor.forEach(o=> s2.appendChild(new Option(o.side, o.side)));
+        if(current && current.floor === s1.value) s2.value = current.side;
+      };
+      const upd = ()=>{
+        const hit = opts.find(o=> o.floor === s1.value && o.side === s2.value);
+        singleValue = hit ? hit.value : "";
+      };
+      s1.onchange = ()=>{ fillSides(); upd(); };
+      s2.onchange = upd;
+      fillSides(); upd();
       body.appendChild(s1); body.appendChild(s2);
     } else if(currentZone.free_text){
       // Free-text zones (e.g. "พาเลทเปล่า") skip pattern validation entirely —
@@ -2724,7 +2804,14 @@ function destinationZones(zones){
 function displayZoneValue(zones, val){
   if(!val || !val.value) return null;
   const z = zones.find(x=> x.zone_key === val.zone);
-  return `${z ? z.zone_name_th : val.zone}: ${val.value}`;
+  const name = z ? z.zone_name_th : val.zone;
+  // A code already names its own place ("ประตู-12"), so putting the zone in
+  // front of it read as "ประตู: ประตู-12" — and after the zone was renamed, as
+  // two different places at once ("ประตูขาเข้า: ประตู-12"). Only a free-text
+  // zone, where the value is whatever someone typed, still needs the zone
+  // spelled out — and only when the text does not already say it.
+  const needsZone = z && z.free_text && !String(val.value).includes(name);
+  return needsZone ? `${name}: ${val.value}` : String(val.value);
 }
 
 function openLocationPickerPopup(title, zones, initial, onConfirm){
@@ -2792,13 +2879,13 @@ function openCreateTask(prefill){
           : "บัญชีของคุณไม่มี cost center กรุณาระบุของหน่วยที่จะลงบัญชีงานนี้"}</div>
         <div id="ct-driver-avail" class="field-note" style="margin-top:8px;">กำลังเช็คจำนวนคนขับว่าง...</div>
         <div class="grid2">
-          <div>
-            <label>จุดต้นทาง</label>
-            <button type="button" class="btn" id="ct-from-btn" style="width:100%;text-align:left;">เลือกจุดต้นทาง</button>
+          <div style="display:flex;flex-direction:column;">
+            <label for="ct-from-btn">จุดต้นทาง</label>
+            <button type="button" class="btn loc-btn" id="ct-from-btn">เลือกจุดต้นทาง</button>
           </div>
-          <div>
-            <label>จุดปลายทาง</label>
-            <button type="button" class="btn" id="ct-to-btn" style="width:100%;text-align:left;">เลือกจุดปลายทาง</button>
+          <div style="display:flex;flex-direction:column;">
+            <label for="ct-to-btn">จุดปลายทาง</label>
+            <button type="button" class="btn loc-btn" id="ct-to-btn">เลือกจุดปลายทาง</button>
           </div>
         </div>
         <label style="margin-top:14px;">จำนวนพาเลท</label>
@@ -2910,13 +2997,13 @@ function openEditTask(taskId){
         <div class="field-note">แก้ไขได้เฉพาะขณะสถานะ "รอดำเนินการ" เท่านั้น</div>
         ${isBooking ? `<label>วันเวลานัดหมาย</label><input id="et-scheduled" type="datetime-local" value="${(t.scheduled_at||'').slice(0,16)}" />` : ""}
         <div class="grid2">
-          <div>
-            <label>จุดต้นทาง</label>
-            <button type="button" class="btn" id="et-from-btn" style="width:100%;text-align:left;">กำลังโหลด...</button>
+          <div style="display:flex;flex-direction:column;">
+            <label for="et-from-btn">จุดต้นทาง</label>
+            <button type="button" class="btn loc-btn" id="et-from-btn">กำลังโหลด...</button>
           </div>
-          <div>
-            <label>จุดปลายทาง</label>
-            <button type="button" class="btn" id="et-to-btn" style="width:100%;text-align:left;">กำลังโหลด...</button>
+          <div style="display:flex;flex-direction:column;">
+            <label for="et-to-btn">จุดปลายทาง</label>
+            <button type="button" class="btn loc-btn" id="et-to-btn">กำลังโหลด...</button>
           </div>
         </div>
         <label style="margin-top:14px;">จำนวนพาเลท</label>
@@ -5440,6 +5527,12 @@ function openZoneEditSheet(zoneKey){
         <label for="ze-example">ตัวอย่างรหัสที่ถูกต้อง</label>
         <input id="ze-example" value="${z.example_code || ''}" />
         <div class="field-note">ระบบจะเช็คว่าตัวอย่างนี้ผ่านรูปแบบที่ตั้งไว้ ก่อนบันทึก</div>
+        <div class="card" style="margin-top:12px;padding:12px 14px;">
+          <label for="ze-try" style="margin-top:0;">ลองพิมพ์รหัสดูว่าผ่านไหม</label>
+          <input id="ze-try" class="mono" placeholder="พิมพ์รหัสที่คิดว่าผู้ขอจะกรอก" />
+          <div class="field-note" id="ze-try-out" style="margin-top:6px;line-height:1.6;"></div>
+          <div class="field-note" id="ze-drift" style="margin-top:6px;line-height:1.6;"></div>
+        </div>
         <label style="display:flex;align-items:center;gap:8px;margin-top:12px;">
           <input type="checkbox" id="ze-multi" style="width:auto;" ${z.allow_multiple ? "checked" : ""} /> เลือกได้หลายจุดในงานเดียว
         </label>
@@ -5464,6 +5557,47 @@ function openZoneEditSheet(zoneKey){
       </div>
     </div>`);
   document.body.appendChild(overlay);
+
+  // Live check. The pattern is a regular expression, so the only honest way
+  // to know what it accepts is to try a code against it — before saving,
+  // rather than finding out when a requester cannot raise a job.
+  const zePattern = overlay.querySelector("#ze-pattern");
+  const zeName = overlay.querySelector("#ze-name");
+  const zeExample = overlay.querySelector("#ze-example");
+  const zeTry = overlay.querySelector("#ze-try");
+  const zeOut = overlay.querySelector("#ze-try-out");
+  const zeDrift = overlay.querySelector("#ze-drift");
+  function zeCheck(){
+    const raw = zeTry.value.trim();
+    let re = null, bad = "";
+    try{ re = new RegExp(zePattern.value.trim() || "^.+$", "i"); }
+    catch(e){ bad = "รูปแบบนี้ยังใช้ไม่ได้: " + e.message; }
+    if(bad){
+      zeOut.textContent = "⚠️ " + bad;
+      zeOut.style.color = "var(--red)";
+    } else if(!raw){
+      zeOut.textContent = "";
+    } else if(re.test(raw)){
+      zeOut.textContent = "✅ ผ่าน — ผู้ขอกรอกรหัสนี้ได้";
+      zeOut.style.color = "var(--green)";
+    } else {
+      zeOut.textContent = "❌ ไม่ผ่าน — ผู้ขอจะกรอกรหัสนี้ไม่ได้";
+      zeOut.style.color = "var(--red)";
+    }
+    // The bug this screen caused: the zone was renamed but its codes kept the
+    // old word, so the job form built codes under a name that no longer
+    // existed. Say it here, where it can still be fixed.
+    const name = zeName.value.trim();
+    const ex = zeExample.value.trim();
+    const freeish = overlay.querySelector("#ze-free").checked || overlay.querySelector("#ze-noloc").checked;
+    zeDrift.style.color = "var(--warn)";
+    zeDrift.textContent = (!freeish && name && ex && !ex.includes(name))
+      ? `ชื่อโซนคือ "${name}" แต่ตัวอย่างรหัสเป็น "${ex}" — ถ้าเพิ่งเปลี่ยนชื่อ อย่าลืมแก้รูปแบบกับตัวอย่างให้ตรงกันด้วย ไม่งั้นเมนูเลือกจุดจะยังสร้างรหัสด้วยชื่อเดิม`
+      : "";
+  }
+  [zePattern, zeName, zeExample, zeTry].forEach(n=> n.addEventListener("input", zeCheck));
+  overlay.querySelectorAll("#ze-free, #ze-noloc").forEach(n=> n.addEventListener("change", zeCheck));
+  zeCheck();
   overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#ze-submit").onclick = async ()=>{
