@@ -404,6 +404,15 @@
   .chip{background:var(--panel-2);border:1px solid var(--line);color:var(--ink-dim);padding:6px 10px;
     border-radius:999px;font-size:12px;cursor:pointer;}
   .chip.active{background:var(--amber-dim);color:var(--amber);border-color:var(--amber);}
+  /* Pick-one rows in the location sheet. Big enough to hit with a glove on,
+     and the choice is visible without opening anything. */
+  /* A grid, not a wrapping flex row: four floors fit one line instead of
+     breaking 3 + 1 and leaving the last one stretched across the width. */
+  .pick-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(76px,1fr));gap:8px;margin-top:4px;}
+  .pick-btn{min-height:46px;padding:10px 8px;border-radius:10px;
+    border:1px solid var(--line);background:var(--panel);color:var(--ink);
+    font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;}
+  .pick-btn.is-on{background:var(--amber);border-color:var(--amber);color:#ffffff;}
 
   .chat-log{flex:1;overflow-y:auto;max-height:44vh;margin:10px 0;padding:4px 2px;}
   .chat-msg{max-width:80%;margin-bottom:8px;padding:8px 11px;border-radius:12px;font-size:13px;line-height:1.4;}
@@ -2661,27 +2670,50 @@ function buildLocationPicker(container, zones, initial){
       singleValue = currentZone.zone_name_th;
       body.appendChild(el(`<div class="field-note">จุดเดียว ไม่ต้องระบุตำแหน่งเพิ่ม</div>`));
     } else if(zk === "MEZZANINE"){
+      // Buttons rather than dropdowns: there are only four floors and two
+      // sides, and on the floor with gloves on a row of targets beats opening
+      // a picker twice. The options still come from the zone, so a floor the
+      // zone no longer accepts simply is not offered.
       const opts = mezzOptions(currentZone);
       const floors = [...new Set(opts.map(o=> o.floor))];
-      const s1 = el("<select></select>");
-      floors.forEach(f=> s1.appendChild(new Option("ชั้น " + f, f)));
-      const s2 = el(`<select style="margin-top:8px;"></select>`);
-      const current = opts.find(o=> o.value === singleValue);
-      if(current) s1.value = current.floor;
-      const fillSides = ()=>{
-        const forFloor = opts.filter(o=> o.floor === s1.value);
-        s2.innerHTML = "";
-        forFloor.forEach(o=> s2.appendChild(new Option(o.side, o.side)));
-        if(current && current.floor === s1.value) s2.value = current.side;
-      };
-      const upd = ()=>{
-        const hit = opts.find(o=> o.floor === s1.value && o.side === s2.value);
+      const start = opts.find(o=> o.value === singleValue);
+      let floor = start ? start.floor : floors[0];
+      let side = start ? start.side : null;
+
+      const floorRow = el(`<div class="pick-row" role="group" aria-label="ชั้น"></div>`);
+      const sideLabel = el(`<div class="field-note" style="margin-top:10px;">ฝั่ง</div>`);
+      const sideRow = el(`<div class="pick-row" role="group" aria-label="ฝั่ง"></div>`);
+
+      function commit(){
+        const hit = opts.find(o=> o.floor === floor && o.side === side);
         singleValue = hit ? hit.value : "";
-      };
-      s1.onchange = ()=>{ fillSides(); upd(); };
-      s2.onchange = upd;
-      fillSides(); upd();
-      body.appendChild(s1); body.appendChild(s2);
+      }
+      function drawSides(){
+        const forFloor = opts.filter(o=> o.floor === floor);
+        if(!forFloor.some(o=> o.side === side)) side = forFloor.length ? forFloor[0].side : null;
+        sideRow.innerHTML = "";
+        forFloor.forEach(o=>{
+          const b = el(`<button type="button" class="pick-btn${o.side === side ? " is-on" : ""}"
+            aria-pressed="${o.side === side}">${o.side}</button>`);
+          b.onclick = ()=>{ side = o.side; commit(); drawSides(); };
+          sideRow.appendChild(b);
+        });
+        commit();
+      }
+      function drawFloors(){
+        floorRow.innerHTML = "";
+        floors.forEach(f=>{
+          const b = el(`<button type="button" class="pick-btn${f === floor ? " is-on" : ""}"
+            aria-pressed="${f === floor}">ชั้น ${f}</button>`);
+          b.onclick = ()=>{ floor = f; drawFloors(); drawSides(); };
+          floorRow.appendChild(b);
+        });
+      }
+      drawFloors(); drawSides();
+      body.appendChild(el(`<div class="field-note">ชั้น</div>`));
+      body.appendChild(floorRow);
+      body.appendChild(sideLabel);
+      body.appendChild(sideRow);
     } else if(currentZone.free_text){
       // Free-text zones (e.g. "พาเลทเปล่า") skip pattern validation entirely —
       // any non-empty description is accepted, so no ✕/toUpperCase gymnastics.
