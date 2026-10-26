@@ -2559,20 +2559,121 @@ function yardOptions(zone){
   return out;
 }
 
-function mezzOptions(zone){
-  const p = zonePrefix(zone, "Mezzanine-");
-  // The prefix stops at the LAST dash, but a Mezzanine code has two, so take
-  // the part before the floor number instead.
-  const base = String(zone.example_code || "Mezzanine-2-ซ้าย (Cross dock)").split("-")[0] + "-";
-  const sides = ["ซ้าย (Cross dock)", "ขวา (Double Deep)"];
-  const out = [];
-  for(let i = 1; i <= 4; i++){
-    sides.forEach(side=>{
-      const v = base + i + "-" + side;
-      if(zoneAccepts(zone, v)) out.push({ value: v, floor: String(i), side: side });
-    });
+// One alternative of a pattern, turned back into the plain text it matches —
+// or null when it still carries regex syntax and so is not a printable label.
+function patternLiteral(raw){
+  let out = "";
+  for(let i = 0; i < raw.length; i++){
+    const c = raw[i];
+    if(c === "\\"){
+      const n = raw[i + 1];
+      if(n === undefined) return null;
+      out += n; i++; continue;
+    }
+    if("[]{}()*+?|^$.".includes(c)) return null;
+    out += c;
   }
   return out;
+}
+
+function splitAlternation(inner){
+  const out = []; let cur = ""; let depth = 0;
+  for(let i = 0; i < inner.length; i++){
+    const c = inner[i];
+    if(c === "\\"){ cur += c + (inner[i + 1] || ""); i++; continue; }
+    if(c === "("){ depth++; cur += c; continue; }
+    if(c === ")"){ depth--; cur += c; continue; }
+    if(c === "|" && depth === 0){ out.push(cur); cur = ""; continue; }
+    cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+// The choices a zone's OWN pattern spells out, read back as plain text. A
+// Mezzanine code is prefix-floor-side and the side half is an alternation, so
+// reading it from the pattern is what keeps the buttons in step with a zone
+// an admin has renamed — without it the picker silently produced codes the
+// zone no longer accepts, fell through to the generic field, and left the
+// requester typing the code by hand.
+function patternAlternatives(pattern){
+  const src = String(pattern || "").replace(/^\^/, "").replace(/\$$/, "");
+  let best = null, open = -1, depth = 0;
+  for(let i = 0; i < src.length; i++){
+    const c = src[i];
+    if(c === "\\"){ i++; continue; }
+    if(c === "("){ if(depth === 0) open = i; depth++; continue; }
+    if(c === ")"){
+      depth--;
+      if(depth === 0 && open >= 0){
+        const inner = src.slice(open + 1, i).replace(/^\?:/, "");
+        if(splitAlternation(inner).length > 1) best = inner;
+        open = -1;
+      }
+    }
+  }
+  if(best === null) return [];
+  const parts = splitAlternation(best).map(patternLiteral);
+  return parts.every(x=> x) ? parts : [];
+}
+
+const MEZZ_SIDES = ["ซ้าย (Cross dock)", "ขวา (Double Deep)"];
+const MEZZ_FLOOR_SCAN = 9;
+
+function mezzBase(zone){
+  const ex = String(zone.example_code || "Mezzanine-2-ซ้าย (Cross dock)");
+  // The prefix stops at the LAST dash, but a Mezzanine code has two, so take
+  // the part before the floor number instead.
+  return ex.split("-")[0] + "-";
+}
+
+// Where to look for the sides, best source first: what the pattern itself
+// lists, then the zone's own example plus the two original sides. Each source
+// is only a guess — the alternation a pattern carries may turn out to be the
+// floor rather than the side — so mezzOptions tries them in turn and keeps
+// the first that the zone actually accepts.
+function mezzSideSources(zone){
+  const parts = String(zone.example_code || "").split("-");
+  const tail = parts.length > 2 ? parts.slice(2).join("-") : "";
+  const fallback = [tail, ...MEZZ_SIDES].filter((v, i, a)=> v && a.indexOf(v) === i);
+  const fromPattern = patternAlternatives(zone.code_pattern);
+  return fromPattern.length ? [fromPattern, fallback] : [fallback];
+}
+
+function mezzOptions(zone){
+  const base = mezzBase(zone);
+  for(const sides of mezzSideSources(zone)){
+    const out = [];
+    for(let i = 1; i <= MEZZ_FLOOR_SCAN; i++){
+      sides.forEach(side=>{
+        const v = base + i + "-" + side;
+        if(zoneAccepts(zone, v)) out.push({ value: v, floor: String(i), side: side });
+      });
+    }
+    if(out.length) return out;
+  }
+  return [];
+}
+
+// What the side button READS. The saved code keeps the rack name in full, so
+// old jobs and reports stay comparable; the button drops it, because the
+// requester is picking a side, not a rack type.
+function mezzSideLabel(side){
+  const s = String(side);
+  const cut = s.indexOf("(");
+  return (cut > 0 ? s.slice(0, cut).trim() : s.trim()) || s;
+}
+
+// Shortened only while the short forms stay distinct — two sides that differ
+// only inside the brackets keep their full names rather than both reading the
+// same.
+function mezzSideLabels(opts){
+  const sides = [...new Set(opts.map(o=> o.side))];
+  const short = sides.map(mezzSideLabel);
+  const distinct = new Set(short).size === short.length;
+  const map = {};
+  sides.forEach((s, i)=> { map[s] = distinct ? short[i] : s; });
+  return map;
 }
 
 // Renders a zone-select + zone-specific sub-picker into `container`.
@@ -2675,6 +2776,7 @@ function buildLocationPicker(container, zones, initial){
       // a picker twice. The options still come from the zone, so a floor the
       // zone no longer accepts simply is not offered.
       const opts = mezzOptions(currentZone);
+      const sideText = mezzSideLabels(opts);
       const floors = [...new Set(opts.map(o=> o.floor))];
       const start = opts.find(o=> o.value === singleValue);
       let floor = start ? start.floor : floors[0];
@@ -2694,7 +2796,7 @@ function buildLocationPicker(container, zones, initial){
         sideRow.innerHTML = "";
         forFloor.forEach(o=>{
           const b = el(`<button type="button" class="pick-btn${o.side === side ? " is-on" : ""}"
-            aria-pressed="${o.side === side}">${o.side}</button>`);
+            aria-pressed="${o.side === side}">${sideText[o.side] || o.side}</button>`);
           b.onclick = ()=>{ side = o.side; commit(); drawSides(); };
           sideRow.appendChild(b);
         });
@@ -2843,7 +2945,22 @@ function displayZoneValue(zones, val){
   // zone, where the value is whatever someone typed, still needs the zone
   // spelled out — and only when the text does not already say it.
   const needsZone = z && z.free_text && !String(val.value).includes(name);
-  return needsZone ? `${name}: ${val.value}` : String(val.value);
+  const shown = shortenMezzText(z, val.value);
+  return needsZone ? `${name}: ${shown}` : shown;
+}
+
+// A Mezzanine code has to carry the rack name — "(Cross dock)", "(Double
+// Deep)" — because the zone's pattern requires it. The requester is picking a
+// side, not a rack type, so the button drops it; the code that is saved, sent
+// to the server and printed on the job keeps it in full.
+function shortenMezzText(zone, text){
+  if(!zone || zone.zone_key !== "MEZZANINE") return String(text);
+  const map = mezzSideLabels(mezzOptions(zone));
+  let out = String(text);
+  Object.keys(map).forEach(full=>{
+    if(map[full] !== full) out = out.split(full).join(map[full]);
+  });
+  return out;
 }
 
 function openLocationPickerPopup(title, zones, initial, onConfirm){
