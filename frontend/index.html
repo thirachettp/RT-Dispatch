@@ -2590,78 +2590,173 @@ function splitAlternation(inner){
   return out;
 }
 
-// The choices a zone's OWN pattern spells out, read back as plain text. A
-// Mezzanine code is prefix-floor-side and the side half is an alternation, so
-// reading it from the pattern is what keeps the buttons in step with a zone
-// an admin has renamed — without it the picker silently produced codes the
-// zone no longer accepts, fell through to the generic field, and left the
-// requester typing the code by hand.
-function patternAlternatives(pattern){
-  const src = String(pattern || "").replace(/^\^/, "").replace(/\$$/, "");
-  let best = null, open = -1, depth = 0;
-  for(let i = 0; i < src.length; i++){
-    const c = src[i];
-    if(c === "\\"){ i++; continue; }
-    if(c === "("){ if(depth === 0) open = i; depth++; continue; }
-    if(c === ")"){
-      depth--;
-      if(depth === 0 && open >= 0){
-        const inner = src.slice(open + 1, i).replace(/^\?:/, "");
-        if(splitAlternation(inner).length > 1) best = inner;
-        open = -1;
-      }
-    }
-  }
-  if(best === null) return [];
-  const parts = splitAlternation(best).map(patternLiteral);
-  return parts.every(x=> x) ? parts : [];
-}
-
-const MEZZ_SIDES = ["ซ้าย (Cross dock)", "ขวา (Double Deep)"];
+// Sides that come in pairs, longest spelling first. Used only to offer the
+// opposite of a side the zone already names — never to invent one.
+const MEZZ_SIDE_PAIRS = [
+  ["ซ้าย (Cross dock)", "ขวา (Double Deep)"],
+  ["ซ้าย", "ขวา"],
+];
 const MEZZ_FLOOR_SCAN = 9;
 
-function mezzBase(zone){
-  const ex = String(zone.example_code || "Mezzanine-2-ซ้าย (Cross dock)");
-  // The prefix stops at the LAST dash, but a Mezzanine code has two, so take
-  // the part before the floor number instead.
-  return ex.split("-")[0] + "-";
+// True when the next character turns the piece just read into "any number of
+// these" — at which point the piece can no longer be listed out as buttons.
+function quantified(src, i){
+  return i < src.length && "*+?{".includes(src[i]);
 }
 
-// Where to look for the sides, best source first: what the pattern itself
-// lists, then the zone's own example plus the two original sides. Each source
-// is only a guess — the alternation a pattern carries may turn out to be the
-// floor rather than the side — so mezzOptions tries them in turn and keeps
-// the first that the zone actually accepts.
-function mezzSideSources(zone){
-  const parts = String(zone.example_code || "").split("-");
-  const tail = parts.length > 2 ? parts.slice(2).join("-") : "";
-  const fallback = [tail, ...MEZZ_SIDES].filter((v, i, a)=> v && a.indexOf(v) === i);
-  const fromPattern = patternAlternatives(zone.code_pattern);
-  return fromPattern.length ? [fromPattern, fallback] : [fallback];
+function matchParen(src, start){
+  let d = 0;
+  for(let i = start; i < src.length; i++){
+    const c = src[i];
+    if(c === "\\"){ i++; continue; }
+    if(c === "("){ d++; continue; }
+    if(c === ")"){ d--; if(d === 0) return i; }
+  }
+  return -1;
+}
+
+// "1-4" becomes 1,2,3,4 and "ab" becomes a,b. A negated or shorthand class is
+// refused, because its members cannot be listed.
+function expandClass(body){
+  if(!body || body[0] === "^") return null;
+  const out = [];
+  for(let i = 0; i < body.length; i++){
+    if(body[i] === "\\") return null;
+    if(body[i + 1] === "-" && body[i + 2] !== undefined){
+      const a = body.charCodeAt(i), b = body.charCodeAt(i + 2);
+      if(b < a || b - a > 40) return null;
+      for(let k = a; k <= b; k++) out.push(String.fromCharCode(k));
+      i += 2; continue;
+    }
+    out.push(body[i]);
+  }
+  return out.length ? out : null;
+}
+
+// Read a pattern as fixed text interleaved with the choices it allows, so the
+// picker can be built for WHATEVER shape the zone uses — "Mezzanine-2-ซ้าย",
+// "Mezzanine ชั้น 2-ซ้าย", any separator at all. The old picker assumed the
+// parts were always split by dashes and built its codes from that assumption;
+// the moment an admin wrote the zone a different way, every code it produced
+// was refused, the buttons vanished, and the requester was left typing.
+//
+// Returns null as soon as the pattern contains something that cannot be
+// listed out — a quantifier, a dot, an open-ended class — because guessing
+// past that is what produced codes the server then rejected.
+function patternTokens(pattern){
+  const src = String(pattern || "").replace(/^\^/, "").replace(/\$$/, "");
+  if(!src) return null;
+  const out = [];
+  let lit = "";
+  const flush = ()=>{ if(lit){ out.push({ text: lit }); lit = ""; } };
+  for(let i = 0; i < src.length; i++){
+    const c = src[i];
+    if(c === "\\"){
+      const n = src[i + 1];
+      // \d, \w and friends are classes, not escaped text.
+      if(n === undefined || /[A-Za-z0-9]/.test(n)) return null;
+      if(quantified(src, i + 2)) return null;
+      lit += n; i++; continue;
+    }
+    if(c === "["){
+      const end = src.indexOf("]", i + 1);
+      if(end < 0) return null;
+      const opts = expandClass(src.slice(i + 1, end));
+      if(!opts || quantified(src, end + 1)) return null;
+      flush(); out.push({ options: opts }); i = end; continue;
+    }
+    if(c === "("){
+      const end = matchParen(src, i);
+      if(end < 0) return null;
+      const inner = src.slice(i + 1, end).replace(/^\?:/, "");
+      const parts = splitAlternation(inner).map(patternLiteral);
+      if(!parts.every(x=> x) || quantified(src, end + 1)) return null;
+      flush(); out.push({ options: parts }); i = end; continue;
+    }
+    if("*+?{}|.)]".includes(c)) return null;
+    lit += c;
+  }
+  flush();
+  return out.length ? out : null;
+}
+
+// Floors and sides straight out of the zone's own pattern. Digits are the
+// floor, words are the side — that is the only assumption left, and it holds
+// however the zone spells the rest.
+function mezzFromPattern(zone){
+  const toks = patternTokens(zone.code_pattern);
+  if(!toks) return [];
+  const choices = toks.filter(t=> t.options);
+  if(!choices.length || choices.length > 2) return [];
+  const digits = (t)=> t.options.every(o=> /^[0-9]+$/.test(o));
+  const floorTok = choices.find(digits) || null;
+  const sideTok = choices.find(t=> t !== floorTok && !digits(t)) || null;
+  // Two groups that are both numbers, or both words, give no way to tell the
+  // floor from the side — leave it to the generic field rather than mislabel.
+  if(choices.length === 2 && !(floorTok && sideTok)) return [];
+  const floors = floorTok ? floorTok.options : [""];
+  const sides = sideTok ? sideTok.options : [""];
+  const out = [];
+  floors.forEach(f=>{
+    sides.forEach(sd=>{
+      const v = toks.map(t=> !t.options ? t.text : (t === floorTok ? f : sd)).join("");
+      if(zoneAccepts(zone, v)) out.push({ value: v, floor: f, side: sd });
+    });
+  });
+  return out;
+}
+
+function lastDigitRun(s){
+  let end = -1;
+  for(let i = s.length - 1; i >= 0; i--){ if(s[i] >= "0" && s[i] <= "9"){ end = i; break; } }
+  if(end < 0) return null;
+  let start = end;
+  while(start > 0 && s[start - 1] >= "0" && s[start - 1] <= "9") start--;
+  return { prefix: s.slice(0, start), suffix: s.slice(end + 1) };
+}
+
+// The other side of a pair, found in text the zone already uses. Nothing is
+// invented here: a side only becomes a button if the zone accepts it.
+function siblingSide(text){
+  for(const pair of MEZZ_SIDE_PAIRS){
+    if(text.includes(pair[0])) return text.split(pair[0]).join(pair[1]);
+    if(text.includes(pair[1])) return text.split(pair[1]).join(pair[0]);
+  }
+  return null;
+}
+
+// Fallback for a pattern too loose to list out (".+" and the like): keep the
+// example's exact shape and vary only the floor, plus the opposite side when
+// the example names one.
+function mezzFromExample(zone){
+  const cut = lastDigitRun(String(zone.example_code || "").trim());
+  if(!cut) return [];
+  const sib = siblingSide(cut.suffix);
+  const suffixes = sib && sib !== cut.suffix ? [cut.suffix, sib] : [cut.suffix];
+  const out = [];
+  for(let i = 1; i <= MEZZ_FLOOR_SCAN; i++){
+    suffixes.forEach(sfx=>{
+      const v = cut.prefix + i + sfx;
+      if(zoneAccepts(zone, v)) out.push({ value: v, floor: String(i), side: sfx });
+    });
+  }
+  return out;
 }
 
 function mezzOptions(zone){
-  const base = mezzBase(zone);
-  for(const sides of mezzSideSources(zone)){
-    const out = [];
-    for(let i = 1; i <= MEZZ_FLOOR_SCAN; i++){
-      sides.forEach(side=>{
-        const v = base + i + "-" + side;
-        if(zoneAccepts(zone, v)) out.push({ value: v, floor: String(i), side: side });
-      });
-    }
-    if(out.length) return out;
-  }
-  return [];
+  const fromPattern = mezzFromPattern(zone);
+  return fromPattern.length ? fromPattern : mezzFromExample(zone);
 }
 
 // What the side button READS. The saved code keeps the rack name in full, so
 // old jobs and reports stay comparable; the button drops it, because the
 // requester is picking a side, not a rack type.
 function mezzSideLabel(side){
-  const s = String(side);
+  // A side taken from the example still carries the separator in front of it
+  // ("-ซ้าย"); the button wants the word alone.
+  const s = String(side).replace(/^[\s\-–—:,/]+/, "").replace(/[\s\-–—:,/]+$/, "");
   const cut = s.indexOf("(");
-  return (cut > 0 ? s.slice(0, cut).trim() : s.trim()) || s;
+  return (cut > 0 ? s.slice(0, cut).trim() : s.trim()) || String(side);
 }
 
 // Shortened only while the short forms stay distinct — two sides that differ
@@ -2812,10 +2907,16 @@ function buildLocationPicker(container, zones, initial){
         });
       }
       drawFloors(); drawSides();
-      body.appendChild(el(`<div class="field-note">ชั้น</div>`));
-      body.appendChild(floorRow);
-      body.appendChild(sideLabel);
-      body.appendChild(sideRow);
+      // A zone may fix the floor or the side; a row with one blank choice in
+      // it is noise, so it is left out rather than drawn empty.
+      if(floors.length && floors[0] !== ""){
+        body.appendChild(el(`<div class="field-note">ชั้น</div>`));
+        body.appendChild(floorRow);
+      }
+      if(opts.some(o=> o.side !== "")){
+        body.appendChild(sideLabel);
+        body.appendChild(sideRow);
+      }
     } else if(currentZone.free_text){
       // Free-text zones (e.g. "พาเลทเปล่า") skip pattern validation entirely —
       // any non-empty description is accepted, so no ✕/toUpperCase gymnastics.
