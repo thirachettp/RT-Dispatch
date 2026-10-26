@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261026.0942"
+APP_VERSION = "TTLOD.261026.0957"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -1719,6 +1719,33 @@ def person_label(db, user_id) -> str:
     return f"คุณ{name}"
 
 
+def person_name(row) -> str:
+    """The name to print for a person in a notification.
+
+    Employee IDs are what the tables join on, not what anyone on the floor
+    recognises: "20100001 รับงาน RT-261026-004" costs the reader a lookup
+    before it means anything. The full name is used wherever the row carries
+    one, and the employee ID stays as the fallback so a row without a name
+    still says who, rather than nothing at all.
+
+    Takes a row the caller already holds, so naming someone costs no extra
+    query. person_label() is the chat's version and stays as it is: there a
+    person is addressed ("คุณสมชาย", "แอดมิน"), while a notification has to
+    name them.
+    """
+    if row is None:
+        return "ไม่ทราบชื่อ"
+
+    def field(key):
+        try:
+            v = row[key]
+        except (KeyError, IndexError, TypeError):
+            return ""
+        return str(v).strip() if v is not None else ""
+
+    return field("full_name") or field("employee_id") or "ไม่ทราบชื่อ"
+
+
 def post_system_message(db, task_id: int, actor_id: int, text: str):
     """An automatic line in the task chat. Deliberately does NOT notify anyone:
     every event that posts one already sends its own notification, and a second
@@ -2282,7 +2309,7 @@ def register(body: RegisterBody):
                        "ON CONFLICT DO NOTHING", (user_id, licence))
             # Anyone who knows the code can make themselves a driver, so every
             # use is announced instead of happening silently.
-            notify_ops(db, f"{body.employee_id} สมัครเป็นคนขับด้วยรหัสเชิญ (ใบอนุญาต {licence})")
+            notify_ops(db, f"{full_name or body.employee_id} สมัครเป็นคนขับด้วยรหัสเชิญ (ใบอนุญาต {licence})")
             audit(db, user_id, "register_with_invite_code", f"{body.employee_id} -> DRIVER {licence}")
         return {"ok": True, "reactivated": bool(existing), "role": role, "license": licence}
 
@@ -3150,7 +3177,7 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER", "ADMIN", "DI
             "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
             "VALUES (?,?,?,?,?)", (task_id, None, "Waiting", user["id"], now_iso()),
         )
-        notify_ops(db, f"งานใหม่ {code} สร้างโดย {user['employee_id']}", task_id)
+        notify_ops(db, f"งานใหม่ {code} สร้างโดย {person_name(user)}", task_id)
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         result = task_to_dict(row, db, viewer_role=user["role"])
         available = db.execute(
@@ -3362,7 +3389,7 @@ def resubmit_task(task_id: int, user=Depends(require_role("USER"))):
             "UPDATE tasks SET blocked_reason=NULL, blocked_at=NULL, waiting_alert_sent=0 WHERE id=?", (task_id,)
         )
         audit(db, user["id"], "resubmit_task", f"task {row['task_code']}")
-        notify_ops(db, f"งาน {row['task_code']} ถูกส่งกลับมาใหม่โดย {user['employee_id']}", task_id)
+        notify_ops(db, f"งาน {row['task_code']} ถูกส่งกลับมาใหม่โดย {person_name(user)}", task_id)
         return {"ok": True}
 
 
@@ -3641,7 +3668,7 @@ def _do_assign(db, task_row, driver, vehicle, assigned_by_id, reason, estimated_
            + (f" (อยู่ในคิวลำดับที่ {queue_pos})" if queue_pos else ""), task_row["id"])
     notify(db, task_row["requester_id"], f"งาน {task_row['task_code']} มอบหมายให้คนขับแล้ว", task_row["id"])
     if is_reassign:
-        notify_ops(db, f"งาน {task_row['task_code']} มอบหมายใหม่ให้ {driver['employee_id']}", task_row["id"])
+        notify_ops(db, f"งาน {task_row['task_code']} มอบหมายใหม่ให้ {person_name(driver)}", task_row["id"])
 
 
 @app.post("/tasks/{task_id}/assign")
@@ -3780,7 +3807,7 @@ def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_cr
                    (now_iso(), body.battery_level, task_id))
         if body.battery_level is not None:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
-        notify_ops(db, f"คนขับ {user['employee_id']} รับงาน {row['task_code']} ด้วยตัวเอง", task_id)
+        notify_ops(db, f"คนขับ {person_name(user)} รับงาน {row['task_code']} ด้วยตัวเอง", task_id)
         return {"ok": True}
 
 
@@ -3812,7 +3839,7 @@ def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_crew
                    (now_iso(), body.battery_level, task_id))
         if body.battery_level is not None:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
-        notify_ops(db, f"คนขับ {user['employee_id']} รับช่วงงาน {row['task_code']}", task_id)
+        notify_ops(db, f"คนขับ {person_name(user)} รับช่วงงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -3839,7 +3866,7 @@ def accept_task(task_id: int, body: AcceptBody, user=Depends(require_crew())):
                 db.execute("UPDATE vehicles SET battery_level=? WHERE id=?",
                            (body.battery_level, row["current_vehicle_id"]))
         notify(db, row["requester_id"], f"คนขับกดรับงาน {row['task_code']} แล้ว", task_id)
-        notify_ops(db, f"คนขับ {user['employee_id']} กดรับงาน {row['task_code']}", task_id)
+        notify_ops(db, f"คนขับ {person_name(user)} กดรับงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -3904,7 +3931,7 @@ def complete_task(task_id: int, user=Depends(require_crew())):
                                 f"{person_label(db, user['id'])} ทำส่วนของตนเสร็จแล้ว "
                                 f"(ยังมีคนขับทำอยู่อีก {remaining} คน)")
             notify(db, row["requester_id"],
-                   f"คนขับ {user['employee_id']} ทำงาน {row['task_code']} ส่วนของตนเสร็จแล้ว "
+                   f"คนขับ {person_name(user)} ทำงาน {row['task_code']} ส่วนของตนเสร็จแล้ว "
                    f"(ยังมีคนขับอีก {remaining} คนทำอยู่)", task_id)
         return {"ok": True}
 
@@ -4013,8 +4040,8 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_crew())):
         post_system_message(db, task_id, user["id"],
                             f"{person_label(db, user['id'])} เข้าร่วมงาน"
                             + ("" if takes_it_up else " (อยู่ในคิวงานของเขา)"))
-        notify(db, row["requester_id"], f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
-        notify_ops(db, f"คนขับ {user['employee_id']} เข้าร่วมงาน {row['task_code']}", task_id)
+        notify(db, row["requester_id"], f"คนขับ {person_name(user)} เข้าร่วมงาน {row['task_code']}", task_id)
+        notify_ops(db, f"คนขับ {person_name(user)} เข้าร่วมงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -4057,7 +4084,7 @@ def admin_add_driver(task_id: int, body: AddDriverBody, user=Depends(require_ops
         if issues:
             raise HTTPException(409, "เพิ่มไม่ได้: " + "; ".join(issues))
         _attach_extra_driver(db, row, driver, vehicle, user["id"], "Added by admin", vehicle_type=vtype)
-        notify(db, row["requester_id"], f"เพิ่มคนขับ {driver['employee_id']} เข้างาน {row['task_code']}", task_id)
+        notify(db, row["requester_id"], f"เพิ่มคนขับ {person_name(driver)} เข้างาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -4107,8 +4134,8 @@ def leave_task(task_id: int, user=Depends(require_crew())):
                 db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
                            (nxt["driver_id"], nxt["vehicle_id"], task_id))
         post_system_message(db, task_id, user["id"], f"{person_label(db, user['id'])} ออกจากงาน")
-        notify(db, row["requester_id"], f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
-        notify_ops(db, f"คนขับ {user['employee_id']} ออกจากงาน {row['task_code']}", task_id)
+        notify(db, row["requester_id"], f"คนขับ {person_name(user)} ออกจากงาน {row['task_code']}", task_id)
+        notify_ops(db, f"คนขับ {person_name(user)} ออกจากงาน {row['task_code']}", task_id)
         return {"ok": True}
 
 
@@ -4246,9 +4273,9 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
                 db.execute("UPDATE tasks SET current_driver_id=?, current_vehicle_id=? WHERE id=?",
                            (nxt["driver_id"], nxt["vehicle_id"], task_id))
         notify(db, row["requester_id"],
-               f"คนขับ {user['employee_id']} แจ้งปัญหารถในงาน {row['task_code']} "
+               f"คนขับ {person_name(user)} แจ้งปัญหารถในงาน {row['task_code']} "
                f"({body.reason}) — งานยังดำเนินต่อโดยคนขับที่เหลือ", task_id)
-        notify_ops(db, f"แจ้งปัญหารถในงาน {row['task_code']} โดย {user['employee_id']}: "
+        notify_ops(db, f"แจ้งปัญหารถในงาน {row['task_code']} โดย {person_name(user)}: "
                           f"{body.reason} (งานยังดำเนินการอยู่ เหลือคนขับ {others} คน)", task_id)
         return {"ok": True}
 
@@ -4471,7 +4498,7 @@ def post_team_chat_message(body: TeamChatBody, user=Depends(require_role("ADMIN"
                 "AND deleted_at IS NULL", (emp_id,)
             ).fetchone()
             if target and target["id"] != user["id"]:
-                notify(db, target["id"], f"{user['employee_id']} กล่าวถึงคุณในแชททีม", kind="team_chat")
+                notify(db, target["id"], f"{person_name(user)} กล่าวถึงคุณในแชททีม", kind="team_chat")
         return {"ok": True}
 
 
@@ -5035,7 +5062,7 @@ def set_driver_status(body: DriverStatusBody, user=Depends(require_crew())):
     with get_db() as db:
         db.execute("UPDATE users SET driver_status=? WHERE id=?", (body.status, user["id"]))
         if body.status == "Breakdown":
-            notify_ops(db, f"คนขับ {user['employee_id']} แจ้งสถานะรถเสีย")
+            notify_ops(db, f"คนขับ {person_name(user)} แจ้งสถานะรถเสีย")
         return {"ok": True}
 
 
@@ -5271,7 +5298,7 @@ def report_breakdown(body: BreakdownBody, user=Depends(require_crew())):
     with get_db() as db:
         if body.target_type == "driver":
             target_id = user["id"]
-            label = user["employee_id"]
+            label = person_name(user)
             db.execute("UPDATE users SET driver_status='Breakdown' WHERE id=?", (user["id"],))
         elif body.target_type == "vehicle":
             if not body.vehicle_code:
@@ -5289,7 +5316,7 @@ def report_breakdown(body: BreakdownBody, user=Depends(require_crew())):
             "VALUES (?,?,?,?,?,?,?)",
             (body.target_type, target_id, label, body.description, user["id"], "Open", now_iso()),
         )
-        notify_ops(db, f"แจ้งเสีย: {'คนขับ' if body.target_type == 'driver' else 'รถ'} {label} โดย {user['employee_id']}")
+        notify_ops(db, f"แจ้งเสีย: {'คนขับ' if body.target_type == 'driver' else 'รถ'} {label} โดย {person_name(user)}")
         return {"ok": True}
 
 
