@@ -414,6 +414,23 @@
     font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;}
   .pick-btn.is-on{background:var(--amber);border-color:var(--amber);color:#ffffff;}
 
+  .td-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 16px;margin-top:12px;}
+  .td-fact span{display:block;font-size:11.5px;color:var(--ink-dim);}
+  .td-fact b{display:block;font-size:13px;margin-top:2px;overflow-wrap:anywhere;}
+  .td-remark{margin-top:12px;font-size:13px;}
+  .td-remark span{display:block;font-size:11.5px;color:var(--ink-dim);}
+  .td-remark div{margin-top:2px;line-height:1.6;overflow-wrap:anywhere;}
+  .person-row{width:100%;min-height:56px;display:flex;align-items:center;gap:10px;
+    padding:10px 14px;margin-top:8px;background:var(--panel);border:1px solid var(--line);
+    border-radius:var(--radius);font-family:inherit;text-align:left;cursor:pointer;}
+  .person-ava{width:34px;height:34px;flex:none;border-radius:999px;background:var(--amber-dim);
+    color:var(--amber);font-size:12.5px;font-weight:800;display:flex;align-items:center;
+    justify-content:center;}
+  .person-main{flex:1;min-width:0;}
+  .person-role{display:block;font-size:11px;color:var(--ink-dim);}
+  .person-name{display:block;font-size:13.5px;font-weight:700;color:var(--ink);overflow-wrap:anywhere;}
+  .person-go{flex:none;color:var(--ink-dim);font-size:15px;}
+
   .cc-pick{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
   .cc-opt{min-height:40px;padding:8px 12px;border-radius:999px;
     border:1px solid var(--line);background:var(--panel);color:var(--ink);
@@ -2454,7 +2471,7 @@ function renderUserTab(main){
     // for anyone in a large cost centre it would bury their own jobs.
     if(state.me && state.me.cost_center){
       const row = el(`<div class="pick-row" style="grid-template-columns:repeat(2,1fr);margin-bottom:10px;"></div>`);
-      [["mine","งานของฉัน"], ["unit","งานทั้งหน่วย"]].forEach(([k, label])=>{
+      [["mine","งานของฉัน"], ["unit","งานทั้ง Cost center"]].forEach(([k, label])=>{
         const on = taskScope() === k;
         const b = el(`<button type="button" class="pick-btn${on ? " is-on" : ""}" aria-pressed="${on}">${label}</button>`);
         b.onclick = ()=>{ if(!on) setTaskScope(k); };
@@ -2463,8 +2480,8 @@ function renderUserTab(main){
       main.appendChild(row);
       if(taskScope() === "unit"){
         main.appendChild(el(`<div class="field-note" style="margin:-4px 0 10px;line-height:1.6;">
-          กำลังดูงานทั้งหมดของ ${costCenterLabel(state.me.cost_center)} —
-          งานของเพื่อนร่วมหน่วยดูและคุยได้ ส่วนแก้ไข ยกเลิก และให้คะแนน เป็นของเจ้าของงาน</div>`));
+          กำลังดูงานทั้งหมดของ Cost center ${costCenterLabel(state.me.cost_center)} —
+          งานของเพื่อนร่วม Cost center ดูและคุยได้ ส่วนแก้ไข ยกเลิก และให้คะแนน เป็นของเจ้าของงาน</div>`));
       }
     }
     const active = state.tasks.filter(t=>!["Completed","Cancelled"].includes(t.status));
@@ -2847,25 +2864,70 @@ function setTaskScope(v){
 // a driver working one end of the warehouse all shift should not re-pick it
 // after every reload. The search box is deliberately NOT persisted: a code you
 // looked up once is not a standing filter.
+// What a job can be narrowed by. Each group reads one field off the task and
+// knows how to name a value; the chips offered are only values that actually
+// occur, so a filter can never produce an empty list by itself.
+const DRIVER_FILTERS = [
+  { key: "fromZones", label: "โซนต้นทาง", of: (t)=> t.from_zone, name: (v)=> zoneName(v) },
+  { key: "toZones", label: "โซนปลายทาง", of: (t)=> t.to_zone, name: (v)=> zoneName(v) },
+  { key: "bus", label: "BU", of: (t)=> t.bu, name: (v)=> v },
+  { key: "ccs", label: "Cost center", of: (t)=> t.cost_center, name: (v)=> costCenterLabel(v) },
+  { key: "requesters", label: "ผู้ขอ", of: (t)=> t.requester_employee_id,
+    name: (v)=> {
+      const hit = (state.tasks || []).find(x=> x.requester_employee_id === v);
+      return (hit && hit.requester_name) || v;
+    } },
+];
+
 function driverFilter(){
   if(!state.driverFilter){
-    let zones = [];
-    try{ zones = JSON.parse(localStorage.getItem("rt_driver_zones_filter") || "[]"); }catch(e){ zones = []; }
-    state.driverFilter = { q: "", zones: Array.isArray(zones) ? zones : [] };
+    let saved = {};
+    try{ saved = JSON.parse(localStorage.getItem("rt_driver_filter") || "{}"); }catch(e){ saved = {}; }
+    if(!saved || typeof saved !== "object") saved = {};
+    const f = { q: "" };
+    DRIVER_FILTERS.forEach(g=>{
+      f[g.key] = Array.isArray(saved[g.key]) ? saved[g.key] : [];
+    });
+    state.driverFilter = f;
   }
   return state.driverFilter;
 }
 
+function saveDriverFilter(){
+  const f = driverFilter();
+  const out = {};
+  DRIVER_FILTERS.forEach(g=> { out[g.key] = (f[g.key] || []).slice(); });
+  try{ localStorage.setItem("rt_driver_filter", JSON.stringify(out)); }catch(e){}
+}
+
+function clearDriverFilter(){
+  const f = driverFilter();
+  f.q = "";
+  DRIVER_FILTERS.forEach(g=> { f[g.key] = []; });
+  saveDriverFilter();
+}
+
 function driverFilterCount(){
   const f = driverFilter();
-  return (f.zones || []).length;
+  return DRIVER_FILTERS.reduce((n, g)=> n + (f[g.key] || []).length, 0);
+}
+
+function driverFilterChips(){
+  const f = driverFilter();
+  const out = [];
+  if(f.q) out.push(`เลขงาน "${f.q}"`);
+  DRIVER_FILTERS.forEach(g=> (f[g.key] || []).forEach(v=> out.push(g.name(v))));
+  return out;
 }
 
 function driverTaskMatches(t){
   const f = driverFilter();
   const q = String(f.q || "").trim().toLowerCase();
   if(q && !String(t.task_code || "").toLowerCase().includes(q)) return false;
-  if((f.zones || []).length && !f.zones.includes(t.from_zone)) return false;
+  for(const g of DRIVER_FILTERS){
+    const picked = f[g.key] || [];
+    if(picked.length && !picked.includes(g.of(t))) return false;
+  }
   return true;
 }
 
@@ -3988,18 +4050,11 @@ function renderDriverTab(main){
     </div>`);
     main.appendChild(bar);
     if(df.q || nFilters){
-      const chips = [];
-      if(df.q) chips.push(`เลขงาน "${df.q}"`);
-      (df.zones || []).forEach(z=> chips.push(zoneName(z)));
       const active = el(`<div class="field-note" style="margin:-4px 0 10px;line-height:1.6;">
-        กรองอยู่: ${chips.join(" · ")}
+        กรองอยู่: ${driverFilterChips().join(" · ")}
         <button class="btn" id="dclear" style="min-height:36px;padding:4px 10px;margin-left:6px;">ล้าง</button>
       </div>`);
-      active.querySelector("#dclear").onclick = ()=>{
-        state.driverFilter = { q: "", zones: [] };
-        try{ localStorage.setItem("rt_driver_zones_filter", "[]"); }catch(e){}
-        renderContent();
-      };
+      active.querySelector("#dclear").onclick = ()=>{ clearDriverFilter(); renderContent(); };
       main.appendChild(active);
     }
     bar.querySelector("#dfilter").onclick = ()=> openDriverFilterSheet();
@@ -4522,60 +4577,76 @@ const PAUSE_PRESETS = {
   vehicle: ["แบตเตอรี่ต่ำ", "รถขัดข้อง/เสีย", "ยางรั่ว/ปัญหาล้อ", "อุปกรณ์ยกของขัดข้อง"],
 };
 
-// Origin zone is the only filter offered here on purpose: it is the one thing
-// that changes whether a job is worth walking to. Sorting is deliberately NOT
-// offered — the unclaimed list is oldest-first within each zone, and letting
-// drivers reorder it turns a queue into a pick-and-choose.
+// Every group the jobs on this screen can be narrowed by. Sorting is
+// deliberately NOT offered — the unclaimed list is oldest-first within each
+// zone, and letting drivers reorder it turns a queue into a pick-and-choose.
 function openDriverFilterSheet(){
   const f = driverFilter();
-  let picked = (f.zones || []).slice();
-  const zones = (state.zones || []).filter(z=> z.active !== 0);
+  const picked = {};
+  DRIVER_FILTERS.forEach(g=> { picked[g.key] = (f[g.key] || []).slice(); });
+
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
         <div class="sheet-head"><h2>ตัวกรองงาน</h2><button class="sheet-close">✕</button></div>
-        <label>โซนต้นทาง</label>
-        <div class="chip-row" id="dfz"></div>
-        <div class="field-note" style="margin-top:8px;line-height:1.6;">
-          เลือกแล้วจะกรองทุกรายการในหน้านี้ ทั้งงานที่กำลังทำ คิวงาน และงานที่รับได้
+        <div id="dfz-groups"></div>
+        <div class="field-note" style="margin-top:10px;line-height:1.6;">
+          กรองทุกรายการในหน้านี้ ทั้งงานที่กำลังทำ คิวงาน และงานที่รับได้ —
+          เลือกหลายอย่างในกลุ่มเดียวกันได้ นับเป็น "อย่างใดอย่างหนึ่ง"
         </div>
         <button class="primary" id="dfz-apply">ดูงาน</button>
-        <button class="btn" id="dfz-clear" style="width:100%;margin-top:8px;">ล้างตัวกรอง</button>
+        <button class="btn" id="dfz-clear" style="width:100%;margin-top:8px;">ล้างตัวกรองทั้งหมด</button>
       </div>
     </div>`);
   document.body.appendChild(overlay);
   overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
-  function apply(list){
-    picked = list;
-    driverFilter().zones = picked.slice();
-    try{ localStorage.setItem("rt_driver_zones_filter", JSON.stringify(picked)); }catch(e){}
+  overlay.querySelector("#dfz-apply").onclick = ()=>{
+    const cur = driverFilter();
+    DRIVER_FILTERS.forEach(g=> { cur[g.key] = picked[g.key].slice(); });
+    saveDriverFilter();
     closeSheet(overlay);
     renderContent();
-  }
-  overlay.querySelector("#dfz-apply").onclick = ()=> apply(picked);
-  overlay.querySelector("#dfz-clear").onclick = ()=> apply([]);
+  };
+  overlay.querySelector("#dfz-clear").onclick = ()=>{
+    clearDriverFilter();
+    closeSheet(overlay);
+    renderContent();
+  };
 
-  const box = overlay.querySelector("#dfz");
+  const box = overlay.querySelector("#dfz-groups");
+  // Only values that actually occur on a job this driver can see. An option
+  // that matches nothing is worse than no option: it reads as "no such work",
+  // when it really means "not in this list".
+  const live = (state.tasks || []).filter(t=> !["Completed","Cancelled"].includes(t.status));
   function draw(){
     box.innerHTML = "";
-    if(!zones.length){
-      box.appendChild(el(`<div class="field-note">ยังไม่มีโซนให้เลือก</div>`));
-      return;
-    }
-    zones.forEach(z=>{
-      const on = picked.includes(z.zone_key);
-      const n = (state.tasks || []).filter(t=> t.from_zone === z.zone_key
-        && !["Completed","Cancelled"].includes(t.status)).length;
-      const chip = el(`<div class="chip${on ? " active" : ""}">${z.zone_name_th} ${n}</div>`);
-      chip.onclick = ()=>{
-        const i = picked.indexOf(z.zone_key);
-        if(i >= 0) picked.splice(i, 1); else picked.push(z.zone_key);
-        draw();
-      };
-      box.appendChild(chip);
+    let any = false;
+    DRIVER_FILTERS.forEach(g=>{
+      const counts = new Map();
+      live.forEach(t=>{
+        const v = g.of(t);
+        if(v === null || v === undefined || v === "") return;
+        counts.set(v, (counts.get(v) || 0) + 1);
+      });
+      if(!counts.size) return;
+      any = true;
+      box.appendChild(el(`<label style="margin-top:12px;">${g.label}</label>`));
+      const row = el(`<div class="chip-row"></div>`);
+      [...counts.keys()].sort().forEach(v=>{
+        const on = picked[g.key].includes(v);
+        const chip = el(`<div class="chip${on ? " active" : ""}">${g.name(v)} ${counts.get(v)}</div>`);
+        chip.onclick = ()=>{
+          const i = picked[g.key].indexOf(v);
+          if(i >= 0) picked[g.key].splice(i, 1); else picked[g.key].push(v);
+          draw();
+        };
+        row.appendChild(chip);
+      });
+      box.appendChild(row);
     });
+    if(!any) box.appendChild(el(`<div class="field-note">ยังไม่มีงานให้กรอง</div>`));
   }
   draw();
 }
@@ -6834,6 +6905,52 @@ function bindTaskDetailActions(container){
   container.querySelectorAll("[data-rate]").forEach(b=> b.onclick = ()=> openRatingSheet(b.dataset.rate));
 }
 
+// Two letters for a face nobody uploaded. Thai names have no case to lean on,
+// so this is the first character of each of the first two words.
+function initialsOf(name){
+  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if(!parts.length) return "—";
+  return parts.slice(0, 2).map(w=> [...w][0]).join("");
+}
+
+// The job's own screen. The list card answers "which job is this"; here there
+// is room for everything about it, so nothing has to be guessed from a chat
+// line or an abbreviation.
+function taskDetailCardHTML(t){
+  const cls = statusClass(t.status);
+  const fact = (label, value)=> value === null || value === undefined || value === ""
+    ? "" : `<div class="td-fact"><span>${label}</span><b>${value}</b></div>`;
+  const actions = buildTaskDetailActions(t);
+  return `
+    <div class="card ${cls}" data-id="${t.id}">
+      <div class="card-top">
+        <span class="task-code mono"><a href="#" class="copy-code" data-code="${t.task_code}">${t.task_code}</a></span>
+        <span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span>
+      </div>
+      ${t.status === "Waiting" && t.queue_position
+        ? `<div class="wait-line">รออยู่ลำดับที่ <b>${t.queue_position}</b>${
+             t.queue_total > 1 ? ` จาก ${t.queue_total} คำขอที่รออยู่` : ""}</div>`
+        : ""}
+      ${t.blocked_reason ? `<div class="blocked-banner">⚠️ ถูกตีกลับ: ${t.blocked_reason}</div>` : ""}
+      ${pauseBannerHTML(t)}
+      <div class="route">${t.from_location}<span class="arrow">→</span>${t.to_location}</div>
+      <div class="td-facts">
+        ${fact("จำนวนพาเลท", t.pallet_qty)}
+        ${fact("BU", t.bu)}
+        ${fact("Cost center", t.cost_center ? costCenterLabel(t.cost_center) : "")}
+        ${fact("ความสำคัญ", PRIORITY_LABEL[t.priority] || t.priority)}
+        ${fact("สร้างคำขอเมื่อ", t.created_at ? fmtTime(t.created_at) : "")}
+        ${t.request_type === "Booking" && t.scheduled_at ? fact("นัดหมาย", fmtTime(t.scheduled_at)) : ""}
+        ${fact("เริ่มงานเมื่อ", t.started_at ? fmtTime(t.started_at) : "")}
+        ${fact("เสร็จเมื่อ", t.completed_at ? fmtTime(t.completed_at) : "")}
+        ${fact("คะแนน", t.rating ? "★".repeat(t.rating) + "☆".repeat(5 - t.rating) : "")}
+      </div>
+      ${t.remark ? `<div class="td-remark"><span>หมายเหตุ</span><div>${t.remark}</div></div>` : ""}
+      ${t.photo_url ? `<img class="thumb" data-photo-url="${t.photo_url}" />` : ""}
+      ${actions.trim() ? `<div class="card-actions">${actions}</div>` : ""}
+    </div>`;
+}
+
 async function openTaskDetailSheet(taskId){
   let t;
   try{ t = await api(`/tasks/${taskId}`); }catch(e){ toast(e.message); return; }
@@ -6849,8 +6966,61 @@ async function openTaskDetailSheet(taskId){
   overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   const holder = overlay.querySelector("#td-card");
-  holder.appendChild(el(taskCard(t, buildTaskDetailActions(t), {showRequester: state.role !== "USER"})));
+  holder.appendChild(el(taskDetailCardHTML(t)));
   bindTaskDetailActions(holder);
+  holder.querySelectorAll(".copy-code").forEach(a=>{
+    a.onclick = async (e)=>{
+      e.preventDefault();
+      try{ await navigator.clipboard.writeText(a.dataset.code); toast(`คัดลอก ${a.dataset.code} แล้ว`); }
+      catch(_){ toast(a.dataset.code); }
+    };
+  });
+
+  // Who is on this job, in the order the job happened: the person who asked,
+  // then whoever is doing it. The row is the summary; the full card — phone
+  // number included — is the same one a name in the chat opens, so there is
+  // one profile card in the app rather than two that drift apart.
+  const people = el(`<div id="td-people"></div>`);
+  holder.appendChild(people);
+  (async ()=>{
+    let roster = [];
+    try{ roster = await api(`/tasks/${taskId}/people`, {background:true}); }catch(e){ roster = []; }
+    const seen = new Set();
+    const rows = [];
+    if(t.requester_employee_id && !seen.has(t.requester_employee_id)){
+      seen.add(t.requester_employee_id);
+      rows.push({ emp: t.requester_employee_id, name: t.requester_name || t.requester_employee_id,
+                  role: "ผู้ขอ" });
+    }
+    (t.drivers || []).forEach(d=>{
+      if(!d.employee_id || seen.has(d.employee_id)) return;
+      seen.add(d.employee_id);
+      // The type is known from the moment work is handed out; the code only
+      // once they board. Saying the type alone would read as "has a PE", so
+      // the wait is spelled out whenever it is still on.
+      const bits = [d.vehicle_type, d.vehicle_code].filter(Boolean).join(" ");
+      const tail = d.awaiting_vehicle
+        ? (bits ? `${bits} · ยังไม่ได้เลือกรถ` : "ยังไม่ได้เลือกรถ")
+        : bits;
+      rows.push({ emp: d.employee_id, name: d.full_name || d.employee_id,
+                  role: "คนขับ" + (tail ? ` · ${tail}` : "") });
+    });
+    if(!rows.length) return;
+    people.appendChild(el(`<div class="section-title">คนเกี่ยวข้อง</div>`));
+    rows.forEach(r=>{
+      const row = el(`<button type="button" class="person-row">
+        <span class="person-ava">${initialsOf(r.name)}</span>
+        <span class="person-main">
+          <span class="person-role">${r.role}</span>
+          <span class="person-name">${r.name}</span>
+        </span>
+        <span class="person-go" aria-hidden="true">›</span>
+      </button>`);
+      row.onclick = ()=> openPersonSheet(r.emp, roster);
+      people.appendChild(row);
+    });
+    people.appendChild(el(`<div class="field-note" style="margin-top:6px;">แตะชื่อเพื่อดูเบอร์ติดต่อและรายละเอียด</div>`));
+  })();
   loadAuthenticatedImages(holder);
   // Any card action that mutates state closes this detail sheet on success via refreshAll's
   // normal re-render; simplest is to just close it after a successful mutation.

@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261027.1526"
+APP_VERSION = "TTLOD.261027.1541"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
