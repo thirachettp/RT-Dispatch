@@ -414,6 +414,15 @@
     font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;}
   .pick-btn.is-on{background:var(--amber);border-color:var(--amber);color:#ffffff;}
 
+  .cc-pick{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
+  .cc-opt{min-height:40px;padding:8px 12px;border-radius:999px;
+    border:1px solid var(--line);background:var(--panel);color:var(--ink);
+    font-family:inherit;font-size:12.5px;cursor:pointer;text-align:left;}
+  .cc-opt.is-on{background:var(--amber);border-color:var(--amber);color:#ffffff;}
+  .cc-opt.cc-add{border-style:dashed;}
+  .cc-tag{font-size:10.5px;color:var(--ink-dim);margin-left:4px;}
+  .cc-opt.is-on .cc-tag{color:#ffffff;}
+
   .chat-log{flex:1;overflow-y:auto;max-height:44vh;margin:10px 0;padding:4px 2px;}
   .chat-msg{max-width:80%;margin-bottom:8px;padding:8px 11px;border-radius:12px;font-size:13px;line-height:1.4;}
   .chat-msg.mine{background:var(--amber-dim);color:var(--amber);margin-left:auto;border-bottom-right-radius:3px;}
@@ -2168,6 +2177,7 @@ function zoneMatchOf(task, zones){
   return null;
 }
 const isCrew = ()=> state.role === "DRIVER" || (state.role === "DISPATCH" && myLicenses().length > 0);
+try{ state.taskScope = localStorage.getItem("rt_task_scope") || "mine"; }catch(e){ state.taskScope = "mine"; }
 // A dispatcher runs the floor with an admin's screens, minus จัดการระบบ.
 const CREW_ROLES = ["DRIVER", "DISPATCH"];
 const OPS_ROLES = ["ADMIN", "DISPATCH"];
@@ -2406,11 +2416,33 @@ function bindCardActions(container){
 // ---------------- USER ----------------
 function renderUserTab(main){
   if(state.tab === "tasks"){
+    // Seeing the whole unit's work is a deliberate switch, not the default:
+    // for anyone in a large cost centre it would bury their own jobs.
+    if(state.me && state.me.cost_center){
+      const row = el(`<div class="pick-row" style="grid-template-columns:repeat(2,1fr);margin-bottom:10px;"></div>`);
+      [["mine","งานของฉัน"], ["unit","งานทั้งหน่วย"]].forEach(([k, label])=>{
+        const on = taskScope() === k;
+        const b = el(`<button type="button" class="pick-btn${on ? " is-on" : ""}" aria-pressed="${on}">${label}</button>`);
+        b.onclick = ()=>{ if(!on) setTaskScope(k); };
+        row.appendChild(b);
+      });
+      main.appendChild(row);
+      if(taskScope() === "unit"){
+        main.appendChild(el(`<div class="field-note" style="margin:-4px 0 10px;line-height:1.6;">
+          กำลังดูงานทั้งหมดของ ${costCenterLabel(state.me.cost_center)} —
+          งานของเพื่อนร่วมหน่วยดูและคุยได้ ส่วนแก้ไข ยกเลิก และให้คะแนน เป็นของเจ้าของงาน</div>`));
+      }
+    }
     const active = state.tasks.filter(t=>!["Completed","Cancelled"].includes(t.status));
     main.appendChild(el(`<div class="section-title">งานที่กำลังดำเนินการ (${active.length})</div>`));
     if(active.length === 0){ main.appendChild(el(`<div class="empty">ยังไม่มีงาน กดปุ่ม + เพื่อสร้างงานใหม่</div>`)); }
     active.forEach(t=>{
       let actions = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
+      if(!isMyTask(t)){
+        // Someone else's job: readable and answerable, not editable.
+        main.appendChild(el(taskCard(t, actions, {showRequester: true})));
+        return;
+      }
       if(t.status === "Waiting"){
         actions = `<button class="btn" data-edit="${t.id}">แก้ไข</button>
           ${t.blocked_reason ? `<button class="btn amber" data-resubmit="${t.id}">ส่งใหม่</button>` : ""}
@@ -2440,8 +2472,10 @@ function renderUserTab(main){
       reviewWrap.appendChild(el(`<div class="empty">ไม่มีงานที่รอให้คะแนน</div>`));
     } else {
       awaitingReview.forEach(t=>{
-        const actions = `<button class="btn amber" data-rate="${t.id}">ให้คะแนน</button><button class="btn" data-chat="${t.id}">💬 แชท</button>`;
-        reviewWrap.appendChild(el(taskCard(t, actions)));
+        const actions = (isMyTask(t)
+          ? `<button class="btn amber" data-rate="${t.id}">ให้คะแนน</button>` : "")
+          + `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
+        reviewWrap.appendChild(el(taskCard(t, actions, {showRequester: !isMyTask(t)})));
       });
     }
     bindCardActions(reviewWrap);
@@ -2753,10 +2787,76 @@ function mezzOptions(zone){
 // requester is picking a side, not a rack type.
 // A place reads as its code, with the longer name beside it when there is
 // one — the code is what goes on the job, so it stays first.
+// A cost centre reads as its digits plus the name someone gave it, so
+// "12345 Mgmt" rather than a number nobody outside that unit recognises.
+// Whose job this is. A requester sees colleagues' jobs in the unit view, and
+// what they may DO with one is still the owner's: edit, cancel and rate stay
+// where the responsibility sits.
+const isMyTask = (t)=> !t.requester_employee_id || t.requester_employee_id === state.employee_id;
+const taskScope = ()=> state.taskScope === "unit" ? "unit" : "mine";
+function setTaskScope(v){
+  state.taskScope = v;
+  try{ localStorage.setItem("rt_task_scope", v); }catch(e){}
+  refreshAll({visible:true});
+}
+
+function costCenterLabel(code){
+  const c = String(code || "").trim();
+  if(!c) return "";
+  const hit = (state.costCenters || []).find(x=> x.code === c);
+  return hit && hit.name ? `${hit.code} ${hit.name}` : c;
+}
+
+// Turns a plain cost-centre input into search-or-add: type part of a code or
+// a name to narrow the list, tap to pick — and if the digits are not on the
+// list at all, add them from here rather than being stopped.
+function attachCostCenterPicker(input, opts={}){
+  if(!input || input.dataset.ccPicker) return;
+  input.dataset.ccPicker = "1";
+  input.removeAttribute("maxlength");
+  input.setAttribute("inputmode", "text");
+  const box = el(`<div class="cc-pick"></div>`);
+  input.insertAdjacentElement("afterend", box);
+
+  function draw(){
+    const q = input.value.trim();
+    const all = (state.costCenters || []).filter(x=> x.active !== 0);
+    const ql = q.toLowerCase();
+    const hits = (!q ? all : all.filter(x=>
+      x.code.includes(q) || String(x.name || "").toLowerCase().includes(ql))).slice(0, 8);
+    box.innerHTML = "";
+    hits.forEach(x=>{
+      const on = x.code === q;
+      const b = el(`<button type="button" class="cc-opt${on ? " is-on" : ""}"
+        aria-pressed="${on}"><b class="mono">${x.code}</b>${x.name ? " " + x.name : ""}${
+          x.pending ? ` <span class="cc-tag">รอตรวจ</span>` : ""}</button>`);
+      b.onclick = ()=>{ input.value = x.code; draw(); if(opts.onPick) opts.onPick(x.code); };
+      box.appendChild(b);
+    });
+    if(/^[0-9]{5}$/.test(q) && !all.some(x=> x.code === q)){
+      const b = el(`<button type="button" class="cc-opt cc-add">เพิ่ม <b class="mono">${q}</b> เป็น cost center ใหม่</button>`);
+      b.onclick = async ()=>{
+        try{
+          await api("/cost-centers", {method:"POST", body: JSON.stringify({code: q})});
+          toast(`เพิ่ม cost center ${q} แล้ว`);
+          await refreshAll();
+          draw();
+          if(opts.onPick) opts.onPick(q);
+        }catch(e){ toast(e.message); }
+      };
+      box.appendChild(b);
+    }
+  }
+  input.addEventListener("input", draw);
+  draw();
+  return draw;
+}
+
 function placeLabel(pl){
   const code = String(pl.code || "");
   const label = String(pl.label || "").trim();
-  return label ? `${code} · ${label}` : code;
+  const tag = pl.pending ? ` <span class="cc-tag">รอยืนยัน</span>` : "";
+  return (label ? `${code} · ${label}` : code) + tag;
 }
 
 function mezzSideLabel(side){
@@ -2878,9 +2978,44 @@ function buildLocationPicker(container, zones, initial){
       // nothing to type on purpose: a room that is not on the list is one the
       // server will refuse, so a text field here would only produce jobs that
       // bounce back.
-      const places = currentZone.locations || [];
+      const places = (currentZone.locations || []).slice();
+      // The person standing in front of a room the list does not have is the
+      // one who knows it exists. Adding it here keeps the job moving; it is
+      // marked รอยืนยัน until an admin has looked.
+      const addRow = el(`<div style="margin-top:10px;"></div>`);
+      const addBtn = el(`<button type="button" class="btn" style="width:100%;">+ ไม่มีจุดที่ต้องการ เพิ่มจุดใหม่</button>`);
+      const addForm = el(`<div class="grid2" style="margin-top:8px;display:none;">
+        <div><input class="zp-new-code mono" placeholder="รหัสจุด เช่น ${currentZone.example_code || 'RRE'}" /></div>
+        <div><button type="button" class="btn amber zp-new-go" style="width:100%;min-height:44px;">เพิ่มและเลือก</button></div>
+      </div>`);
+      addBtn.onclick = ()=>{
+        addForm.style.display = addForm.style.display === "none" ? "" : "none";
+        if(addForm.style.display === "") addForm.querySelector(".zp-new-code").focus();
+      };
+      addForm.querySelector(".zp-new-go").onclick = async ()=>{
+        const code = addForm.querySelector(".zp-new-code").value.trim();
+        if(!code){ toast("กรุณาระบุรหัสจุด"); return; }
+        try{
+          const res = await api(`/zones/${currentZone.zone_key}/locations/request`,
+                                {method:"POST", body: JSON.stringify({code})});
+          toast(res.existing ? `จุด ${res.code} มีอยู่แล้ว` : `เพิ่มจุด ${res.code} แล้ว (รอแอดมินยืนยัน)`);
+          if(!places.some(pl=> pl.code === res.code)){
+            places.push({code: res.code, label: null, pending: 1});
+          }
+          singleValue = res.code;
+          if(currentZone.allow_multiple && !chips.includes(res.code)) chips.push(res.code);
+          addForm.querySelector(".zp-new-code").value = "";
+          addForm.style.display = "none";
+          renderBody();
+          if(container.onPendingChange) container.onPendingChange();
+        }catch(e){ toast(e.message); }
+      };
+      addRow.appendChild(addBtn);
+      addRow.appendChild(addForm);
+
       if(!places.length){
-        body.appendChild(el(`<div class="field-note">โซนนี้ยังไม่มีจุดให้เลือก — ให้แอดมินเพิ่มจุดในหน้าจัดการระบบก่อน</div>`));
+        body.appendChild(el(`<div class="field-note">โซนนี้ยังไม่มีจุดให้เลือก — เพิ่มจุดแรกได้เลย</div>`));
+        body.appendChild(addRow);
       } else if(currentZone.allow_multiple){
         const row = el(`<div class="pick-row" role="group" aria-label="${currentZone.zone_name_th}"></div>`);
         function drawPlaces(){
@@ -2900,6 +3035,7 @@ function buildLocationPicker(container, zones, initial){
         }
         drawPlaces();
         body.appendChild(row);
+        body.appendChild(addRow);
       } else {
         if(!places.some(pl=> pl.code === singleValue)) singleValue = places[0].code;
         const row = el(`<div class="pick-row" role="group" aria-label="${currentZone.zone_name_th}"></div>`);
@@ -2915,6 +3051,7 @@ function buildLocationPicker(container, zones, initial){
         }
         drawPlaces();
         body.appendChild(row);
+        body.appendChild(addRow);
       }
     } else if(zk === "MEZZANINE"){
       // Buttons rather than dropdowns: there are only four floors and two
@@ -3171,12 +3308,12 @@ function openCreateTask(prefill){
         </div>` : ""}
         <label>BU</label>
         <select id="ct-bu">${BU_LIST.map(b=>`<option value="${b}">${b}</option>`).join("")}</select>
-        <label for="ct-cc">Cost center ของงานนี้ (5 หลัก)</label>
+        <label for="ct-cc">Cost center ของงานนี้</label>
         <input id="ct-cc" maxlength="5" inputmode="numeric"
                value="${(state.me && state.me.cost_center) || ''}"
                placeholder="เช่น 12345" />
         <div class="field-note">${(state.me && state.me.cost_center)
-          ? "เติมจากโปรไฟล์ของคุณให้แล้ว แก้ได้ถ้างานนี้ลงบัญชีหน่วยอื่น"
+          ? `เติมจากโปรไฟล์ของคุณให้แล้ว (${costCenterLabel(state.me.cost_center)}) แก้ได้ถ้างานนี้ลงบัญชีหน่วยอื่น`
           : "บัญชีของคุณไม่มี cost center กรุณาระบุของหน่วยที่จะลงบัญชีงานนี้"}</div>
         <div id="ct-driver-avail" class="field-note" style="margin-top:8px;">กำลังเช็คจำนวนคนขับว่าง...</div>
         <div class="grid2">
@@ -3216,6 +3353,11 @@ function openCreateTask(prefill){
     box.textContent = `คนขับว่างตอนนี้ ${s.available} คน (ไม่ว่าง ${s.busy} · ทั้งหมด ${s.total} คน)`;
     if(s.available === 0) box.style.color = "var(--warn)";
   }).catch(()=>{ overlay.querySelector("#ct-driver-avail").textContent = ""; });
+
+  // Search-or-add rather than five bare digits: the person booking the job
+  // knows the unit by name more often than by number, and a cost centre that
+  // is not on the list yet can be added here instead of blocking the job.
+  attachCostCenterPicker(overlay.querySelector("#ct-cc"));
 
   let fromValue = null, toValue = null, zonesCache = null;
   async function ensureZones(){ if(!zonesCache) zonesCache = await api("/zones"); return zonesCache; }
@@ -3470,6 +3612,7 @@ function renderProfile(main){
     }catch(e){ toast(e.message); }
   };
   main.appendChild(pf);
+  attachCostCenterPicker(pf.querySelector("#pf-cc"));
 
   main.appendChild(el(`<div class="section-title">เปลี่ยนรหัสผ่าน</div>`));
   const card = el(`<div class="card">
@@ -5812,7 +5955,7 @@ function openUserEditSheet(userId){
   };
 }
 
-const ADMIN_SETTINGS_SUBTABS = ["system", "zones", "vehicletypes", "audit"];
+const ADMIN_SETTINGS_SUBTABS = ["system", "zones", "costcenters", "vehicletypes", "audit"];
 
 // Editing a zone in place. The key is shown but locked: tasks store it as
 // plain text and four zones have their own picker keyed on it, so changing it
@@ -6028,6 +6171,7 @@ function renderAdminSettings(main){
   const subtabs = el(`<div class="subtabs">
     <button data-s="system">ตั้งค่าระบบ</button>
     <button data-s="zones">โซน</button>
+    <button data-s="costcenters">Cost center</button>
     <button data-s="vehicletypes">ประเภทรถ</button>
     <button data-s="audit">บันทึกตรวจสอบ</button>
   </div>`);
@@ -6164,6 +6308,74 @@ function renderAdminSettings(main){
         </div>`));
       }catch(e){ /* diagnostics are informational only */ }
     })();
+  } else if(state.subtab === "costcenters"){
+    main.appendChild(el(`<div class="section-title">Cost center</div>`));
+    main.appendChild(el(`<div class="field-note" style="margin-bottom:10px;line-height:1.6;">
+      ใครก็เพิ่มได้ตอนเปิดงาน งานจะได้ไม่ต้องรอ — ของที่เพิ่งเพิ่มจะขึ้น "รอตรวจ"
+      ให้มาตั้งชื่อหรือปิดทิ้งที่นี่</div>`));
+
+    const add = el(`<div class="card">
+      <div class="grid2">
+        <div><label for="cc-new-code" style="margin-top:0;">รหัส (5 หลัก)</label>
+          <input id="cc-new-code" class="mono" maxlength="5" inputmode="numeric" placeholder="เช่น 12345" /></div>
+        <div><label for="cc-new-name" style="margin-top:0;">ชื่อหน่วย</label>
+          <input id="cc-new-name" placeholder="เช่น Mgmt" /></div>
+      </div>
+      <button class="btn" id="cc-new-go" style="width:100%;margin-top:8px;">เพิ่ม cost center</button>
+    </div>`);
+    add.querySelector("#cc-new-go").onclick = async ()=>{
+      const code = add.querySelector("#cc-new-code").value.trim();
+      const name = add.querySelector("#cc-new-name").value.trim();
+      try{
+        await api("/cost-centers", {method:"POST", body: JSON.stringify({code, name: name || null})});
+        toast("เพิ่มแล้ว");
+        add.querySelector("#cc-new-code").value = "";
+        add.querySelector("#cc-new-name").value = "";
+        await refreshAll({visible:true});
+      }catch(e){ toast(e.message); }
+    };
+    main.appendChild(add);
+
+    const rows = (state.costCenters || []).slice()
+      .sort((a,b)=> (b.pending - a.pending) || a.code.localeCompare(b.code));
+    const waiting = rows.filter(r=> r.pending).length;
+    main.appendChild(el(`<div class="section-title">รายการทั้งหมด (${rows.length})${
+      waiting ? ` · รอตรวจ ${waiting}` : ""}</div>`));
+    const list = el(`<div class="card"></div>`);
+    if(!rows.length) list.appendChild(el(`<div class="empty">ยังไม่มี cost center</div>`));
+    rows.forEach(r=>{
+      const row = el(`<div class="list-row" style="display:block;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <b class="mono">${r.code}</b>
+          <span class="l-sub">${r.name || "ยังไม่มีชื่อ"}</span>
+          ${r.pending ? `<span class="cc-tag">รอตรวจ</span>` : ""}
+          ${r.active ? "" : `<span class="cc-tag">ปิดอยู่</span>`}
+        </div>
+        <div class="grid2" style="margin-top:8px;">
+          <div><input class="cc-name" placeholder="ระบุชื่อหน่วย" value="${r.name || ''}" /></div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn cc-save" style="flex:1;min-height:44px;">บันทึก</button>
+            <button class="btn cc-toggle" style="flex:none;min-height:44px;">${r.active ? "ปิด" : "เปิด"}</button>
+          </div>
+        </div>
+      </div>`);
+      row.querySelector(".cc-save").onclick = async ()=>{
+        try{
+          await api(`/cost-centers/${r.code}`, {method:"PUT",
+            body: JSON.stringify({name: row.querySelector(".cc-name").value.trim() || null})});
+          toast("บันทึกแล้ว"); await refreshAll({visible:true});
+        }catch(e){ toast(e.message); }
+      };
+      row.querySelector(".cc-toggle").onclick = async ()=>{
+        try{
+          await api(`/cost-centers/${r.code}`, {method:"PUT",
+            body: JSON.stringify({active: !r.active})});
+          await refreshAll({visible:true});
+        }catch(e){ toast(e.message); }
+      };
+      list.appendChild(row);
+    });
+    main.appendChild(list);
   } else if(state.subtab === "zones"){
     main.appendChild(el(`<div class="section-title">โซนทั้งหมด</div>`));
     main.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">ไม่ต้องสร้างรหัสตำแหน่งทีละอัน — กำหนดแค่รูปแบบ (pattern) ของโซน ระบบจะตรวจสอบรหัสที่พิมพ์เข้ามาอัตโนมัติ</div>`));
@@ -6360,6 +6572,9 @@ function buildTaskDetailActions(t){
   const isChat = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
   const dupBtn = `<button class="btn" data-duplicate="${t.id}">สร้างงานจากงานนี้</button>`;
   if(state.role === "USER"){
+    // A colleague's job, seen through the unit view: read it, ask about it,
+    // or raise your own like it — but it is not yours to change.
+    if(!isMyTask(t)) return isChat + dupBtn;
     if(t.status === "Waiting") return `<button class="btn" data-edit="${t.id}">แก้ไข</button>${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
     if(t.status === "Assigned") return `${isChat}<button class="btn red" data-action="cancel">ยกเลิก</button>${dupBtn}`;
     // The requester can clear a problem and confirm the job is done — they are
@@ -6856,7 +7071,9 @@ async function refreshAll(opts={}){
   const ctrl = new AbortController();
   _refreshAbort = ctrl;
   try{
-    const d = await api("/app-data?scope=" + scope, {background: !opts.visible, signal: ctrl.signal});
+    const d = await api("/app-data?scope=" + scope
+      + (state.role === "USER" && taskScope() === "unit" ? "&task_scope=unit" : ""),
+      {background: !opts.visible, signal: ctrl.signal});
     // Merge returned keys into state (only overwrites what the scope included,
     // so data from another tab stays cached until you go back to it).
     Object.assign(state, d);

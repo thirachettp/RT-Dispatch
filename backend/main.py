@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261027.1249"
+APP_VERSION = "TTLOD.261027.1343"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -898,8 +898,27 @@ CREATE TABLE IF NOT EXISTS zone_locations (
     -- Retired rooms stay here so old jobs still read properly; they just stop
     -- being offered.
     active INTEGER NOT NULL DEFAULT 1,
+    -- Added by a requester who needed it, not yet checked by an admin. It is
+    -- usable at once — blocking the job to wait for approval would just move
+    -- the problem onto the floor — and shows as "รอยืนยัน" until confirmed.
+    pending INTEGER NOT NULL DEFAULT 0,
     created_at TEXT,
     UNIQUE(zone_key, code)
+);
+
+-- The cost centres jobs are booked against. Before this they were five loose
+-- digits typed into a box, so "82899" meant nothing to anyone who did not
+-- already know the number, and a typo created a cost centre nobody noticed.
+CREATE TABLE IF NOT EXISTS cost_centers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    -- What people call it ("Mgmt"). Blank until someone fills it in.
+    name TEXT,
+    -- Added by whoever needed it rather than by an admin. Usable immediately
+    -- so nobody's work waits on approval; flagged so the list can be tidied.
+    pending INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT
 );
 
 -- UNUSED since the vehicle-type/zone matrix was removed. Kept rather than
@@ -1219,6 +1238,7 @@ NEW_COLUMNS = [
     ("zones", "active", "INTEGER NOT NULL DEFAULT 1", None),
     # The zone's locations come from the zone_locations list, not its pattern.
     ("zones", "from_master", "INTEGER NOT NULL DEFAULT 0", None),
+    ("zone_locations", "pending", "INTEGER NOT NULL DEFAULT 0", None),
     # The cost centre the job is booked against. It used to be read off the
     # requester's profile, which left nothing to charge against when an admin
     # or dispatcher raised the job on someone's behalf — they have no cost
@@ -1242,7 +1262,7 @@ def _column_exists(db, table, column):
 # only when the database is FRESH, so a table added to SCHEMA alone would never
 # exist on the live one and every screen that touched it would 500. This runs
 # on every boot for both backends instead.
-NEW_TABLES = ("driver_zones", "zone_locations")
+NEW_TABLES = ("driver_zones", "zone_locations", "cost_centers")
 
 
 def ensure_tables():
@@ -1300,6 +1320,59 @@ def ensure_seed_zones():
                 log.info("Seeded COOLROOM rooms")
     except Exception as e:
         log.warning("ensure_seed_zones skipped: %s", e)
+
+
+COST_CENTER_LEN = 5
+
+
+def valid_cost_center(code: str) -> bool:
+    code = (code or "").strip()
+    return code.isdigit() and len(code) == COST_CENTER_LEN
+
+
+def ensure_cost_centers():
+    """Fill the cost-centre list from the codes already in use.
+
+    The list is new; the codes are not. Every code an account or a job already
+    carries goes in as an established cost centre — not pending, since it was
+    in use long before anyone could add one — with its name left blank for
+    someone to fill in.
+    """
+    try:
+        with get_db() as db:
+            known = {r["code"] for r in db.execute("SELECT code FROM cost_centers").fetchall()}
+            found = set()
+            for q in ("SELECT DISTINCT cost_center AS c FROM users WHERE cost_center IS NOT NULL",
+                      "SELECT DISTINCT cost_center AS c FROM tasks WHERE cost_center IS NOT NULL"):
+                for r in db.execute(q).fetchall():
+                    if valid_cost_center(r["c"]):
+                        found.add(r["c"].strip())
+            fresh = sorted(found - known)
+            for code in fresh:
+                db.execute("INSERT INTO cost_centers (code, name, pending, active, created_at) "
+                           "VALUES (?,NULL,0,1,?)", (code, now_iso()))
+            if fresh:
+                log.info("Seeded %d cost centres already in use", len(fresh))
+    except Exception as e:
+        log.warning("ensure_cost_centers skipped: %s", e)
+
+
+def register_cost_center(db, code: str) -> bool:
+    """Record a cost centre the moment someone uses one that is not listed.
+
+    Refusing it would stop a job over bookkeeping, so it goes in as pending
+    and ops are told; an admin names or retires it afterwards. Returns True
+    when this call is what created it.
+    """
+    code = (code or "").strip()
+    if not valid_cost_center(code):
+        return False
+    if db.execute("SELECT 1 FROM cost_centers WHERE code=?", (code,)).fetchone():
+        return False
+    db.execute("INSERT INTO cost_centers (code, name, pending, active, created_at) "
+               "VALUES (?,NULL,1,1,?)", (code, now_iso()))
+    notify_ops(db, f"มี cost center ใหม่ {code} ถูกใช้งาน — ตั้งชื่อหรือปิดได้ในหน้าจัดการระบบ")
+    return True
 
 
 def ensure_columns():
@@ -2094,6 +2167,12 @@ def task_chat_allowed(db, task_row, user) -> bool:
         return True
     if task_row["requester_id"] == user["id"]:
         return True
+    # A colleague booked to the same cost centre can see the job in their unit
+    # view, so they can ask about it there too — otherwise the job appears in
+    # their list with a chat button that always refuses them.
+    if (user["role"] == "USER" and task_row["cost_center"]
+            and (user["cost_center"] or "").strip() == task_row["cost_center"]):
+        return True
     ever_driver = db.execute(
         "SELECT 1 FROM task_assignments WHERE task_id=? AND driver_id=?", (task_row["id"], user["id"])
     ).fetchone()
@@ -2405,6 +2484,7 @@ def register(body: RegisterBody):
             )
             user_id = cur.fetchone()["id"]
         db.execute("UPDATE users SET first_name=?, last_name=? WHERE id=?", (first, last, user_id))
+        register_cost_center(db, body.cost_center)
 
         if licence:
             # Permanent licence (no expiry), as specified for invite-code drivers.
@@ -2501,6 +2581,8 @@ def update_me(body: ProfileUpdateBody, user=Depends(current_user)):
             fields["contact"] = validate_and_normalize_contact(db, body.contact, exclude_user_id=user["id"])
         if not fields:
             return {"ok": True}
+        if fields.get("cost_center"):
+            register_cost_center(db, fields["cost_center"])
         set_clause = ", ".join(f"{k}=?" for k in fields.keys())
         db.execute(f"UPDATE users SET {set_clause} WHERE id=?", list(fields.values()) + [user["id"]])
         return {"ok": True}
@@ -2872,7 +2954,7 @@ def list_zones(user=Depends(current_user)):
             "SELECT * FROM zone_locations WHERE active=1 ORDER BY sort_order, code"
         ).fetchall():
             places.setdefault(r["zone_key"], []).append(
-                {"code": r["code"], "label": r["label"]})
+                {"code": r["code"], "label": r["label"], "pending": r["pending"]})
     out = []
     for r in rows:
         if user["role"] != "ADMIN" and not r["active"]:
@@ -3003,10 +3085,109 @@ def delete_zone(zone_key: str, user=Depends(require_role("ADMIN"))):
         return {"ok": True, "deleted": True}
 
 
+class CostCenterBody(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
+    active: Optional[bool] = None
+    pending: Optional[bool] = None
+
+
+@app.get("/cost-centers")
+def list_cost_centers(user=Depends(current_user)):
+    """The cost centres a job can be booked against.
+
+    Admin also sees the retired ones, to switch one back on; everyone else
+    only gets what they may still pick.
+    """
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM cost_centers ORDER BY code").fetchall()
+    if user["role"] == "ADMIN":
+        return [dict(r) for r in rows]
+    return [dict(r) for r in rows if r["active"]]
+
+
+@app.post("/cost-centers")
+def add_cost_center(body: CostCenterBody, user=Depends(current_user)):
+    """Add a cost centre.
+
+    Open to everyone on purpose: the person raising a job is the one who knows
+    which account it belongs to, and making them wait for an admin would stop
+    the work. One an admin adds is established straight away; one anybody else
+    adds is marked pending for an admin to name or retire.
+    """
+    code = (body.code or "").strip()
+    if not valid_cost_center(code):
+        raise HTTPException(400, f"Cost center ต้องเป็นตัวเลข {COST_CENTER_LEN} หลัก")
+    name = (body.name or "").strip() or None
+    with get_db() as db:
+        row = db.execute("SELECT * FROM cost_centers WHERE code=?", (code,)).fetchone()
+        if row:
+            # Already there: give it back rather than refusing. The caller is
+            # picking a cost centre, not administering the list.
+            if not row["active"]:
+                raise HTTPException(400, f"Cost center {code} ถูกปิดใช้งานอยู่ กรุณาติดต่อแอดมิน")
+            if name and not row["name"]:
+                db.execute("UPDATE cost_centers SET name=? WHERE code=?", (name, code))
+            return {"ok": True, "code": code, "existing": True}
+        is_admin = user["role"] == "ADMIN"
+        db.execute("INSERT INTO cost_centers (code, name, pending, active, created_at) "
+                   "VALUES (?,?,?,1,?)", (code, name, 0 if is_admin else 1, now_iso()))
+        audit(db, user["id"], "add_cost_center", f"{code}" + (f" ({name})" if name else ""))
+        if not is_admin:
+            notify_ops(db, f"{person_name(user)} เพิ่ม cost center {code}"
+                           + (f" ({name})" if name else "") + " — ตรวจได้ในหน้าจัดการระบบ")
+        return {"ok": True, "code": code, "pending": not is_admin}
+
+
+@app.put("/cost-centers/{code}")
+def update_cost_center(code: str, body: CostCenterBody, user=Depends(require_role("ADMIN"))):
+    """Name, confirm or retire a cost centre. The CODE itself never changes:
+    every account and job that uses it stores the digits as plain text."""
+    with get_db() as db:
+        row = db.execute("SELECT * FROM cost_centers WHERE code=?", (code,)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบ cost center นี้")
+        fields = {}
+        if body.name is not None:
+            fields["name"] = body.name.strip() or None
+        if body.active is not None:
+            fields["active"] = 1 if body.active else 0
+        if body.pending is not None:
+            fields["pending"] = 1 if body.pending else 0
+        elif body.name is not None:
+            # Naming one is the act of checking it.
+            fields["pending"] = 0
+        if not fields:
+            return {"ok": True, "unchanged": True}
+        db.execute(f"UPDATE cost_centers SET {', '.join(f'{k}=?' for k in fields)} WHERE code=?",
+                   tuple(fields.values()) + (code,))
+        audit(db, user["id"], "update_cost_center", f"{code}: {', '.join(sorted(fields))}")
+        return {"ok": True}
+
+
+@app.delete("/cost-centers/{code}")
+def delete_cost_center(code: str, user=Depends(require_role("ADMIN"))):
+    """Retire a cost centre anything refers to; delete one nothing uses."""
+    with get_db() as db:
+        row = db.execute("SELECT * FROM cost_centers WHERE code=?", (code,)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบ cost center นี้")
+        used = (db.execute("SELECT COUNT(*) n FROM tasks WHERE cost_center=?", (code,)).fetchone()["n"]
+                + db.execute("SELECT COUNT(*) n FROM users WHERE cost_center=?", (code,)).fetchone()["n"])
+        if used:
+            db.execute("UPDATE cost_centers SET active=0 WHERE code=?", (code,))
+            audit(db, user["id"], "deactivate_cost_center", f"{code} (refs={used})")
+            return {"ok": True, "deactivated": True, "ref_count": used}
+        db.execute("DELETE FROM cost_centers WHERE code=?", (code,))
+        audit(db, user["id"], "delete_cost_center", code)
+        return {"ok": True, "deleted": True}
+
+
 class ZoneLocationBody(BaseModel):
     code: Optional[str] = None
     label: Optional[str] = None
     active: Optional[bool] = None
+    pending: Optional[bool] = None
 
 
 @app.get("/zones/{zone_key}/locations")
@@ -3047,6 +3228,49 @@ def add_zone_location(zone_key: str, body: ZoneLocationBody, user=Depends(requir
         return {"ok": True, "code": code}
 
 
+@app.post("/zones/{zone_key}/locations/request")
+def request_zone_location(zone_key: str, body: ZoneLocationBody, user=Depends(current_user)):
+    """Add a place to a list-backed zone from the job form.
+
+    The person standing in front of a room that is not on the list is the one
+    who knows it exists. Refusing the job until an admin adds it moves the
+    problem onto the floor, so the place is created and usable at once, marked
+    pending, and ops are told. An admin names, merges or retires it after.
+    """
+    code = (body.code or "").strip().upper()
+    if not code or len(code) > 40:
+        raise HTTPException(400, "กรุณาระบุรหัสจุด (ไม่เกิน 40 ตัวอักษร)")
+    with get_db() as db:
+        zone = db.execute("SELECT * FROM zones WHERE zone_key=?", (zone_key,)).fetchone()
+        if not zone:
+            raise HTTPException(404, "ไม่พบโซนนี้")
+        if not zone["from_master"]:
+            raise HTTPException(400, "โซนนี้ไม่ได้ใช้รายการจุด")
+        if not zone["active"]:
+            raise HTTPException(400, f"โซน {zone['zone_name_th']} ถูกปิดใช้งานแล้ว")
+        # The zone's pattern is a shape check here, not the rule: it keeps a
+        # sentence out of a field that holds a code.
+        if not re.compile(zone["code_pattern"], re.IGNORECASE).match(code):
+            raise HTTPException(400, f"รูปแบบรหัสจุดไม่ถูกต้อง (ตัวอย่างที่ถูกต้อง: {zone['example_code']})")
+        row = db.execute("SELECT * FROM zone_locations WHERE zone_key=? AND UPPER(code)=?",
+                         (zone_key, code)).fetchone()
+        if row:
+            if not row["active"]:
+                raise HTTPException(400, f"จุด {row['code']} ถูกปิดใช้งานอยู่ กรุณาติดต่อแอดมิน")
+            return {"ok": True, "code": row["code"], "existing": True}
+        order = db.execute(
+            "SELECT COALESCE(MAX(sort_order),0) + 1 AS m FROM zone_locations WHERE zone_key=?",
+            (zone_key,)).fetchone()["m"]
+        db.execute(
+            "INSERT INTO zone_locations (zone_key, code, label, sort_order, active, pending, created_at) "
+            "VALUES (?,?,?,?,1,1,?)",
+            (zone_key, code, (body.label or "").strip() or None, order, now_iso()))
+        audit(db, user["id"], "request_zone_location", f"{zone_key}: {code}")
+        notify_ops(db, f"{person_name(user)} เพิ่มจุด {code} ในโซน {zone['zone_name_th']} "
+                       f"— ตรวจได้ในหน้าจัดการระบบ")
+        return {"ok": True, "code": code, "pending": True}
+
+
 @app.put("/zones/{zone_key}/locations/{loc_id}")
 def update_zone_location(zone_key: str, loc_id: int, body: ZoneLocationBody,
                          user=Depends(require_role("ADMIN"))):
@@ -3067,6 +3291,11 @@ def update_zone_location(zone_key: str, loc_id: int, body: ZoneLocationBody,
             fields["label"] = body.label.strip() or None
         if body.active is not None:
             fields["active"] = 1 if body.active else 0
+        if body.pending is not None:
+            fields["pending"] = 1 if body.pending else 0
+        elif body.label is not None:
+            # Naming a place is the act of checking it.
+            fields["pending"] = 0
         if not fields:
             return {"ok": True, "unchanged": True}
         db.execute(f"UPDATE zone_locations SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
@@ -3382,6 +3611,10 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER", "ADMIN", "DI
     if not (cost_center.isdigit() and len(cost_center) == 5):
         raise HTTPException(400, "cost center ต้องเป็นตัวเลข 5 หลัก")
     with get_db() as db:
+        # A cost centre nobody has listed yet is recorded rather than refused:
+        # the person raising the job knows which account it belongs to, and
+        # holding the job for an admin would stop the work.
+        register_cost_center(db, cost_center)
         from_location = validate_location_string(db, body.from_zone, body.from_location)
         to_location = validate_location_string(db, body.to_zone, body.to_location, is_destination=True)
         task_type = infer_task_type(db, body.from_zone, body.to_zone)
@@ -3500,12 +3733,26 @@ def _history_cutoff_iso() -> str:
 
 
 @app.get("/tasks")
-def list_tasks(status_filter: Optional[str] = None, user=Depends(current_user)):
+def list_tasks(status_filter: Optional[str] = None, scope: Optional[str] = None,
+               user=Depends(current_user)):
     with get_db() as db:
         if user["role"] in ("ADMIN", "DISPATCH"):
             check_waiting_too_long(db)
         cutoff = _history_cutoff_iso()
-        if user["role"] == "USER":
+        if user["role"] == "USER" and scope == "unit" and (user["cost_center"] or "").strip():
+            # Everything booked to the same cost centre as this person, their
+            # own jobs included. The match is on the JOB's cost centre rather
+            # than the requester's, because a job can be raised against
+            # another unit's account and it is that account's work.
+            #
+            # The rating clause stays personal: a colleague's unrated job is
+            # not this person's to score, so it does not linger in their list.
+            q = ("SELECT * FROM tasks WHERE cost_center=? AND ("
+                 "status NOT IN ('Completed','Cancelled') "
+                 "OR created_at >= ? "
+                 "OR (status='Completed' AND rating IS NULL AND requester_id=?))")
+            params = [(user["cost_center"] or "").strip(), cutoff, user["id"]]
+        elif user["role"] == "USER":
             # Live tasks, recent history, and — regardless of age — anything
             # still awaiting this requester's rating, so the "ให้คะแนน" button
             # can never vanish just because the task got old.
@@ -5760,7 +6007,8 @@ def get_audit_logs(user=Depends(require_role("ADMIN"))):
 # ---------------------------------------------------------------------------
 
 @app.get("/app-data")
-def app_data(scope: str = "core", user=Depends(current_user)):
+def app_data(scope: str = "core", task_scope: Optional[str] = None,
+             user=Depends(current_user)):
     """Returns everything a screen needs in ONE round-trip instead of the
     frontend firing 14 separate requests every refresh. Each of those was a
     separate serverless invocation + DB round-trip on Vercel/Neon, which is
@@ -5783,8 +6031,11 @@ def app_data(scope: str = "core", user=Depends(current_user)):
     with get_db():
         out = {
             "me": me(user),
-            "tasks": list_tasks(None, user),
+            "tasks": list_tasks(None, task_scope, user),
             "notifications": get_notifications(user),
+            # Small, changes rarely, and needed by the job form and the
+            # profile screen — cheaper here than a request of its own.
+            "costCenters": list_cost_centers(user),
         }
         if scope == "driver":
             out["vehicles"] = list_vehicles(user)
@@ -6270,6 +6521,7 @@ try:
     ensure_columns()
     widen_role_constraint()
     ensure_seed_zones()
+    ensure_cost_centers()
     try:
         with get_db() as _db:
             sync_master_fleet(_db)
