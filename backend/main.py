@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261027.1541"
+APP_VERSION = "TTLOD.261027.1550"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -1981,7 +1981,9 @@ def notify(db, user_id: int, message: str, task_id: Optional[int] = None, kind: 
         "INSERT INTO notifications (user_id, message, task_id, kind, created_at) VALUES (?,?,?,?,?)",
         (user_id, message, task_id, kind, now_iso()),
     )
-    push_url = f"/?task={task_id}" if (kind in ("task", "chat") and task_id) else "/"
+    # The kind rides along so a tapped chat notification opens the chat and a
+    # job notification opens the job, the same split the in-app list uses.
+    push_url = f"/?task={task_id}&kind={kind}" if (kind in ("task", "chat") and task_id) else "/"
     # Chat messages about one job collapse into one line; anything else about
     # that job replaces the previous line about it; everything else stands on
     # its own. See send_web_push_to_user() for why this matters.

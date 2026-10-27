@@ -7522,6 +7522,9 @@ async function bootstrap(){
   // banner is needed — in that order, so the banner never appears for a device
   // that the silent path just fixed.
   ensurePushRegistration().then(maybeAutoPromptNotifications); // never blocks app usage
+  // After the first render and refresh, so the sheet opens over a screen that
+  // already has the job's data behind it.
+  openPendingTask();
 }
 
 // Put the driver back in their usual vehicle when they open the app. Silent
@@ -7602,12 +7605,53 @@ window.addEventListener("online", ()=>{
 // as long as it is.
 if("serviceWorker" in navigator){
   navigator.serviceWorker.addEventListener("message", (e)=>{
-    if(e.data && e.data.type === "scdc-refresh" && state.token) refreshAll();
+    if(!e.data || e.data.type !== "scdc-refresh") return;
+    if(!state.token) return;
+    // A tapped notification sends the job along with the nudge: focusing an
+    // open window does not reload it, so the query string never arrives and
+    // the deep link would be lost.
+    if(e.data.task){
+      _pendingTask = { id: String(e.data.task), kind: e.data.kind || "task" };
+      refreshAll().then(openPendingTask);
+      return;
+    }
+    refreshAll();
   });
+}
+
+// A notification is about one job, so tapping it should land on that job —
+// not on whatever screen happened to be open. The push carries /?task=<id>,
+// and until now nothing read it: the app booted, ignored the query, and left
+// the person to find the job themselves.
+let _pendingTask = null;
+
+function readTaskDeepLink(){
+  try{
+    const u = new URL(window.location.href);
+    const id = u.searchParams.get("task");
+    if(!id) return;
+    _pendingTask = { id, kind: u.searchParams.get("kind") || "task" };
+    // Take it out of the address bar so a reload, or coming back to the tab
+    // later, does not reopen a job the person already dealt with.
+    u.searchParams.delete("task");
+    u.searchParams.delete("kind");
+    history.replaceState({}, "", u.pathname + (u.search || "") + u.hash);
+  }catch(e){ /* a URL we cannot parse is not a deep link */ }
+}
+
+function openPendingTask(){
+  if(!_pendingTask || !state.token) return;
+  const { id, kind } = _pendingTask;
+  _pendingTask = null;
+  // Close whatever is already open first: arriving from a notification should
+  // show the job, not the job behind two stale sheets.
+  document.querySelectorAll(".sheet-overlay").forEach(o=> o.remove());
+  if(kind === "chat") openChatSheet(id); else openTaskDetailSheet(id);
 }
 
 function render(){
   stopPolling();
+  readTaskDeepLink();
   if(state.token){ bootstrap(); } else { renderLogin(); }
 }
 

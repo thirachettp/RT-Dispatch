@@ -95,6 +95,16 @@ self.addEventListener("pushsubscriptionchange", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const url = (event.notification.data && event.notification.data.url) || "/";
+  // Which job this notification is about, pulled out of its own url so the
+  // page gets it even when focusing an open window leaves the address bar
+  // untouched — which is the usual case, and why tapping a notification used
+  // to land on whatever screen happened to be open.
+  let task = null, kind = "task";
+  try {
+    const u = new URL(url, self.location.origin);
+    task = u.searchParams.get("task");
+    kind = u.searchParams.get("kind") || "task";
+  } catch (e) { /* a url we cannot parse carries no job */ }
   event.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
       for (const client of clientList) {
@@ -104,7 +114,7 @@ self.addEventListener("notificationclick", (event) => {
           // Focusing an existing window does not reload it, so ask it to pull
           // fresh data — otherwise tapping a "new task" notification could
           // land the driver on a list that does not show that task yet.
-          client.postMessage({ type: "scdc-refresh" });
+          client.postMessage({ type: "scdc-refresh", task: task, kind: kind });
           return;
         }
       }
