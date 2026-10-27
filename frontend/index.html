@@ -2379,6 +2379,40 @@ const OPTIMISTIC_PATCH = {
 };
 
 function bindCardActions(container){
+  // Finishing, clearing a hold-up and reporting one are bound HERE, not only
+  // in the detail sheet, so the same button works wherever it is drawn. They
+  // lived in the detail binder alone, which is why a requester could confirm a
+  // job was done only after opening it.
+  container.querySelectorAll("[data-resolve]").forEach(b=>{
+    b.onclick = async (e)=>{
+      e.stopPropagation();
+      if(!confirm("ยืนยันว่าแก้ไขเหตุขัดข้องเรียบร้อยแล้ว และให้งานดำเนินการต่อ?")) return;
+      await taskAction({
+        id: b.dataset.resolve, key: "resolve", btn: b,
+        patch: ()=> ({status: "In Progress"}),
+        run: ()=> api(`/tasks/${b.dataset.resolve}/resume`, {method:"POST"}),
+        successMsg: "แก้ไขเหตุขัดข้องแล้ว — งานดำเนินการต่อ",
+      });
+      reopenChatIfOpen(b.dataset.resolve);
+    };
+  });
+  container.querySelectorAll("[data-req-complete]").forEach(b=>{
+    b.onclick = async (e)=>{
+      e.stopPropagation();
+      if(!confirm("ยืนยันว่างานนี้เสร็จเรียบร้อยแล้ว?\nคนขับทุกคนในงานจะถูกปลดจากงานนี้ทันที")) return;
+      await taskAction({
+        id: b.dataset.reqComplete, key: "req-complete", btn: b,
+        patch: ()=> ({status: "Completed"}),
+        run: ()=> api(`/tasks/${b.dataset.reqComplete}/requester-complete`, {method:"POST"}),
+        successMsg: "ยืนยันงานเสร็จแล้ว",
+      });
+      reopenChatIfOpen(b.dataset.reqComplete);
+    };
+  });
+
+  container.querySelectorAll("[data-pause]").forEach(b=>{
+    b.onclick = (e)=>{ e.stopPropagation(); openPauseSheet(b.dataset.pause); };
+  });
   container.querySelectorAll("[data-duplicate]").forEach(b=> b.onclick = async (e)=>{
     e.stopPropagation();
     try{
@@ -2450,6 +2484,14 @@ function renderUserTab(main){
           <button class="btn red" data-action="cancel">ยกเลิก</button>`;
       } else if(t.status === "Assigned"){
         actions = `${actions}<button class="btn red" data-action="cancel">ยกเลิก</button>`;
+      } else if(t.status === "In Progress"){
+        // The requester is the one who can see the pallets arrive, so ending
+        // the job belongs on the card, not one tap further in.
+        actions = `<button class="btn green" data-req-complete="${t.id}">ยืนยันงานเสร็จ</button>
+          <button class="btn" data-pause="${t.id}">แจ้งปัญหา</button>${actions}`;
+      } else if(t.status === "Pause"){
+        actions = `<button class="btn amber" data-resolve="${t.id}">แก้ไขเหตุขัดข้อง</button>
+          <button class="btn green" data-req-complete="${t.id}">ยืนยันงานเสร็จ</button>${actions}`;
       }
       main.appendChild(el(taskCard(t, actions)));
     });
@@ -6638,35 +6680,8 @@ function bindTaskDetailActions(container){
   container.querySelectorAll("[data-pause]").forEach(b=>{
     b.onclick = (e)=>{ e.stopPropagation(); openPauseSheet(b.dataset.pause); };
   });
-  container.querySelectorAll("[data-resolve]").forEach(b=>{
-    b.onclick = async (e)=>{
-      e.stopPropagation();
-      if(!confirm("ยืนยันว่าแก้ไขเหตุขัดข้องเรียบร้อยแล้ว และให้งานดำเนินการต่อ?")) return;
-      await taskAction({
-        id: b.dataset.resolve, key: "resolve", btn: b,
-        patch: ()=> ({status: "In Progress"}),
-        run: ()=> api(`/tasks/${b.dataset.resolve}/resume`, {method:"POST"}),
-        successMsg: "แก้ไขเหตุขัดข้องแล้ว — งานดำเนินการต่อ",
-      });
-      reopenChatIfOpen(b.dataset.resolve);
-    };
-  });
-  container.querySelectorAll("[data-req-complete]").forEach(b=>{
-    b.onclick = async (e)=>{
-      e.stopPropagation();
-      if(!confirm("ยืนยันว่างานนี้เสร็จเรียบร้อยแล้ว?\nคนขับทุกคนในงานจะถูกปลดจากงานนี้ทันที")) return;
-      await taskAction({
-        id: b.dataset.reqComplete, key: "req-complete", btn: b,
-        patch: ()=> ({status: "Completed"}),
-        run: ()=> api(`/tasks/${b.dataset.reqComplete}/requester-complete`, {method:"POST"}),
-        successMsg: "ยืนยันงานเสร็จแล้ว",
-      });
-      reopenChatIfOpen(b.dataset.reqComplete);
-    };
-  });
   container.querySelectorAll("[data-edit]").forEach(b=> b.onclick = ()=> openEditTask(b.dataset.edit));
   container.querySelectorAll("[data-photo]").forEach(b=> b.onclick = ()=> openPhotoUpload(b.dataset.photo));
-  container.querySelectorAll("[data-pause]").forEach(b=> b.onclick = ()=> openPauseSheet(b.dataset.pause));
   container.querySelectorAll("[data-self-assign]").forEach(b=> b.onclick = ()=> openBatterySheet(b.dataset.selfAssign, "self-assign"));
   container.querySelectorAll("[data-take-over]").forEach(b=> b.onclick = ()=> openBatterySheet(b.dataset.takeOver, "take-over"));
   container.querySelectorAll("[data-join]").forEach(b=> b.onclick = ()=> openBatterySheet(b.dataset.join, "join"));
