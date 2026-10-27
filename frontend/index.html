@@ -2842,6 +2842,33 @@ function setTaskScope(v){
   refreshAll({visible:true});
 }
 
+// What a driver has narrowed their job screen to. Kept in state so a refresh
+// in the background does not drop it, and the zones persist between visits —
+// a driver working one end of the warehouse all shift should not re-pick it
+// after every reload. The search box is deliberately NOT persisted: a code you
+// looked up once is not a standing filter.
+function driverFilter(){
+  if(!state.driverFilter){
+    let zones = [];
+    try{ zones = JSON.parse(localStorage.getItem("rt_driver_zones_filter") || "[]"); }catch(e){ zones = []; }
+    state.driverFilter = { q: "", zones: Array.isArray(zones) ? zones : [] };
+  }
+  return state.driverFilter;
+}
+
+function driverFilterCount(){
+  const f = driverFilter();
+  return (f.zones || []).length;
+}
+
+function driverTaskMatches(t){
+  const f = driverFilter();
+  const q = String(f.q || "").trim().toLowerCase();
+  if(q && !String(t.task_code || "").toLowerCase().includes(q)) return false;
+  if((f.zones || []).length && !f.zones.includes(t.from_zone)) return false;
+  return true;
+}
+
 function costCenterLabel(code){
   const c = String(code || "").trim();
   if(!c) return "";
@@ -3920,7 +3947,8 @@ function renderDriverTab(main){
   if(state.tab === "available"){
     const isMine = (t)=> (t.drivers||[]).some(d=> d.employee_id === state.employee_id);
     const myRow = (t)=> (t.drivers||[]).find(d=> d.employee_id === state.employee_id);
-    const all = state.tasks.filter(t=> isMine(t) && !["Completed","Cancelled"].includes(t.status));
+    const all = state.tasks.filter(t=> isMine(t) && !["Completed","Cancelled"].includes(t.status)
+      && driverTaskMatches(t));
     // A dispatcher can hand over a batch of jobs at once. Exactly one is the
     // job in hand; the rest wait in the queue and start by themselves as each
     // one finishes, so this screen has to say plainly which is which.
@@ -3947,6 +3975,44 @@ function renderDriverTab(main){
         </div>`;
       }catch(e){ /* stats are informational */ }
     })();
+
+    // Search and filter sit above every list on this screen, because a driver
+    // looking for one job does not know, or care, which section it is in.
+    const df = driverFilter();
+    const nFilters = driverFilterCount();
+    const bar = el(`<div class="card" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
+      <input id="dq" value="${df.q || ""}" placeholder="ค้นหาเลขงาน เช่น 004"
+             style="flex:1;min-width:0;margin:0;" />
+      <button class="btn${nFilters ? " amber" : ""}" id="dfilter" style="flex:none;min-height:44px;">
+        ตัวกรอง${nFilters ? ` (${nFilters})` : ""}</button>
+    </div>`);
+    main.appendChild(bar);
+    if(df.q || nFilters){
+      const chips = [];
+      if(df.q) chips.push(`เลขงาน "${df.q}"`);
+      (df.zones || []).forEach(z=> chips.push(zoneName(z)));
+      const active = el(`<div class="field-note" style="margin:-4px 0 10px;line-height:1.6;">
+        กรองอยู่: ${chips.join(" · ")}
+        <button class="btn" id="dclear" style="min-height:36px;padding:4px 10px;margin-left:6px;">ล้าง</button>
+      </div>`);
+      active.querySelector("#dclear").onclick = ()=>{
+        state.driverFilter = { q: "", zones: [] };
+        try{ localStorage.setItem("rt_driver_zones_filter", "[]"); }catch(e){}
+        renderContent();
+      };
+      main.appendChild(active);
+    }
+    bar.querySelector("#dfilter").onclick = ()=> openDriverFilterSheet();
+    const dq = bar.querySelector("#dq");
+    dq.addEventListener("input", ()=>{
+      const pos = dq.selectionStart;
+      driverFilter().q = dq.value;
+      renderContent();
+      // renderContent() rebuilds the box, so put the caret back where it was
+      // rather than making the driver re-tap after every character.
+      const again = document.querySelector("#dq");
+      if(again){ again.focus(); try{ again.setSelectionRange(pos, pos); }catch(e){} }
+    });
 
     // A job handed to this driver before they boarded anything. They cannot
     // work it until they pick a vehicle, so this sits above the job itself
@@ -4005,7 +4071,9 @@ function renderDriverTab(main){
         };
       });
     } else {
-      main.appendChild(el(`<div class="empty">ยังไม่มีงานที่กำลังทำอยู่</div>`));
+      main.appendChild(el(`<div class="empty">${(df.q || nFilters)
+        ? "ไม่มีงานที่กำลังทำที่ตรงกับตัวกรอง"
+        : "ยังไม่มีงานที่กำลังทำอยู่"}</div>`));
     }
 
     // ---------------- 1b. คิวงานของฉัน ----------------
@@ -4059,7 +4127,9 @@ function renderDriverTab(main){
     const zones = myZones();
     const hasZones = !!(zones.primary || (zones.secondary || []).length);
     const matchOf = new Map();
-    const waiting = state.tasks.filter(t=> t.status === "Waiting");
+    // Filtered at the source so the zone switch's own counts below agree with
+    // the list the driver is actually looking at.
+    const waiting = state.tasks.filter(t=> t.status === "Waiting" && driverTaskMatches(t));
     waiting.forEach(t=> matchOf.set(t.id, zoneMatchOf(t, zones)));
     if(state.zoneOnly === undefined){
       try{ state.zoneOnly = localStorage.getItem("scdc_zone_only") === "1"; }catch(e){ state.zoneOnly = false; }
@@ -4098,6 +4168,7 @@ function renderDriverTab(main){
     if(!avail.length) main.appendChild(el(`<div class="empty">${
       state.zoneOnly && hasZones && waiting.length
         ? `ไม่มีงานในโซนของคุณตอนนี้ — ยังมีอีก ${waiting.length} งานในโซนอื่น เอาเครื่องหมายถูกออกเพื่อดู`
+        : (df.q || nFilters) ? "ไม่มีงานว่างที่ตรงกับตัวกรอง"
         : "ยังไม่มีงานว่างในขณะนี้"}</div>`));
     avail.forEach(t=>{
       main.appendChild(el(taskCard(t, `<button class="btn amber" data-self-assign="${t.id}">รับงานนี้</button>`,
@@ -4109,10 +4180,11 @@ function renderDriverTab(main){
 
     // ---------------- 4. งานที่คนอื่นกำลังทำ ----------------
     const others = state.tasks.filter(t=> ["Assigned","In Progress","Pause"].includes(t.status)
-      && !isMine(t) && (t.drivers||[]).length > 0);
+      && !isMine(t) && (t.drivers||[]).length > 0 && driverTaskMatches(t));
     main.appendChild(el(`<div class="section-title">งานที่คนอื่นกำลังทำ (${others.length})</div>`));
     main.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">"เข้าร่วม" = ช่วยทำไปพร้อมกัน</div>`));
-    if(!others.length) main.appendChild(el(`<div class="empty">ไม่มีงานของคนอื่นในขณะนี้</div>`));
+    if(!others.length) main.appendChild(el(`<div class="empty">${(df.q || nFilters)
+      ? "ไม่มีงานของคนอื่นที่ตรงกับตัวกรอง" : "ไม่มีงานของคนอื่นในขณะนี้"}</div>`));
     others.forEach(t=>{
       main.appendChild(el(taskCard(t, `<button class="btn green" data-join="${t.id}">เข้าร่วม</button>`, {showRequester:true})));
     });
@@ -4449,6 +4521,64 @@ const PAUSE_PRESETS = {
   user: ["พื้นที่ยังไม่พร้อม", "ของยังไม่พร้อม", "ประตูยังไม่ถูกเปิด", "ผู้ขอไม่อยู่หน้างาน"],
   vehicle: ["แบตเตอรี่ต่ำ", "รถขัดข้อง/เสีย", "ยางรั่ว/ปัญหาล้อ", "อุปกรณ์ยกของขัดข้อง"],
 };
+
+// Origin zone is the only filter offered here on purpose: it is the one thing
+// that changes whether a job is worth walking to. Sorting is deliberately NOT
+// offered — the unclaimed list is oldest-first within each zone, and letting
+// drivers reorder it turns a queue into a pick-and-choose.
+function openDriverFilterSheet(){
+  const f = driverFilter();
+  let picked = (f.zones || []).slice();
+  const zones = (state.zones || []).filter(z=> z.active !== 0);
+  const overlay = el(`
+    <div class="sheet-overlay">
+      <div class="sheet">
+        <div class="sheet-head"><h2>ตัวกรองงาน</h2><button class="sheet-close">✕</button></div>
+        <label>โซนต้นทาง</label>
+        <div class="chip-row" id="dfz"></div>
+        <div class="field-note" style="margin-top:8px;line-height:1.6;">
+          เลือกแล้วจะกรองทุกรายการในหน้านี้ ทั้งงานที่กำลังทำ คิวงาน และงานที่รับได้
+        </div>
+        <button class="primary" id="dfz-apply">ดูงาน</button>
+        <button class="btn" id="dfz-clear" style="width:100%;margin-top:8px;">ล้างตัวกรอง</button>
+      </div>
+    </div>`);
+  document.body.appendChild(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
+  overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
+
+  function apply(list){
+    picked = list;
+    driverFilter().zones = picked.slice();
+    try{ localStorage.setItem("rt_driver_zones_filter", JSON.stringify(picked)); }catch(e){}
+    closeSheet(overlay);
+    renderContent();
+  }
+  overlay.querySelector("#dfz-apply").onclick = ()=> apply(picked);
+  overlay.querySelector("#dfz-clear").onclick = ()=> apply([]);
+
+  const box = overlay.querySelector("#dfz");
+  function draw(){
+    box.innerHTML = "";
+    if(!zones.length){
+      box.appendChild(el(`<div class="field-note">ยังไม่มีโซนให้เลือก</div>`));
+      return;
+    }
+    zones.forEach(z=>{
+      const on = picked.includes(z.zone_key);
+      const n = (state.tasks || []).filter(t=> t.from_zone === z.zone_key
+        && !["Completed","Cancelled"].includes(t.status)).length;
+      const chip = el(`<div class="chip${on ? " active" : ""}">${z.zone_name_th} ${n}</div>`);
+      chip.onclick = ()=>{
+        const i = picked.indexOf(z.zone_key);
+        if(i >= 0) picked.splice(i, 1); else picked.push(z.zone_key);
+        draw();
+      };
+      box.appendChild(chip);
+    });
+  }
+  draw();
+}
 
 function openPauseSheet(taskId){
   // A VEHICLE fault pulls the reporter's OWN vehicle out of service, so only a
