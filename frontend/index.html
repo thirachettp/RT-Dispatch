@@ -5103,6 +5103,16 @@ ${actions}
   drawList();
 }
 
+// Reasons a job gets handed back. These used to be referenced here without
+// ever being defined, which threw before the Submit button was wired — the
+// sheet opened, the chips were missing, and "ยืนยันตีกลับ" did nothing at all.
+const SEND_BACK_PRESETS = [
+  "จุดต้นทาง/ปลายทางไม่ถูกต้อง",
+  "จำนวนพาเลทไม่ตรงกับของจริง",
+  "พื้นที่ยังไม่พร้อมให้เข้าไปทำงาน",
+  "ขอให้ยืนยัน cost center ก่อน",
+];
+
 function openSendBackSheet(taskId){
   const overlay = el(`
     <div class="sheet-overlay">
@@ -5120,12 +5130,8 @@ function openSendBackSheet(taskId){
   document.body.appendChild(overlay);
   overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
-  const chipBox = overlay.querySelector("#sb-chips");
-  SEND_BACK_PRESETS.forEach(p=>{
-    const chip = el(`<div class="chip">${p}</div>`);
-    chip.onclick = ()=>{ overlay.querySelector("#sb-reason").value = p; };
-    chipBox.appendChild(chip);
-  });
+  // Submit first: everything below it is decoration, and decoration that
+  // throws must not be able to leave the button dead.
   overlay.querySelector("#sb-submit").onclick = async ()=>{
     const reason = overlay.querySelector("#sb-reason").value.trim();
     if(!reason){ toast("กรุณาระบุเหตุผล"); return; }
@@ -5136,6 +5142,12 @@ function openSendBackSheet(taskId){
       await refreshAll();
     }catch(e){ toast(e.message); }
   };
+  const chipBox = overlay.querySelector("#sb-chips");
+  SEND_BACK_PRESETS.forEach(p=>{
+    const chip = el(`<div class="chip">${p}</div>`);
+    chip.onclick = ()=>{ overlay.querySelector("#sb-reason").value = p; };
+    chipBox.appendChild(chip);
+  });
 }
 
 function openPrioritySheet(taskId){
@@ -6603,7 +6615,10 @@ function buildTaskDetailActions(t){
     return "";
   }
   if(isOps()){
-    if(t.status === "Waiting") return `<button class="btn amber" data-assign="${t.id}">มอบหมายงาน</button>`;
+    // ตีกลับ lives on the operations list card; without it here, opening a job
+    // first and deciding to hand it back meant going back out to find it.
+    if(t.status === "Waiting") return `<button class="btn amber" data-assign="${t.id}">มอบหมายงาน</button>`
+      + `<button class="btn" data-sendback="${t.id}">ตีกลับ</button>${isChat}`;
     // A dispatcher standing in the aisle sees a hold-up before anyone reports
     // it. The server has always accepted this from them; only the button was
     // missing.
@@ -6617,6 +6632,9 @@ function buildTaskDetailActions(t){
 
 function bindTaskDetailActions(container){
   bindCardActions(container);
+  container.querySelectorAll("[data-sendback]").forEach(b=>{
+    b.onclick = (e)=>{ e.stopPropagation(); openSendBackSheet(b.dataset.sendback); };
+  });
   container.querySelectorAll("[data-pause]").forEach(b=>{
     b.onclick = (e)=>{ e.stopPropagation(); openPauseSheet(b.dataset.pause); };
   });
@@ -6691,7 +6709,7 @@ async function openTaskDetailSheet(taskId){
   loadAuthenticatedImages(holder);
   // Any card action that mutates state closes this detail sheet on success via refreshAll's
   // normal re-render; simplest is to just close it after a successful mutation.
-  holder.querySelectorAll("[data-action],[data-edit],[data-photo],[data-accept],[data-pause],[data-self-assign],[data-take-over],[data-join],[data-leave],[data-assign],[data-reassign],[data-admin-complete],[data-priority],[data-chat],[data-rate]").forEach(b=>{
+  holder.querySelectorAll("[data-action],[data-edit],[data-photo],[data-accept],[data-pause],[data-self-assign],[data-take-over],[data-join],[data-leave],[data-assign],[data-reassign],[data-admin-complete],[data-priority],[data-chat],[data-rate],[data-sendback]").forEach(b=>{
     const orig = b.onclick;
     b.onclick = (e)=>{ closeSheet(overlay); if(orig) orig(e); };
   });
