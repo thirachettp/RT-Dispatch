@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261027.1452"
+APP_VERSION = "TTLOD.261027.1458"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -4906,11 +4906,20 @@ def post_task_message(task_id: int, body: ChatMessageBody, user=Depends(current_
         for r in active_drivers:
             if r["driver_id"] != user["id"]:
                 others.add(r["driver_id"])
-        # Anyone who has already spoken in THIS job's chat. Without this, a
-        # dispatcher could ask a question here and never be told the answer:
-        # only the requester and the drivers on the job were notified. Scoped
-        # to people actually in the conversation rather than every admin, so
-        # turning this on does not notify the whole office about every job.
+        # Every job conversation reaches ops, spoken in or not. A dispatcher
+        # answers for every job on the floor, and hearing only the threads they
+        # had already joined meant a problem raised in a chat no dispatcher had
+        # touched sat unseen until someone happened to open that job. The
+        # service worker tags a notification per job, so a burst of messages in
+        # one job replaces itself rather than stacking up.
+        for r in db.execute(
+            "SELECT id FROM users WHERE role IN ('ADMIN','DISPATCH') AND deleted_at IS NULL"
+        ).fetchall():
+            if r["id"] != user["id"]:
+                others.add(r["id"])
+        # Anyone else who has already spoken in THIS job's chat — a colleague
+        # in the same cost centre, say, who asked about it and is owed the
+        # answer.
         for r in db.execute(
             "SELECT DISTINCT sender_id FROM task_messages WHERE task_id=? AND sender_id IS NOT NULL "
             "AND kind='user'", (task_id,)
