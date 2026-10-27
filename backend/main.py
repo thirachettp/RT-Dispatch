@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261026.0957"
+APP_VERSION = "TTLOD.261027.1249"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -766,6 +766,24 @@ def validate_and_normalize_email(db, email: Optional[str], exclude_user_id: Opti
 # Schema
 # ---------------------------------------------------------------------------
 
+# A rack code is Aisle(3) + Bay(2) + Level(1) + Slot(1), and a requester may
+# stop at any of those four steps: "AAA" names an aisle, "AAA01A1" a single
+# slot. Which letters and digits are valid is deliberately not checked — the
+# floor renames aisles faster than anyone updates a pattern, and a job refused
+# over a letter that is perfectly real costs more than a typo does. Only the
+# first letter stays pinned per zone, so a code can never contradict the zone
+# it was filed under.
+RACK_PATTERN_SELECTIVE = "^B[A-Z]{2}([0-9]{2}([A-Z][0-9]?)?)?$"
+RACK_PATTERN_DOUBLE_DEEP = "^A[A-Z]{2}([0-9]{2}([A-Z][0-9]?)?)?$"
+
+# The patterns those replace. A live zone is only rewritten while it still
+# carries the original, so a pattern an admin has since edited is left alone.
+RACK_PATTERN_SELECTIVE_SEED = "^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$"
+RACK_PATTERN_DOUBLE_DEEP_SEED = "^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$"
+
+COOLROOM_FIRST_ROOM = "RRE"
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vehicles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -856,9 +874,32 @@ CREATE TABLE IF NOT EXISTS zones (
     -- The zone IS the location: picking it saves straight away with no detail
     -- to type (Sort Yard, empty pallets).
     no_location INTEGER NOT NULL DEFAULT 0,
+    -- The zone's locations are a LIST (zone_locations), not a pattern:
+    -- Coolroom and its rooms, where "which rooms exist" is the whole rule.
+    from_master INTEGER NOT NULL DEFAULT 0,
     -- Retired zones stay here so old tasks still read properly; they just
     -- stop being offered when creating a job.
     active INTEGER NOT NULL DEFAULT 1
+);
+
+-- The named places inside a zone, for zones whose locations are a LIST rather
+-- than a pattern (Coolroom and its rooms). A pattern cannot express "these
+-- four rooms exist and nothing else", and a rack zone cannot be a list —
+-- thousands of slots nobody would maintain — so the two live side by side and
+-- zones.from_master picks which one applies.
+CREATE TABLE IF NOT EXISTS zone_locations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone_key TEXT NOT NULL,
+    -- What gets written onto the job. Unique per zone, case-insensitively.
+    code TEXT NOT NULL,
+    -- Optional longer name for the picker; the code is what the job stores.
+    label TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    -- Retired rooms stay here so old jobs still read properly; they just stop
+    -- being offered.
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT,
+    UNIQUE(zone_key, code)
 );
 
 -- UNUSED since the vehicle-type/zone matrix was removed. Kept rather than
@@ -1176,6 +1217,8 @@ NEW_COLUMNS = [
     ("zones", "origin_only", "INTEGER NOT NULL DEFAULT 0", None),
     ("zones", "no_location", "INTEGER NOT NULL DEFAULT 0", None),
     ("zones", "active", "INTEGER NOT NULL DEFAULT 1", None),
+    # The zone's locations come from the zone_locations list, not its pattern.
+    ("zones", "from_master", "INTEGER NOT NULL DEFAULT 0", None),
     # The cost centre the job is booked against. It used to be read off the
     # requester's profile, which left nothing to charge against when an admin
     # or dispatcher raised the job on someone's behalf — they have no cost
@@ -1199,7 +1242,7 @@ def _column_exists(db, table, column):
 # only when the database is FRESH, so a table added to SCHEMA alone would never
 # exist on the live one and every screen that touched it would 500. This runs
 # on every boot for both backends instead.
-NEW_TABLES = ("driver_zones",)
+NEW_TABLES = ("driver_zones", "zone_locations")
 
 
 def ensure_tables():
@@ -1217,6 +1260,46 @@ def ensure_tables():
                 db.execute(ddl)
     except Exception as e:
         log.warning("ensure_tables skipped: %s", e)
+
+
+def ensure_seed_zones():
+    """Corrections to the seeded zones, applied to a database that already exists.
+
+    init_db() seeds only a FRESH database, so a zone added or corrected there
+    would never reach production. Every step here is conditional: a pattern is
+    rewritten only while it still matches the one it replaces, and a zone or
+    room is inserted only when missing — so an admin's own edits in
+    จัดการระบบ survive this and every later deploy.
+    """
+    try:
+        with get_db() as db:
+            for zone_key, was, now, example in (
+                ("SELECTIVE_RACK", RACK_PATTERN_SELECTIVE_SEED, RACK_PATTERN_SELECTIVE, "BAA01A1"),
+                ("DOUBLE_DEEP", RACK_PATTERN_DOUBLE_DEEP_SEED, RACK_PATTERN_DOUBLE_DEEP, "AAA01A1"),
+            ):
+                cur = db.execute(
+                    "UPDATE zones SET code_pattern=?, example_code=? WHERE zone_key=? AND code_pattern=?",
+                    (now, example, zone_key, was))
+                if cur.rowcount:
+                    log.info("Relaxed %s location pattern", zone_key)
+
+            if not db.execute("SELECT 1 FROM zones WHERE zone_key='COOLROOM'").fetchone():
+                order = db.execute(
+                    "SELECT COALESCE(MAX(sort_order),0) + 1 AS m FROM zones").fetchone()["m"]
+                db.execute(
+                    "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, "
+                    "example_code, sort_order, free_text, origin_only, no_location, active, from_master) "
+                    "VALUES ('COOLROOM','Coolroom','^[A-Z0-9-]+$',0,?,?,0,0,0,1,1)",
+                    (COOLROOM_FIRST_ROOM, order))
+                log.info("Added COOLROOM zone")
+
+            if not db.execute("SELECT 1 FROM zone_locations WHERE zone_key='COOLROOM'").fetchone():
+                db.execute(
+                    "INSERT INTO zone_locations (zone_key, code, label, sort_order, active, created_at) "
+                    "VALUES ('COOLROOM',?,NULL,1,1,?)", (COOLROOM_FIRST_ROOM, now_iso()))
+                log.info("Seeded COOLROOM rooms")
+    except Exception as e:
+        log.warning("ensure_seed_zones skipped: %s", e)
 
 
 def ensure_columns():
@@ -1321,8 +1404,10 @@ def ensure_columns():
                                tuple(flags.values()) + (zone_key,))
                 # Staging and empty pallets both landed on sort_order 7 on
                 # databases built by the migration path, so their order in the
-                # picker differed from a fresh install. Pin them.
-                for zone_key, order in (("STAGING", 7), ("EMPTY_PALLET", 8)):
+                # picker differed from a fresh install. Pin them — and pin
+                # Coolroom ahead of them, since it is a real storage zone and
+                # those two are the catch-alls at the end of the list.
+                for zone_key, order in (("COOLROOM", 7), ("STAGING", 8), ("EMPTY_PALLET", 9)):
                     db.execute("UPDATE zones SET sort_order=? WHERE zone_key=?", (order, zone_key))
                 log.info("Migrated: zone flags and ordering applied")
             except Exception as ex:
@@ -1584,11 +1669,13 @@ def seed_master_data(db):
             "('GATE','ประตู','^ประตู-([1-9]|[1-7][0-9]|8[0-5])$',1,'ประตู-12',2,0,0,0),"
             "('SORT_YARD','ลาน Sort','^ลาน Sort$',0,'ลาน Sort',3,0,0,1),"
             "('MEZZANINE','Mezzanine','^Mezzanine-[1-4]-(ซ้าย \\(Cross dock\\)|ขวา \\(Double Deep\\))$',0,'Mezzanine-2-ซ้าย (Cross dock)',4,0,0,0),"
-            "('SELECTIVE_RACK','Selective Rack','^B[AB][A-H](0[1-9]|[12][0-9]|3[0-9])([A-G][12])?$',1,'BAA01A1',5,0,0,0),"
-            "('DOUBLE_DEEP','Double Deep','^AA[A-F](0[1-9]|[1-6][0-9]|7[0-4])([A-G][12])?$',1,'AAA01G1',6,0,0,0),"
-            "('STAGING','Staging (อื่นๆ)','^.+$',0,'ระบุจุดเอง',7,1,0,0),"
-            "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า',8,1,1,1)"
+            "('SELECTIVE_RACK','Selective Rack','" + RACK_PATTERN_SELECTIVE + "',1,'BAA01A1',5,0,0,0),"
+            "('DOUBLE_DEEP','Double Deep','" + RACK_PATTERN_DOUBLE_DEEP + "',1,'AAA01A1',6,0,0,0),"
+            "('COOLROOM','Coolroom','^[A-Z0-9-]+$',0,'" + COOLROOM_FIRST_ROOM + "',7,0,0,0),"
+            "('STAGING','Staging (อื่นๆ)','^.+$',0,'ระบุจุดเอง',8,1,0,0),"
+            "('EMPTY_PALLET','พาเลทเปล่า','^.+$',0,'พาเลทเปล่า',9,1,1,1)"
         )
+        db.execute("UPDATE zones SET from_master=1 WHERE zone_key='COOLROOM'")
         log.info("Seeded master data: zones")
 
 
@@ -1683,6 +1770,22 @@ def validate_location_string(db, zone_key: str, value: str, *, is_destination: b
         raise HTTPException(400, f"โซน {zone['zone_name_th']} เลือกได้จุดเดียวเท่านั้น")
     if zone["free_text"]:
         return ",".join(parts)
+    # A list-backed zone (Coolroom and its rooms) is checked against its own
+    # places rather than a pattern. A pattern cannot say WHICH rooms exist,
+    # and a room that has been retired has to stop being accepted even though
+    # its shape is still perfectly valid.
+    if zone["from_master"]:
+        known = {r["code"].upper(): r["code"] for r in db.execute(
+            "SELECT code FROM zone_locations WHERE zone_key=? AND active=1",
+            (zone_key,)).fetchall()}
+        chosen = []
+        for p in parts:
+            hit = known.get(p.upper())
+            if not hit:
+                raise HTTPException(400, f"ไม่พบจุด '{p}' ในโซน {zone['zone_name_th']} "
+                                         f"— เลือกจากรายการที่มี หรือให้แอดมินเพิ่มจุดนี้ก่อน")
+            chosen.append(hit)
+        return ",".join(chosen)
     pattern = re.compile(zone["code_pattern"], re.IGNORECASE)
     for p in parts:
         if not pattern.match(p):
@@ -2749,6 +2852,7 @@ class ZoneBody(BaseModel):
     free_text: bool = False
     origin_only: bool = False
     no_location: bool = False
+    from_master: bool = False
 
 
 @app.get("/zones")
@@ -2760,9 +2864,23 @@ def list_zones(user=Depends(current_user)):
     """
     with get_db() as db:
         rows = db.execute("SELECT * FROM zones ORDER BY sort_order, id").fetchall()
-    if user["role"] == "ADMIN":
-        return [dict(r) for r in rows]
-    return [dict(r) for r in rows if r["active"]]
+        # A list-backed zone carries its places with it. The picker is built
+        # synchronously as the person changes zone, so fetching them per zone
+        # would put a round trip in the middle of a tap.
+        places = {}
+        for r in db.execute(
+            "SELECT * FROM zone_locations WHERE active=1 ORDER BY sort_order, code"
+        ).fetchall():
+            places.setdefault(r["zone_key"], []).append(
+                {"code": r["code"], "label": r["label"]})
+    out = []
+    for r in rows:
+        if user["role"] != "ADMIN" and not r["active"]:
+            continue
+        d = dict(r)
+        d["locations"] = places.get(r["zone_key"], []) if r["from_master"] else []
+        out.append(d)
+    return out
 
 
 @app.post("/zones")
@@ -2777,10 +2895,10 @@ def add_zone(body: ZoneBody, user=Depends(require_role("ADMIN"))):
         max_order = db.execute("SELECT COALESCE(MAX(sort_order),0) m FROM zones").fetchone()["m"]
         db.execute(
             "INSERT INTO zones (zone_key, zone_name_th, code_pattern, allow_multiple, example_code, "
-            "sort_order, free_text, origin_only, no_location) VALUES (?,?,?,?,?,?,?,?,?)",
+            "sort_order, free_text, origin_only, no_location, from_master) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (body.zone_key, body.zone_name_th, body.code_pattern, int(body.allow_multiple),
              body.example_code, max_order + 1, int(body.free_text),
-             int(body.origin_only), int(body.no_location)),
+             int(body.origin_only), int(body.no_location), int(body.from_master)),
         )
         audit(db, user["id"], "add_zone", body.zone_key)
         return {"ok": True}
@@ -2795,6 +2913,7 @@ class ZoneUpdateBody(BaseModel):
     free_text: Optional[bool] = None
     origin_only: Optional[bool] = None
     no_location: Optional[bool] = None
+    from_master: Optional[bool] = None
     active: Optional[bool] = None
     sort_order: Optional[int] = None
 
@@ -2827,7 +2946,8 @@ def update_zone(zone_key: str, body: ZoneUpdateBody, user=Depends(require_role("
             fields["code_pattern"] = pattern
         if body.example_code is not None:
             fields["example_code"] = body.example_code.strip() or None
-        for flag in ("allow_multiple", "free_text", "origin_only", "no_location", "active"):
+        for flag in ("allow_multiple", "free_text", "origin_only", "no_location",
+                     "from_master", "active"):
             val = getattr(body, flag)
             if val is not None:
                 fields[flag] = 1 if val else 0
@@ -2842,7 +2962,10 @@ def update_zone(zone_key: str, body: ZoneUpdateBody, user=Depends(require_role("
         final_example = fields.get("example_code", row["example_code"])
         free_text = fields.get("free_text", row["free_text"])
         no_location = fields.get("no_location", row["no_location"])
-        if final_example and not free_text and not no_location:
+        # A list-backed zone's pattern is not what validates a location, so
+        # its example has nothing to agree with.
+        from_master = fields.get("from_master", row["from_master"])
+        if final_example and not free_text and not no_location and not from_master:
             if not re.compile(final_pattern, re.IGNORECASE).match(final_example):
                 raise HTTPException(400, f"ตัวอย่าง '{final_example}' ไม่ผ่านรูปแบบที่ตั้งไว้ "
                                          f"— แก้ตัวอย่างหรือรูปแบบให้ตรงกันก่อน")
@@ -2877,6 +3000,106 @@ def delete_zone(zone_key: str, user=Depends(require_role("ADMIN"))):
             return {"ok": True, "deactivated": True, "task_count": used_by_tasks}
         db.execute("DELETE FROM zones WHERE zone_key=?", (zone_key,))
         audit(db, user["id"], "delete_zone", zone_key)
+        return {"ok": True, "deleted": True}
+
+
+class ZoneLocationBody(BaseModel):
+    code: Optional[str] = None
+    label: Optional[str] = None
+    active: Optional[bool] = None
+
+
+@app.get("/zones/{zone_key}/locations")
+def list_zone_locations(zone_key: str, user=Depends(current_user)):
+    """The places a list-backed zone offers.
+
+    Admin also sees the retired ones, because the management screen has to
+    list them to switch one back on; a picker must never offer them.
+    """
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT * FROM zone_locations WHERE zone_key=? ORDER BY sort_order, code",
+            (zone_key,)).fetchall()
+    if user["role"] == "ADMIN":
+        return [dict(r) for r in rows]
+    return [dict(r) for r in rows if r["active"]]
+
+
+@app.post("/zones/{zone_key}/locations")
+def add_zone_location(zone_key: str, body: ZoneLocationBody, user=Depends(require_role("ADMIN"))):
+    code = (body.code or "").strip().upper()
+    if not code:
+        raise HTTPException(400, "กรุณาระบุรหัสจุด")
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM zones WHERE zone_key=?", (zone_key,)).fetchone():
+            raise HTTPException(404, "ไม่พบโซนนี้")
+        if db.execute("SELECT 1 FROM zone_locations WHERE zone_key=? AND UPPER(code)=?",
+                      (zone_key, code)).fetchone():
+            raise HTTPException(400, f"จุด {code} มีอยู่แล้วในโซนนี้")
+        order = db.execute(
+            "SELECT COALESCE(MAX(sort_order),0) + 1 AS m FROM zone_locations WHERE zone_key=?",
+            (zone_key,)).fetchone()["m"]
+        db.execute(
+            "INSERT INTO zone_locations (zone_key, code, label, sort_order, active, created_at) "
+            "VALUES (?,?,?,?,1,?)",
+            (zone_key, code, (body.label or "").strip() or None, order, now_iso()))
+        audit(db, user["id"], "add_zone_location", f"{zone_key}: {code}")
+        return {"ok": True, "code": code}
+
+
+@app.put("/zones/{zone_key}/locations/{loc_id}")
+def update_zone_location(zone_key: str, loc_id: int, body: ZoneLocationBody,
+                         user=Depends(require_role("ADMIN"))):
+    """Rename or retire one place.
+
+    The CODE itself is not editable: every job that ever used this place
+    stores that text, and changing it here would leave those jobs pointing at
+    a place that no longer exists by that name. Add the new code and retire
+    the old one instead.
+    """
+    with get_db() as db:
+        row = db.execute("SELECT * FROM zone_locations WHERE id=? AND zone_key=?",
+                         (loc_id, zone_key)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบจุดนี้")
+        fields = {}
+        if body.label is not None:
+            fields["label"] = body.label.strip() or None
+        if body.active is not None:
+            fields["active"] = 1 if body.active else 0
+        if not fields:
+            return {"ok": True, "unchanged": True}
+        db.execute(f"UPDATE zone_locations SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+                   tuple(fields.values()) + (loc_id,))
+        audit(db, user["id"], "update_zone_location",
+              f"{zone_key}: {row['code']} ({', '.join(sorted(fields))})")
+        return {"ok": True}
+
+
+@app.delete("/zones/{zone_key}/locations/{loc_id}")
+def delete_zone_location(zone_key: str, loc_id: int, user=Depends(require_role("ADMIN"))):
+    """Retire a place that jobs have used; delete one nothing refers to.
+
+    Same rule as retiring a zone, and for the same reason: a job stores the
+    location as plain text, so removing the row cannot corrupt history — but
+    keeping it means the management screen can still explain what an old job
+    was talking about, and switch the place back on.
+    """
+    with get_db() as db:
+        row = db.execute("SELECT * FROM zone_locations WHERE id=? AND zone_key=?",
+                         (loc_id, zone_key)).fetchone()
+        if not row:
+            raise HTTPException(404, "ไม่พบจุดนี้")
+        used = db.execute(
+            "SELECT COUNT(*) n FROM tasks WHERE (from_zone=? AND from_location=?) "
+            "OR (to_zone=? AND to_location=?)",
+            (zone_key, row["code"], zone_key, row["code"])).fetchone()["n"]
+        if used:
+            db.execute("UPDATE zone_locations SET active=0 WHERE id=?", (loc_id,))
+            audit(db, user["id"], "deactivate_zone_location", f"{zone_key}: {row['code']} (tasks={used})")
+            return {"ok": True, "deactivated": True, "task_count": used}
+        db.execute("DELETE FROM zone_locations WHERE id=?", (loc_id,))
+        audit(db, user["id"], "delete_zone_location", f"{zone_key}: {row['code']}")
         return {"ok": True, "deleted": True}
 
 
@@ -4200,8 +4423,13 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
                 raise HTTPException(404, "ไม่พบงานนี้")
             if user["role"] == "USER" and row["requester_id"] != user["id"]:
                 raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
-            if row["status"] not in ("In Progress", "Assigned"):
-                raise HTTPException(400, "แจ้งปัญหาได้เฉพาะงานที่กำลังดำเนินการ")
+            # Only a job in progress can be held: the state machine has no
+            # Assigned -> Pause edge, and inventing one would let a resume
+            # mark a job as started that nobody has started. A job that has
+            # not begun is cancelled or talked about in its chat instead.
+            if row["status"] != "In Progress":
+                raise HTTPException(400, "แจ้งปัญหาได้เฉพาะงานที่กำลังดำเนินการอยู่ "
+                                         "(งานที่ยังไม่เริ่ม ใช้แชทในงานหรือยกเลิกแทน)")
             transition(db, row, "Pause", user["id"], note=f"[user] {body.reason}")
             for a in db.execute("SELECT driver_id FROM task_assignments WHERE task_id=? "
                                 "AND assignment_status='Active'", (task_id,)).fetchall():
@@ -4218,6 +4446,11 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
         ).fetchone()
         if not my_assignment:
             raise HTTPException(403, "งานนี้ไม่ใช่ของคุณ")
+        # Same rule as above, said here rather than letting transition() throw
+        # "Invalid transition: Assigned -> Pause" at a driver on the floor.
+        if row["status"] != "In Progress":
+            raise HTTPException(400, "แจ้งปัญหาได้เฉพาะงานที่กำลังดำเนินการอยู่ "
+                                     "(งานที่ยังไม่เริ่ม ใช้แชทในงานหรือยกเลิกแทน)")
         note = f"[{body.category}] {body.reason}"
 
         # A problem on the requester's side (location/goods not ready) blocks
@@ -6036,6 +6269,7 @@ try:
     ensure_tables()
     ensure_columns()
     widen_role_constraint()
+    ensure_seed_zones()
     try:
         with get_db() as _db:
             sync_master_fleet(_db)

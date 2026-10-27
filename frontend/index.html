@@ -2751,6 +2751,14 @@ function mezzOptions(zone){
 // What the side button READS. The saved code keeps the rack name in full, so
 // old jobs and reports stay comparable; the button drops it, because the
 // requester is picking a side, not a rack type.
+// A place reads as its code, with the longer name beside it when there is
+// one — the code is what goes on the job, so it stays first.
+function placeLabel(pl){
+  const code = String(pl.code || "");
+  const label = String(pl.label || "").trim();
+  return label ? `${code} · ${label}` : code;
+}
+
 function mezzSideLabel(side){
   // A side taken from the example still carries the separator in front of it
   // ("-ซ้าย"); the button wants the word alone.
@@ -2865,6 +2873,49 @@ function buildLocationPicker(container, zones, initial){
       // admin can give a new zone the same behaviour without a deploy.
       singleValue = currentZone.zone_name_th;
       body.appendChild(el(`<div class="field-note">จุดเดียว ไม่ต้องระบุตำแหน่งเพิ่ม</div>`));
+    } else if(currentZone.from_master){
+      // The zone's own list of places (Coolroom and its rooms). There is
+      // nothing to type on purpose: a room that is not on the list is one the
+      // server will refuse, so a text field here would only produce jobs that
+      // bounce back.
+      const places = currentZone.locations || [];
+      if(!places.length){
+        body.appendChild(el(`<div class="field-note">โซนนี้ยังไม่มีจุดให้เลือก — ให้แอดมินเพิ่มจุดในหน้าจัดการระบบก่อน</div>`));
+      } else if(currentZone.allow_multiple){
+        const row = el(`<div class="pick-row" role="group" aria-label="${currentZone.zone_name_th}"></div>`);
+        function drawPlaces(){
+          row.innerHTML = "";
+          places.forEach(pl=>{
+            const on = chips.includes(pl.code);
+            const b = el(`<button type="button" class="pick-btn${on ? " is-on" : ""}"
+              aria-pressed="${on}">${placeLabel(pl)}</button>`);
+            b.onclick = ()=>{
+              const i = chips.indexOf(pl.code);
+              if(i >= 0) chips.splice(i, 1); else chips.push(pl.code);
+              drawPlaces();
+              if(container.onPendingChange) container.onPendingChange();
+            };
+            row.appendChild(b);
+          });
+        }
+        drawPlaces();
+        body.appendChild(row);
+      } else {
+        if(!places.some(pl=> pl.code === singleValue)) singleValue = places[0].code;
+        const row = el(`<div class="pick-row" role="group" aria-label="${currentZone.zone_name_th}"></div>`);
+        function drawPlaces(){
+          row.innerHTML = "";
+          places.forEach(pl=>{
+            const on = pl.code === singleValue;
+            const b = el(`<button type="button" class="pick-btn${on ? " is-on" : ""}"
+              aria-pressed="${on}">${placeLabel(pl)}</button>`);
+            b.onclick = ()=>{ singleValue = pl.code; drawPlaces(); };
+            row.appendChild(b);
+          });
+        }
+        drawPlaces();
+        body.appendChild(row);
+      }
     } else if(zk === "MEZZANINE"){
       // Buttons rather than dropdowns: there are only four floors and two
       // sides, and on the floor with gloves on a row of targets beats opening
@@ -4215,9 +4266,13 @@ const PAUSE_PRESETS = {
 };
 
 function openPauseSheet(taskId){
-  // Only a driver can report a VEHICLE fault — it takes their own vehicle out
-  // of service. Everyone else is reporting a hold-up on the requester's side.
-  const canReportVehicle = isCrew();
+  // A VEHICLE fault pulls the reporter's OWN vehicle out of service, so only a
+  // driver actually on this job can report one — the server refuses it from
+  // anyone else, including a dispatcher who is crew but not on the job.
+  // Everyone else is reporting a hold-up on the requester's side.
+  const task = (state.tasks || []).find(t=> String(t.id) === String(taskId));
+  const onTheJob = !!(task && (task.drivers || []).some(d=> d.employee_id === state.employee_id));
+  const canReportVehicle = isCrew() && onTheJob;
   let category = "user";
   const overlay = el(`
     <div class="sheet-overlay">
@@ -4240,6 +4295,9 @@ function openPauseSheet(taskId){
   overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
+  const catUser = overlay.querySelector("#ps-cat-user");
+  const catVehicle = overlay.querySelector("#ps-cat-vehicle");
+
   function renderChips(){
     const chipBox = overlay.querySelector("#ps-chips");
     chipBox.innerHTML = "";
@@ -4248,11 +4306,14 @@ function openPauseSheet(taskId){
       chip.onclick = ()=>{ overlay.querySelector("#ps-reason").value = p; };
       chipBox.appendChild(chip);
     });
-    overlay.querySelector("#ps-cat-user").className = category === "user" ? "btn amber" : "btn";
-    overlay.querySelector("#ps-cat-vehicle").className = category === "vehicle" ? "btn amber" : "btn";
+    // These two buttons only exist for a driver on the job. Reaching for them
+    // unconditionally threw before the chips were drawn and before Submit was
+    // wired, which left the requester with a sheet that could not be sent.
+    if(catUser) catUser.className = category === "user" ? "btn amber" : "btn";
+    if(catVehicle) catVehicle.className = category === "vehicle" ? "btn amber" : "btn";
   }
-  overlay.querySelector("#ps-cat-user").onclick = ()=>{ category="user"; renderChips(); };
-  overlay.querySelector("#ps-cat-vehicle").onclick = ()=>{ category="vehicle"; renderChips(); };
+  if(catUser) catUser.onclick = ()=>{ category="user"; renderChips(); };
+  if(catVehicle) catVehicle.onclick = ()=>{ category="vehicle"; renderChips(); };
   renderChips();
 
   overlay.querySelector("#ps-submit").onclick = async ()=>{
@@ -5796,6 +5857,24 @@ function openZoneEditSheet(zoneKey){
           <input type="checkbox" id="ze-noloc" style="width:auto;" ${z.no_location ? "checked" : ""} /> ไม่ต้องระบุตำแหน่ง (กดโซนแล้วบันทึกเลย)
         </label>
         <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="ze-master" style="width:auto;" ${z.from_master ? "checked" : ""} /> เลือกจากรายการจุด (ไม่ต้องพิมพ์ ไม่ใช้รูปแบบรหัส)
+        </label>
+        <div class="card" id="ze-places" style="margin-top:12px;padding:12px 14px;${z.from_master ? "" : "display:none;"}">
+          <div class="section-title" style="margin:0 0 8px;">จุดในโซนนี้</div>
+          <div id="ze-place-list"></div>
+          <div class="grid2" style="margin-top:10px;">
+            <div><label for="ze-place-code" style="margin-top:0;">รหัสจุด</label>
+              <input id="ze-place-code" class="mono" placeholder="เช่น RRE" /></div>
+            <div><label for="ze-place-label" style="margin-top:0;">ชื่อเรียก (ถ้ามี)</label>
+              <input id="ze-place-label" placeholder="เช่น ห้องเย็นฝั่งตะวันออก" /></div>
+          </div>
+          <button class="btn" id="ze-place-add" style="width:100%;margin-top:8px;">เพิ่มจุด</button>
+          <div class="field-note" style="margin-top:8px;line-height:1.6;">
+            รหัสจุดแก้ทีหลังไม่ได้ เพราะงานที่เคยใช้จุดนี้เก็บรหัสไว้เป็นข้อความ
+            ถ้าต้องเปลี่ยน ให้เพิ่มรหัสใหม่แล้วปิดอันเก่า
+          </div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;">
           <input type="checkbox" id="ze-active" style="width:auto;" ${z.active ? "checked" : ""} /> เปิดใช้งาน (ให้เลือกได้ตอนสร้างงาน)
         </label>
         <button class="primary" id="ze-submit">บันทึก</button>
@@ -5839,15 +5918,77 @@ function openZoneEditSheet(zoneKey){
     // existed. Say it here, where it can still be fixed.
     const name = zeName.value.trim();
     const ex = zeExample.value.trim();
-    const freeish = overlay.querySelector("#ze-free").checked || overlay.querySelector("#ze-noloc").checked;
+    const freeish = overlay.querySelector("#ze-free").checked
+      || overlay.querySelector("#ze-noloc").checked
+      || overlay.querySelector("#ze-master").checked;
     zeDrift.style.color = "var(--warn)";
     zeDrift.textContent = (!freeish && name && ex && !ex.includes(name))
       ? `ชื่อโซนคือ "${name}" แต่ตัวอย่างรหัสเป็น "${ex}" — ถ้าเพิ่งเปลี่ยนชื่อ อย่าลืมแก้รูปแบบกับตัวอย่างให้ตรงกันด้วย ไม่งั้นเมนูเลือกจุดจะยังสร้างรหัสด้วยชื่อเดิม`
       : "";
   }
   [zePattern, zeName, zeExample, zeTry].forEach(n=> n.addEventListener("input", zeCheck));
-  overlay.querySelectorAll("#ze-free, #ze-noloc").forEach(n=> n.addEventListener("change", zeCheck));
+  overlay.querySelectorAll("#ze-free, #ze-noloc, #ze-master").forEach(n=> n.addEventListener("change", zeCheck));
   zeCheck();
+  // A list-backed zone is maintained here rather than through the pattern:
+  // the pattern cannot say which rooms exist, and the picker offers exactly
+  // what this list holds.
+  const zeMaster = overlay.querySelector("#ze-master");
+  const zePlaces = overlay.querySelector("#ze-places");
+  zeMaster.addEventListener("change", ()=>{
+    zePlaces.style.display = zeMaster.checked ? "" : "none";
+    if(zeMaster.checked) drawPlaces();
+  });
+
+  async function drawPlaces(){
+    const list = overlay.querySelector("#ze-place-list");
+    let rows = [];
+    try{ rows = await api(`/zones/${zoneKey}/locations`, {background:true}); }
+    catch(e){ list.innerHTML = `<div class="field-note">โหลดรายการจุดไม่สำเร็จ: ${e.message}</div>`; return; }
+    list.innerHTML = "";
+    if(!rows.length){
+      list.appendChild(el(`<div class="field-note">ยังไม่มีจุดในโซนนี้ — เพิ่มด้านล่าง</div>`));
+      return;
+    }
+    rows.forEach(r=>{
+      const row = el(`<div class="list-row">
+        <span class="l-main"><b class="mono">${r.code}</b>${r.label ? ` <span class="l-sub">${r.label}</span>` : ""}${r.active ? "" : ` <span class="l-sub">(ปิดอยู่)</span>`}</span>
+        <span style="display:flex;gap:6px;flex:none;">
+          <button class="btn" data-toggle="${r.id}">${r.active ? "ปิด" : "เปิด"}</button>
+          <button class="btn red" data-remove="${r.id}">ลบ</button>
+        </span>
+      </div>`);
+      row.querySelector("[data-toggle]").onclick = async ()=>{
+        try{
+          await api(`/zones/${zoneKey}/locations/${r.id}`,
+                    {method:"PUT", body: JSON.stringify({active: !r.active})});
+          await drawPlaces(); await refreshAll();
+        }catch(e){ toast(e.message); }
+      };
+      row.querySelector("[data-remove]").onclick = async ()=>{
+        if(!confirm(`ลบจุด ${r.code}?\n\nถ้ามีงานเคยใช้จุดนี้ ระบบจะปิดไว้แทนการลบ`)) return;
+        try{
+          const res = await api(`/zones/${zoneKey}/locations/${r.id}`, {method:"DELETE"});
+          toast(res.deleted ? "ลบจุดแล้ว" : `ปิดจุดแล้ว (มี ${res.task_count} งานอ้างอิงอยู่)`);
+          await drawPlaces(); await refreshAll();
+        }catch(e){ toast(e.message); }
+      };
+      list.appendChild(row);
+    });
+  }
+
+  overlay.querySelector("#ze-place-add").onclick = async ()=>{
+    const code = overlay.querySelector("#ze-place-code").value.trim();
+    if(!code){ toast("กรุณาระบุรหัสจุด"); return; }
+    try{
+      await api(`/zones/${zoneKey}/locations`, {method:"POST", body: JSON.stringify({
+        code, label: overlay.querySelector("#ze-place-label").value.trim() || null })});
+      overlay.querySelector("#ze-place-code").value = "";
+      overlay.querySelector("#ze-place-label").value = "";
+      await drawPlaces(); await refreshAll();
+    }catch(e){ toast(e.message); }
+  };
+  if(z.from_master) drawPlaces();
+
   overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
   overlay.querySelector("#ze-submit").onclick = async ()=>{
@@ -5860,6 +6001,7 @@ function openZoneEditSheet(zoneKey){
         free_text: overlay.querySelector("#ze-free").checked,
         origin_only: overlay.querySelector("#ze-origin").checked,
         no_location: overlay.querySelector("#ze-noloc").checked,
+        from_master: overlay.querySelector("#ze-master").checked,
         active: overlay.querySelector("#ze-active").checked,
       })});
       toast("บันทึกโซนแล้ว");
@@ -6247,7 +6389,12 @@ function buildTaskDetailActions(t){
   }
   if(isOps()){
     if(t.status === "Waiting") return `<button class="btn amber" data-assign="${t.id}">มอบหมายงาน</button>`;
-    if(["Assigned","In Progress","Pause"].includes(t.status)) return `<button class="btn blue" data-reassign="${t.id}">แก้ไขการมอบหมาย</button>${isChat}${t.status !== "Assigned" ? `<button class="btn green" data-admin-complete="${t.id}">ทำเครื่องหมายเสร็จ</button>` : ""}<button class="btn red" data-action="cancel">ยกเลิก</button>`;
+    // A dispatcher standing in the aisle sees a hold-up before anyone reports
+    // it. The server has always accepted this from them; only the button was
+    // missing.
+    const opsPause = t.status === "In Progress"
+      ? `<button class="btn" data-pause="${t.id}">แจ้งปัญหา</button>` : "";
+    if(["Assigned","In Progress","Pause"].includes(t.status)) return `<button class="btn blue" data-reassign="${t.id}">แก้ไขการมอบหมาย</button>${opsPause}${isChat}${t.status !== "Assigned" ? `<button class="btn green" data-admin-complete="${t.id}">ทำเครื่องหมายเสร็จ</button>` : ""}<button class="btn red" data-action="cancel">ยกเลิก</button>`;
     return isChat;
   }
   return "";
