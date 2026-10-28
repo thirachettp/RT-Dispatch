@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261027.1550"
+APP_VERSION = "TTLOD.261028.0754"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -5772,6 +5772,132 @@ def my_driver_stats(period: str = "day", date: Optional[str] = None, user=Depend
             pallet_total += r["pallet_qty"] / max(1, participants)
         return {"period": period, "date": date, "task_count": task_count,
                 "pallet_total": round(pallet_total, 1)}
+
+
+HISTORY_DAY_BUCKETS = 14
+HISTORY_MONTH_BUCKETS = 12
+
+
+def _history_scope(role: str) -> str:
+    """Whose work a history summary counts.
+
+    A driver is measured on what they moved, a requester on what they asked
+    for, and ops on the floor as a whole. Same screen, three honest answers —
+    the alternative, one number for everyone, is true for nobody.
+    """
+    if role in ("ADMIN", "DISPATCH"):
+        return "all"
+    if role == "DRIVER":
+        return "driver"
+    return "requester"
+
+
+@app.get("/history/summary")
+def history_summary(period: str = "day", date: Optional[str] = None,
+                    user=Depends(current_user)):
+    """Totals for one day or month, plus the buckets around it for a chart.
+
+    The numbers are for the bucket that was picked; the series is the context
+    it sits in, so "a good day" can be read against the fortnight rather than
+    against nothing. Everything is bucketed in Bangkok time — a job finished
+    at 1am here belongs to that day, not to the UTC day before it.
+    """
+    if period not in ("day", "month"):
+        raise HTTPException(400, "period ต้องเป็น day หรือ month")
+    now_bkk = datetime.utcnow() + BKK_OFFSET
+    try:
+        if period == "day":
+            end_day = (datetime.strptime(date, "%Y-%m-%d") if date
+                       else now_bkk.replace(hour=0, minute=0, second=0, microsecond=0))
+            keys = [(end_day - timedelta(days=i)).strftime("%Y-%m-%d")
+                    for i in range(HISTORY_DAY_BUCKETS - 1, -1, -1)]
+            labels = [(end_day - timedelta(days=i)).strftime("%-d/%-m")
+                      for i in range(HISTORY_DAY_BUCKETS - 1, -1, -1)]
+            start_bkk = end_day - timedelta(days=HISTORY_DAY_BUCKETS - 1)
+            end_bkk = end_day + timedelta(days=1)
+            key_of = lambda at: at.strftime("%Y-%m-%d")
+        else:
+            end_month = (datetime.strptime(date, "%Y-%m") if date
+                         else now_bkk.replace(day=1, hour=0, minute=0, second=0, microsecond=0))
+            months = []
+            y, m = end_month.year, end_month.month
+            for _ in range(HISTORY_MONTH_BUCKETS):
+                months.append((y, m))
+                m -= 1
+                if m == 0:
+                    y, m = y - 1, 12
+            months.reverse()
+            keys = [f"{y:04d}-{m:02d}" for y, m in months]
+            labels = [f"{m}/{str(y)[-2:]}" for y, m in months]
+            start_bkk = datetime(months[0][0], months[0][1], 1)
+            end_bkk = (end_month + timedelta(days=32)).replace(day=1)
+            key_of = lambda at: at.strftime("%Y-%m")
+    except ValueError:
+        raise HTTPException(400, "รูปแบบวันที่ไม่ถูกต้อง")
+
+    selected = keys[-1]
+    since_utc = (start_bkk - BKK_OFFSET).isoformat(timespec="seconds") + "Z"
+    until_utc = (end_bkk - BKK_OFFSET).isoformat(timespec="seconds") + "Z"
+    scope = _history_scope(user["role"])
+
+    buckets = {k: {"key": k, "label": lb, "completed": 0, "cancelled": 0, "pallets": 0.0}
+               for k, lb in zip(keys, labels)}
+    with get_db() as db:
+        if scope == "driver":
+            # Credit is the job's pallets split between everyone who finished
+            # their part of it, so two drivers on one job do not each report
+            # having moved all of it.
+            rows = db.execute(
+                "SELECT tasks.id, tasks.status, tasks.pallet_qty, tasks.completed_at, "
+                "(SELECT COUNT(*) FROM task_assignments x WHERE x.task_id = tasks.id "
+                " AND x.assignment_status='Completed') AS crew "
+                "FROM task_assignments JOIN tasks ON tasks.id = task_assignments.task_id "
+                "WHERE task_assignments.driver_id=? AND task_assignments.assignment_status='Completed' "
+                "AND tasks.status='Completed' AND tasks.completed_at>=? AND tasks.completed_at<?",
+                (user["id"], since_utc, until_utc)).fetchall()
+            for r in rows:
+                at = _to_bkk(r["completed_at"])
+                b = buckets.get(key_of(at)) if at else None
+                if not b:
+                    continue
+                b["completed"] += 1
+                b["pallets"] += (r["pallet_qty"] or 0) / max(1, r["crew"] or 1)
+        else:
+            q = ("SELECT status, pallet_qty, completed_at, created_at FROM tasks "
+                 "WHERE status IN ('Completed','Cancelled')")
+            params = []
+            if scope == "requester":
+                q += " AND requester_id=?"
+                params.append(user["id"])
+            rows = db.execute(q, params).fetchall()
+            for r in rows:
+                # A cancelled job has no completion time; it is counted on the
+                # day it was raised, which is the only date it has.
+                at = _to_bkk(r["completed_at"] or r["created_at"])
+                b = buckets.get(key_of(at)) if at else None
+                if not b:
+                    continue
+                if r["status"] == "Completed":
+                    b["completed"] += 1
+                    b["pallets"] += r["pallet_qty"] or 0
+                else:
+                    b["cancelled"] += 1
+
+    series = []
+    for k in keys:
+        b = buckets[k]
+        b["pallets"] = round(b["pallets"], 1)
+        series.append(b)
+    chosen = buckets[selected]
+    return {
+        "period": period, "date": selected, "scope": scope,
+        "summary": {"completed": chosen["completed"], "cancelled": chosen["cancelled"],
+                    "pallets": chosen["pallets"]},
+        "window": {"completed": sum(b["completed"] for b in series),
+                   "cancelled": sum(b["cancelled"] for b in series),
+                   "pallets": round(sum(b["pallets"] for b in series), 1)},
+        "buckets": series,
+    }
 
 
 # ---------------------------------------------------------------------------

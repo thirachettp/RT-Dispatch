@@ -2349,8 +2349,10 @@ async function taskAction({id, key, run, patch, successMsg, btn}){
     btn.textContent = "กำลังส่ง...";
   }
 
+  let ok = false;
   try{
     await run();
+    ok = true;
     toast(successMsg || "สำเร็จ");
     await refreshAll();
   }catch(err){
@@ -2368,6 +2370,9 @@ async function taskAction({id, key, run, patch, successMsg, btn}){
     _inFlightActions.delete(lock);
     if(btn && btnLabel !== null){ btn.disabled = false; btn.textContent = btnLabel; }
   }
+  // Callers that need to follow up only on success — asking for a rating the
+  // moment a job is confirmed done, say — read this.
+  return ok;
 }
 
 // What each action is expected to do, so the UI can show it immediately.
@@ -2417,13 +2422,21 @@ function bindCardActions(container){
     b.onclick = async (e)=>{
       e.stopPropagation();
       if(!confirm("ยืนยันว่างานนี้เสร็จเรียบร้อยแล้ว?\nคนขับทุกคนในงานจะถูกปลดจากงานนี้ทันที")) return;
-      await taskAction({
-        id: b.dataset.reqComplete, key: "req-complete", btn: b,
+      const id = b.dataset.reqComplete;
+      const ok = await taskAction({
+        id, key: "req-complete", btn: b,
         patch: ()=> ({status: "Completed"}),
-        run: ()=> api(`/tasks/${b.dataset.reqComplete}/requester-complete`, {method:"POST"}),
+        run: ()=> api(`/tasks/${id}/requester-complete`, {method:"POST"}),
         successMsg: "ยืนยันงานเสร็จแล้ว",
       });
-      reopenChatIfOpen(b.dataset.reqComplete);
+      reopenChatIfOpen(id);
+      // The person who just said the job is done is the one who can say how it
+      // went, and they are already holding the phone. Asking now beats leaving
+      // a "ให้คะแนน" button for a later nobody comes back for.
+      if(ok && state.role === "USER"){
+        const t = findTask(id);
+        if(!t || !t.rating) openRatingSheet(id);
+      }
     };
   });
 
@@ -2541,19 +2554,7 @@ function renderUserTab(main){
     reviewWrap.querySelectorAll("[data-rate]").forEach(b=> b.onclick = ()=> openRatingSheet(b.dataset.rate));
     bindCardClickToDetail(reviewWrap);
   } else if(state.tab === "history"){
-    const done = state.tasks.filter(t=>["Completed","Cancelled"].includes(t.status));
-    main.appendChild(el(`<div class="section-title">ประวัติ (${done.length})</div>`));
-    if(done.length === 0) main.appendChild(el(`<div class="empty">ยังไม่มีงานที่เสร็จสิ้น</div>`));
-    done.forEach(t=>{
-      let actions = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
-      if(t.status === "Completed"){
-        actions = (t.rating ? `<span style="font-size:14px;">${"★".repeat(t.rating)}${"☆".repeat(5-t.rating)}</span>` : `<button class="btn amber" data-rate="${t.id}">ให้คะแนน</button>`) + actions;
-      }
-      main.appendChild(el(taskCard(t, actions)));
-    });
-    bindCardActions(main);
-    main.querySelectorAll("[data-rate]").forEach(b=> b.onclick = ()=> openRatingSheet(b.dataset.rate));
-    bindCardClickToDetail(main);
+    renderHistoryTab(main);
   } else if(state.tab === "profile"){
     renderProfile(main);
   }
@@ -2864,72 +2865,102 @@ function setTaskScope(v){
 // a driver working one end of the warehouse all shift should not re-pick it
 // after every reload. The search box is deliberately NOT persisted: a code you
 // looked up once is not a standing filter.
-// What a job can be narrowed by. Each group reads one field off the task and
-// knows how to name a value; the chips offered are only values that actually
-// occur, so a filter can never produce an empty list by itself.
-const DRIVER_FILTERS = [
-  { key: "fromZones", label: "โซนต้นทาง", of: (t)=> t.from_zone, name: (v)=> zoneName(v) },
-  { key: "toZones", label: "โซนปลายทาง", of: (t)=> t.to_zone, name: (v)=> zoneName(v) },
-  { key: "bus", label: "BU", of: (t)=> t.bu, name: (v)=> v },
-  { key: "ccs", label: "Cost center", of: (t)=> t.cost_center, name: (v)=> costCenterLabel(v) },
-  { key: "requesters", label: "ผู้ขอ", of: (t)=> t.requester_employee_id,
+// A value a job can be narrowed by, and how it reads on a chip. A group may
+// pull SEVERAL values off one job — a job can call at three gates — in which
+// case matching any one of them counts.
+const TASK_FILTER_GROUPS = {
+  fromZones: { label: "โซนต้นทาง", of: (t)=> t.from_zone, name: (v)=> zoneName(v) },
+  toZones: { label: "โซนปลายทาง", of: (t)=> t.to_zone, name: (v)=> zoneName(v) },
+  fromLocs: { label: "พื้นที่ต้นทาง", many: true,
+    of: (t)=> String(t.from_location || "").split(",").map(x=> x.trim()).filter(Boolean),
+    name: (v)=> v },
+  toLocs: { label: "พื้นที่ปลายทาง", many: true,
+    of: (t)=> String(t.to_location || "").split(",").map(x=> x.trim()).filter(Boolean),
+    name: (v)=> v },
+  bus: { label: "BU", of: (t)=> t.bu, name: (v)=> v },
+  ccs: { label: "Cost center", of: (t)=> t.cost_center, name: (v)=> costCenterLabel(v) },
+  requesters: { label: "ผู้ขอ", of: (t)=> t.requester_employee_id,
     name: (v)=> {
       const hit = (state.tasks || []).find(x=> x.requester_employee_id === v);
       return (hit && hit.requester_name) || v;
     } },
-];
+};
 
-function driverFilter(){
-  if(!state.driverFilter){
+// Which groups each screen offers, and where its choices are remembered. The
+// search box is never remembered: a code you looked up once is not a standing
+// filter.
+const TASK_FILTERS = {
+  driver: { store: "rt_driver_filter",
+            groups: ["fromZones", "toZones", "bus", "ccs", "requesters"] },
+  history: { store: "rt_history_filter",
+             groups: ["fromLocs", "fromZones", "toLocs", "toZones", "bus"] },
+};
+
+function taskFilter(name){
+  if(!state.filters) state.filters = {};
+  if(!state.filters[name]){
+    const spec = TASK_FILTERS[name];
     let saved = {};
-    try{ saved = JSON.parse(localStorage.getItem("rt_driver_filter") || "{}"); }catch(e){ saved = {}; }
+    try{ saved = JSON.parse(localStorage.getItem(spec.store) || "{}"); }catch(e){ saved = {}; }
     if(!saved || typeof saved !== "object") saved = {};
     const f = { q: "" };
-    DRIVER_FILTERS.forEach(g=>{
-      f[g.key] = Array.isArray(saved[g.key]) ? saved[g.key] : [];
-    });
-    state.driverFilter = f;
+    spec.groups.forEach(g=> { f[g] = Array.isArray(saved[g]) ? saved[g] : []; });
+    state.filters[name] = f;
   }
-  return state.driverFilter;
+  return state.filters[name];
 }
 
-function saveDriverFilter(){
-  const f = driverFilter();
-  const out = {};
-  DRIVER_FILTERS.forEach(g=> { out[g.key] = (f[g.key] || []).slice(); });
-  try{ localStorage.setItem("rt_driver_filter", JSON.stringify(out)); }catch(e){}
+function saveTaskFilter(name){
+  const f = taskFilter(name), out = {};
+  TASK_FILTERS[name].groups.forEach(g=> { out[g] = (f[g] || []).slice(); });
+  try{ localStorage.setItem(TASK_FILTERS[name].store, JSON.stringify(out)); }catch(e){}
 }
 
-function clearDriverFilter(){
-  const f = driverFilter();
+function clearTaskFilter(name){
+  const f = taskFilter(name);
   f.q = "";
-  DRIVER_FILTERS.forEach(g=> { f[g.key] = []; });
-  saveDriverFilter();
+  TASK_FILTERS[name].groups.forEach(g=> { f[g] = []; });
+  saveTaskFilter(name);
 }
 
-function driverFilterCount(){
-  const f = driverFilter();
-  return DRIVER_FILTERS.reduce((n, g)=> n + (f[g.key] || []).length, 0);
+function taskFilterCount(name){
+  const f = taskFilter(name);
+  return TASK_FILTERS[name].groups.reduce((n, g)=> n + (f[g] || []).length, 0);
 }
 
-function driverFilterChips(){
-  const f = driverFilter();
-  const out = [];
+function taskFilterChips(name){
+  const f = taskFilter(name), out = [];
   if(f.q) out.push(`เลขงาน "${f.q}"`);
-  DRIVER_FILTERS.forEach(g=> (f[g.key] || []).forEach(v=> out.push(g.name(v))));
+  TASK_FILTERS[name].groups.forEach(g=>
+    (f[g] || []).forEach(v=> out.push(TASK_FILTER_GROUPS[g].name(v))));
   return out;
 }
 
-function driverTaskMatches(t){
-  const f = driverFilter();
+function taskFilterValues(g, t){
+  const got = TASK_FILTER_GROUPS[g].of(t);
+  return Array.isArray(got) ? got : (got === null || got === undefined || got === "" ? [] : [got]);
+}
+
+function taskMatchesFilter(name, t){
+  const f = taskFilter(name);
   const q = String(f.q || "").trim().toLowerCase();
   if(q && !String(t.task_code || "").toLowerCase().includes(q)) return false;
-  for(const g of DRIVER_FILTERS){
-    const picked = f[g.key] || [];
-    if(picked.length && !picked.includes(g.of(t))) return false;
+  for(const g of TASK_FILTERS[name].groups){
+    const picked = f[g] || [];
+    if(!picked.length) continue;
+    const have = taskFilterValues(g, t);
+    if(!have.some(v=> picked.includes(v))) return false;
   }
   return true;
 }
+
+// The driver screen's own names, kept so its call sites read as what they are.
+const driverFilter = ()=> taskFilter("driver");
+const saveDriverFilter = ()=> saveTaskFilter("driver");
+const clearDriverFilter = ()=> clearTaskFilter("driver");
+const driverFilterCount = ()=> taskFilterCount("driver");
+const driverFilterChips = ()=> taskFilterChips("driver");
+const driverTaskMatches = (t)=> taskMatchesFilter("driver", t);
 
 function costCenterLabel(code){
   const c = String(code || "").trim();
@@ -4042,32 +4073,8 @@ function renderDriverTab(main){
     // looking for one job does not know, or care, which section it is in.
     const df = driverFilter();
     const nFilters = driverFilterCount();
-    const bar = el(`<div class="card" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
-      <input id="dq" value="${df.q || ""}" placeholder="ค้นหาเลขงาน เช่น 004"
-             style="flex:1;min-width:0;margin:0;" />
-      <button class="btn${nFilters ? " amber" : ""}" id="dfilter" style="flex:none;min-height:44px;">
-        ตัวกรอง${nFilters ? ` (${nFilters})` : ""}</button>
-    </div>`);
-    main.appendChild(bar);
-    if(df.q || nFilters){
-      const active = el(`<div class="field-note" style="margin:-4px 0 10px;line-height:1.6;">
-        กรองอยู่: ${driverFilterChips().join(" · ")}
-        <button class="btn" id="dclear" style="min-height:36px;padding:4px 10px;margin-left:6px;">ล้าง</button>
-      </div>`);
-      active.querySelector("#dclear").onclick = ()=>{ clearDriverFilter(); renderContent(); };
-      main.appendChild(active);
-    }
-    bar.querySelector("#dfilter").onclick = ()=> openDriverFilterSheet();
-    const dq = bar.querySelector("#dq");
-    dq.addEventListener("input", ()=>{
-      const pos = dq.selectionStart;
-      driverFilter().q = dq.value;
-      renderContent();
-      // renderContent() rebuilds the box, so put the caret back where it was
-      // rather than making the driver re-tap after every character.
-      const again = document.querySelector("#dq");
-      if(again){ again.focus(); try{ again.setSelectionRange(pos, pos); }catch(e){} }
-    });
+    taskFilterBar(main, "driver",
+      (state.tasks || []).filter(t=> !["Completed","Cancelled"].includes(t.status)));
 
     // A job handed to this driver before they boarded anything. They cannot
     // work it until they pick a vehicle, so this sits above the job itself
@@ -4275,7 +4282,7 @@ function renderDriverTab(main){
     };
     main.appendChild(bd);
   } else if(state.tab === "history"){
-    renderDriverHistory(main);
+    renderHistoryTab(main);
   } else if(state.tab === "teamchat"){
     renderTeamChat(main);
   } else if(state.tab === "profile"){
@@ -4490,51 +4497,158 @@ function openChatMenuSheet(){
   }
 }
 
-async function renderDriverHistory(main){
-  main.appendChild(el(`<div class="section-title">สรุปผลงาน</div>`));
-  const today = new Date();
-  const dayDefault = today.toISOString().slice(0,10);
-  const monthDefault = today.toISOString().slice(0,7);
-  const statCard = el(`<div class="card">
+const HISTORY_SCOPE_NOTE = {
+  driver: "นับเฉพาะงานที่คุณขับและทำเสร็จ",
+  requester: "นับเฉพาะงานที่คุณเป็นผู้ขอ",
+  all: "นับงานทั้งหมดในระบบ",
+};
+
+// Whose finished work belongs on this screen. A driver's history is what they
+// moved; everyone else sees the jobs the server already decided they may see,
+// which is their own as a requester and the whole floor as ops.
+function historyTasks(){
+  const done = (state.tasks || []).filter(t=> ["Completed","Cancelled"].includes(t.status));
+  if(state.role === "DRIVER"){
+    return done.filter(t=> (t.drivers || []).some(d=> d.employee_id === state.employee_id)
+                        || t.driver_employee_id === state.employee_id);
+  }
+  return done;
+}
+
+// One bar per day or per month, the chosen one filled in. Tapping a bar moves
+// the numbers above it — the series is already loaded, so reading the chart
+// costs nothing but a tap.
+function renderHistoryChart(holder, data, selectedKey, onPick){
+  holder.innerHTML = "";
+  const bars = data.buckets || [];
+  const max = Math.max(1, ...bars.map(b=> b.completed));
+  if(!bars.some(b=> b.completed || b.cancelled)){
+    holder.appendChild(el(`<div class="empty">ยังไม่มีงานที่เสร็จในช่วงนี้</div>`));
+    return;
+  }
+  const top = niceMax(max);
+  const n = bars.length;
+  const W = 340, H = 140, padT = 12, padB = 22, padL = 22, padR = 2;
+  const plotH = H - padT - padB, plotW = W - padL - padR;
+  const gap = n > 12 ? 3 : 6;
+  const barW = Math.max(6, (plotW - gap * (n - 1)) / n);
+  const ticks = top % 2 === 0 ? [0, top / 2, top] : [0, top];
+
+  let svg = "";
+  ticks.forEach(v=>{
+    const y = padT + plotH - (v / top) * plotH;
+    svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="var(--line)" stroke-width="1"></line>`;
+    svg += `<text x="${padL - 4}" y="${y + 3}" font-size="8" fill="var(--ink-dim)" text-anchor="end">${v}</text>`;
+  });
+  bars.forEach((b, i)=>{
+    const x = padL + i * (barW + gap);
+    const h = (b.completed / top) * plotH;
+    const on = b.key === selectedKey;
+    const y = padT + plotH - h;
+    if(h > 0){
+      svg += `<rect x="${x}" y="${y}" width="${barW}" height="${h}" rx="2"
+        fill="${on ? "var(--amber)" : "var(--amber-dim)"}"></rect>`;
+    }
+    // A full-height hit area, so a zero-height bar is still tappable.
+    svg += `<rect x="${x}" y="${padT}" width="${barW}" height="${plotH}" fill="transparent"
+      style="cursor:pointer;" data-bucket="${b.key}"><title>${b.label}: ${b.completed} งาน</title></rect>`;
+    svg += `<text x="${x + barW / 2}" y="${H - 6}" font-size="8" text-anchor="middle"
+      fill="${on ? "var(--amber)" : "var(--ink-dim)"}">${b.label}</text>`;
+  });
+  const chart = el(`<svg viewBox="0 0 ${W} ${H}" width="100%" role="img"
+    aria-label="กราฟงานที่เสร็จต่อช่วงเวลา">${svg}</svg>`);
+  chart.querySelectorAll("[data-bucket]").forEach(r=>{
+    r.addEventListener("click", ()=> onPick(r.dataset.bucket));
+  });
+  holder.appendChild(chart);
+}
+
+async function renderHistoryTab(main){
+  main.appendChild(el(`<div class="section-title" style="margin-top:0;">สรุปผลงาน</div>`));
+  if(!state.histPeriod) state.histPeriod = "day";
+  const today = new Date(Date.now() + 7 * 3600 * 1000);
+  const dayDefault = today.toISOString().slice(0, 10);
+  const monthDefault = today.toISOString().slice(0, 7);
+  if(!state.histDate) state.histDate = dayDefault;
+
+  const card = el(`<div class="card">
     <div class="subtabs">
-      <button data-period="day" class="active">รายวัน</button>
+      <button data-period="day">รายวัน</button>
       <button data-period="month">รายเดือน</button>
     </div>
-    <input id="dh-date" type="date" value="${dayDefault}" />
-    <div class="stat-grid" style="margin-top:12px;">
-      <div class="stat"><div class="n" id="dh-count">-</div><div class="l">งานที่เสร็จ</div></div>
-      <div class="stat"><div class="n" id="dh-pallet">-</div><div class="l">พาเลทรวม</div></div>
+    <input id="hs-date" type="${state.histPeriod === "day" ? "date" : "month"}" value="${state.histDate}" />
+    <div class="stat-grid" id="hs-stats" style="margin-top:12px;">
+      <div class="empty">กำลังโหลด...</div>
     </div>
+    <div class="field-note" id="hs-note" style="margin-top:8px;"></div>
+    <div id="hs-chart" style="margin-top:10px;"></div>
   </div>`);
-  main.appendChild(statCard);
+  main.appendChild(card);
+  card.querySelectorAll("[data-period]").forEach(b=>
+    b.classList.toggle("active", b.dataset.period === state.histPeriod));
 
-  let period = "day";
-  async function loadStats(){
-    const dateVal = statCard.querySelector("#dh-date").value;
-    try{
-      const res = await api(`/drivers/me/stats?period=${period}&date=${dateVal}`, {background:true});
-      statCard.querySelector("#dh-count").textContent = res.task_count;
-      statCard.querySelector("#dh-pallet").textContent = res.pallet_total;
-    }catch(e){ toast(e.message); }
+  let data = null;
+  function paint(key){
+    const b = (data.buckets || []).find(x=> x.key === key) || data.buckets[data.buckets.length - 1];
+    const grid = card.querySelector("#hs-stats");
+    const showCancelled = data.scope !== "driver";
+    grid.innerHTML = `
+      <div class="stat"><div class="n">${b.completed}</div><div class="l">งานที่เสร็จ</div></div>
+      <div class="stat"><div class="n">${b.pallets}</div><div class="l">พาเลทรวม</div></div>
+      ${showCancelled ? `<div class="stat"><div class="n">${b.cancelled}</div><div class="l">ยกเลิก</div></div>` : ""}`;
+    const w = data.window || {};
+    card.querySelector("#hs-note").textContent =
+      `${b.label} · ${HISTORY_SCOPE_NOTE[data.scope] || ""} — ทั้งช่วงในกราฟ ${w.completed || 0} งาน`;
+    renderHistoryChart(card.querySelector("#hs-chart"), data, b.key, paint);
   }
-  statCard.querySelectorAll("[data-period]").forEach(b=>{
+
+  async function load(){
+    try{
+      data = await api(`/history/summary?period=${state.histPeriod}&date=${state.histDate}`,
+                       {background:true});
+      paint(data.date);
+    }catch(e){
+      card.querySelector("#hs-stats").innerHTML = "";
+      card.querySelector("#hs-chart").innerHTML = "";
+      card.querySelector("#hs-note").textContent = "โหลดสรุปผลงานไม่สำเร็จ: " + e.message;
+    }
+  }
+  card.querySelectorAll("[data-period]").forEach(b=>{
     b.onclick = ()=>{
-      period = b.dataset.period;
-      statCard.querySelectorAll("[data-period]").forEach(x=> x.classList.toggle("active", x===b));
-      const dateInput = statCard.querySelector("#dh-date");
-      dateInput.type = period === "day" ? "date" : "month";
-      dateInput.value = period === "day" ? dayDefault : monthDefault;
-      loadStats();
+      state.histPeriod = b.dataset.period;
+      state.histDate = state.histPeriod === "day" ? dayDefault : monthDefault;
+      card.querySelectorAll("[data-period]").forEach(x=> x.classList.toggle("active", x === b));
+      const input = card.querySelector("#hs-date");
+      input.type = state.histPeriod === "day" ? "date" : "month";
+      input.value = state.histDate;
+      load();
     };
   });
-  statCard.querySelector("#dh-date").onchange = loadStats;
-  loadStats();
+  card.querySelector("#hs-date").onchange = (e)=>{
+    state.histDate = e.target.value;
+    load();
+  };
+  load();
 
-  const done = state.tasks.filter(t=> t.driver_employee_id === state.employee_id && ["Completed","Cancelled"].includes(t.status));
-  main.appendChild(el(`<div class="section-title">ประวัติงาน</div>`));
-  if(done.length===0) main.appendChild(el(`<div class="empty">ยังไม่มีงานที่เสร็จสิ้น</div>`));
-  done.forEach(t=> main.appendChild(el(taskCard(t, `<button class="btn" data-chat="${t.id}">💬 แชท</button>`))));
+  // ---- the list ----
+  const all = historyTasks();
+  taskFilterBar(main, "history", all);
+  const done = all.filter(t=> taskMatchesFilter("history", t));
+  const filtering = taskFilter("history").q || taskFilterCount("history");
+  main.appendChild(el(`<div class="section-title">ประวัติงาน (${done.length})</div>`));
+  if(!done.length){
+    main.appendChild(el(`<div class="empty">${filtering
+      ? "ไม่มีงานที่ตรงกับตัวกรอง" : "ยังไม่มีงานที่เสร็จสิ้น"}</div>`));
+  }
+  done.forEach(t=>{
+    let actions = `<button class="btn" data-chat="${t.id}">💬 แชท</button>`;
+    if(state.role === "USER" && t.status === "Completed" && isMyTask(t) && !t.rating){
+      actions = `<button class="btn amber" data-rate="${t.id}">ให้คะแนน</button>` + actions;
+    }
+    main.appendChild(el(taskCard(t, actions, {showRequester: state.role !== "USER"})));
+  });
   bindCardActions(main);
+  main.querySelectorAll("[data-rate]").forEach(b=> b.onclick = ()=> openRatingSheet(b.dataset.rate));
   bindCardClickToDetail(main);
 }
 
@@ -4577,13 +4691,14 @@ const PAUSE_PRESETS = {
   vehicle: ["แบตเตอรี่ต่ำ", "รถขัดข้อง/เสีย", "ยางรั่ว/ปัญหาล้อ", "อุปกรณ์ยกของขัดข้อง"],
 };
 
-// Every group the jobs on this screen can be narrowed by. Sorting is
-// deliberately NOT offered — the unclaimed list is oldest-first within each
-// zone, and letting drivers reorder it turns a queue into a pick-and-choose.
-function openDriverFilterSheet(){
-  const f = driverFilter();
+// The filter sheet for a screen. Sorting is deliberately NOT offered on the
+// driver's board — the unclaimed list is oldest-first within each zone, and
+// letting drivers reorder it turns a queue into a pick-and-choose.
+function openTaskFilterSheet(name, tasks){
+  const spec = TASK_FILTERS[name];
+  const f = taskFilter(name);
   const picked = {};
-  DRIVER_FILTERS.forEach(g=> { picked[g.key] = (f[g.key] || []).slice(); });
+  spec.groups.forEach(g=> { picked[g] = (f[g] || []).slice(); });
 
   const overlay = el(`
     <div class="sheet-overlay">
@@ -4591,8 +4706,8 @@ function openDriverFilterSheet(){
         <div class="sheet-head"><h2>ตัวกรองงาน</h2><button class="sheet-close">✕</button></div>
         <div id="dfz-groups"></div>
         <div class="field-note" style="margin-top:10px;line-height:1.6;">
-          กรองทุกรายการในหน้านี้ ทั้งงานที่กำลังทำ คิวงาน และงานที่รับได้ —
-          เลือกหลายอย่างในกลุ่มเดียวกันได้ นับเป็น "อย่างใดอย่างหนึ่ง"
+          เลือกหลายอย่างในกลุ่มเดียวกันได้ นับเป็น "อย่างใดอย่างหนึ่ง" —
+          ข้ามกลุ่มต้องตรงทุกกลุ่ม
         </div>
         <button class="primary" id="dfz-apply">ดูงาน</button>
         <button class="btn" id="dfz-clear" style="width:100%;margin-top:8px;">ล้างตัวกรองทั้งหมด</button>
@@ -4603,43 +4718,41 @@ function openDriverFilterSheet(){
   overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
 
   overlay.querySelector("#dfz-apply").onclick = ()=>{
-    const cur = driverFilter();
-    DRIVER_FILTERS.forEach(g=> { cur[g.key] = picked[g.key].slice(); });
-    saveDriverFilter();
+    const cur = taskFilter(name);
+    spec.groups.forEach(g=> { cur[g] = picked[g].slice(); });
+    saveTaskFilter(name);
     closeSheet(overlay);
     renderContent();
   };
   overlay.querySelector("#dfz-clear").onclick = ()=>{
-    clearDriverFilter();
+    clearTaskFilter(name);
     closeSheet(overlay);
     renderContent();
   };
 
   const box = overlay.querySelector("#dfz-groups");
-  // Only values that actually occur on a job this driver can see. An option
-  // that matches nothing is worse than no option: it reads as "no such work",
+  // Only values that actually occur on a job in this list. An option that
+  // matches nothing is worse than no option: it reads as "no such work",
   // when it really means "not in this list".
-  const live = (state.tasks || []).filter(t=> !["Completed","Cancelled"].includes(t.status));
+  const pool = tasks || [];
   function draw(){
     box.innerHTML = "";
     let any = false;
-    DRIVER_FILTERS.forEach(g=>{
+    spec.groups.forEach(g=>{
+      const group = TASK_FILTER_GROUPS[g];
       const counts = new Map();
-      live.forEach(t=>{
-        const v = g.of(t);
-        if(v === null || v === undefined || v === "") return;
-        counts.set(v, (counts.get(v) || 0) + 1);
-      });
+      pool.forEach(t=> taskFilterValues(g, t).forEach(v=>
+        counts.set(v, (counts.get(v) || 0) + 1)));
       if(!counts.size) return;
       any = true;
-      box.appendChild(el(`<label style="margin-top:12px;">${g.label}</label>`));
+      box.appendChild(el(`<label style="margin-top:12px;">${group.label}</label>`));
       const row = el(`<div class="chip-row"></div>`);
       [...counts.keys()].sort().forEach(v=>{
-        const on = picked[g.key].includes(v);
-        const chip = el(`<div class="chip${on ? " active" : ""}">${g.name(v)} ${counts.get(v)}</div>`);
+        const on = picked[g].includes(v);
+        const chip = el(`<div class="chip${on ? " active" : ""}">${group.name(v)} ${counts.get(v)}</div>`);
         chip.onclick = ()=>{
-          const i = picked[g.key].indexOf(v);
-          if(i >= 0) picked[g.key].splice(i, 1); else picked[g.key].push(v);
+          const i = picked[g].indexOf(v);
+          if(i >= 0) picked[g].splice(i, 1); else picked[g].push(v);
           draw();
         };
         row.appendChild(chip);
@@ -4649,6 +4762,45 @@ function openDriverFilterSheet(){
     if(!any) box.appendChild(el(`<div class="field-note">ยังไม่มีงานให้กรอง</div>`));
   }
   draw();
+}
+
+function openDriverFilterSheet(){
+  openTaskFilterSheet("driver",
+    (state.tasks || []).filter(t=> !["Completed","Cancelled"].includes(t.status)));
+}
+
+// The search box plus the filter button, and the line that says what is on.
+// Shared so the driver's board and every history screen never drift into two
+// slightly different versions of the same control.
+function taskFilterBar(main, name, tasks){
+  const f = taskFilter(name);
+  const n = taskFilterCount(name);
+  const bar = el(`<div class="card" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
+    <input id="dq" value="${f.q || ""}" placeholder="ค้นหาเลขงาน เช่น 004"
+           style="flex:1;min-width:0;margin:0;" />
+    <button class="btn${n ? " amber" : ""}" id="dfilter" style="flex:none;min-height:44px;">
+      ตัวกรอง${n ? ` (${n})` : ""}</button>
+  </div>`);
+  main.appendChild(bar);
+  if(f.q || n){
+    const active = el(`<div class="field-note" style="margin:-4px 0 10px;line-height:1.6;">
+      กรองอยู่: ${taskFilterChips(name).join(" · ")}
+      <button class="btn" id="dclear" style="min-height:36px;padding:4px 10px;margin-left:6px;">ล้าง</button>
+    </div>`);
+    active.querySelector("#dclear").onclick = ()=>{ clearTaskFilter(name); renderContent(); };
+    main.appendChild(active);
+  }
+  bar.querySelector("#dfilter").onclick = ()=> openTaskFilterSheet(name, tasks);
+  const dq = bar.querySelector("#dq");
+  dq.addEventListener("input", ()=>{
+    const pos = dq.selectionStart;
+    taskFilter(name).q = dq.value;
+    renderContent();
+    // renderContent() rebuilds the box, so put the caret back where it was
+    // rather than making the person re-tap after every character.
+    const again = document.querySelector("#dq");
+    if(again){ again.focus(); try{ again.setSelectionRange(pos, pos); }catch(e){} }
+  });
 }
 
 function openPauseSheet(taskId){
