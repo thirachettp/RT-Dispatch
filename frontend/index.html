@@ -86,6 +86,38 @@
   .card-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;
     padding-top:12px;border-top:1px solid var(--line);}
 
+  /* The list card went back to five things: code, route, when, what and who.
+     Icons and labels on every value made the card twice as tall and said
+     nothing a warehouse reader needed twice, so the values now run as one
+     quiet line and the chevron promises the rest is one tap away. */
+  .card-body{display:flex;align-items:center;gap:10px;}
+  .card-main{flex:1;min-width:0;}
+  .card-main .route{margin:0;}
+  .card-chev{flex:none;color:var(--ink-dim);font-size:22px;line-height:1;}
+  .card-meta{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;
+    color:var(--ink-dim);line-height:1.5;margin-top:8px;}
+  .card-meta .cm-who{color:var(--ink);font-weight:700;}
+  .card-meta .cm-rate{color:var(--amber);letter-spacing:.06em;}
+
+  /* The four times a job has are now a bar instead of four rows in the fact
+     grid: the order matters as much as the clock, and a bar shows both. */
+  .td-steps-card{padding:16px 12px 12px;}
+  .td-steps{display:flex;align-items:flex-start;}
+  .td-step{flex:1;min-width:0;text-align:center;position:relative;}
+  .td-step .td-seg{position:absolute;top:11px;left:50%;right:-50%;height:2px;background:var(--line);}
+  .td-step:last-child .td-seg{display:none;}
+  .td-step.is-done .td-seg{background:var(--green);}
+  .td-dot{position:relative;width:24px;height:24px;margin:0 auto;border-radius:999px;
+    background:var(--panel-2);border:1px solid var(--line);display:flex;align-items:center;
+    justify-content:center;font-size:12px;font-weight:800;color:var(--ink-dim);}
+  .td-step.is-done .td-dot{background:var(--green);border-color:var(--green);color:#fff;}
+  .td-step.is-now .td-dot{background:var(--warn);border-color:var(--warn);color:#fff;}
+  .td-step.is-bad .td-dot{background:var(--red);border-color:var(--red);color:#fff;}
+  .td-step-l{font-size:11.5px;font-weight:700;margin-top:8px;line-height:1.35;}
+  .td-step-t{font-size:11px;color:var(--ink-dim);margin-top:3px;line-height:1.35;}
+  .td-step.is-now .td-step-l,.td-step.is-now .td-step-t{color:var(--warn);}
+  .td-step.is-bad .td-step-l,.td-step.is-bad .td-step-t{color:var(--red);}
+
   /* Multi-select driver picker in the assign sheet. */
   .driver-pick-list{max-height:46vh;overflow-y:auto;margin:10px 0;border:1px solid var(--line);
     border-radius:12px;}
@@ -2264,29 +2296,42 @@ const ICO = {
 
 function taskCard(t, actionsHtml, opts={}){
   const cls = statusClass(t.status);
-  const showRequester = opts.showRequester;
-  // The list card answers "what is on this job", not "who" — so it counts
-  // vehicles by type. Names belong in the job's own screen, where there is
-  // room for them and the reader is looking at one job rather than scanning.
+  // Five things and no more: code, route, when, what (BU and pallets) and who.
+  // A card is read while walking; everything else lives one tap away in the
+  // job's own screen, which is what the chevron on the right promises.
   const counts = t.driver_counts || {};
-  // With many vehicle types in the fleet, spelling out every one would run off
-  // the card, so past three it folds into a total the detail screen expands.
   const present = allVehicleTypes(Object.keys(counts)).filter(k=> counts[k]);
   const totalUnits = present.reduce((n, k)=> n + counts[k], 0);
-  const crewLabel = !present.length ? null
-    : present.length <= 3 ? present.map(k=> `${k} ${counts[k]} คัน`).join(" · ")
-    : `${present.length} ประเภท · ${totalUnits} คัน`;
+  const drivers = t.drivers || [];
+  let crewLabel = null;
+  if(drivers.length === 1){
+    // One driver is the ordinary case, and then there is room for the real
+    // vehicle and the real name instead of a count of one.
+    const d = drivers[0];
+    const veh = d.vehicle_code || d.vehicle_type || "";
+    crewLabel = [veh, d.full_name || d.employee_id].filter(Boolean).join(" · ");
+  } else if(present.length){
+    // With many vehicle types on one job, spelling out every one would run off
+    // the card, so past three it folds into a total the detail screen expands.
+    crewLabel = present.length <= 3
+      ? present.map(k=> `${k} ${counts[k]} คัน`).join(" · ")
+      : `${present.length} ประเภท · ${totalUnits} คัน`;
+  } else if(drivers.length){
+    crewLabel = `${drivers.length} คน`;
+  }
+  // Before anyone takes the job the useful name is the person who asked;
+  // after that it is the vehicle doing it.
+  const who = crewLabel || t.requester_name || t.requester_employee_id || "";
+  const hasPallets = !(t.pallet_qty === null || t.pallet_qty === undefined || t.pallet_qty === "");
 
-  const facts = [
-    cardFact(ICO.box, "พาเลท", t.pallet_qty),
+  const meta = [
+    `<span>${fmtTime(t.created_at)}</span>`,
     t.request_type === "Booking" && t.scheduled_at
-      ? cardFact(ICO.cal, "นัดหมาย", fmtTime(t.scheduled_at))
-      : "",
-    cardFact(ICO.clock, "วันที่/เวลา", fmtTime(t.created_at)),
-    crewLabel ? cardFact(ICO.truck, "รถที่รับงาน", crewLabel) : "",
-    showRequester ? cardFact(ICO.user, "ผู้ขอ", t.requester_name || t.requester_employee_id || "-") : "",
-    showRequester ? cardFact(ICO.phone, "ติดต่อ", fmtPhone(t.requester_contact)) : "",
-    t.rating ? cardFact(ICO.star, "คะแนน", "★".repeat(t.rating) + "☆".repeat(5 - t.rating)) : "",
+      ? `<span>นัดหมาย ${fmtTime(t.scheduled_at)}</span>` : "",
+    t.bu ? `<span>BU ${t.bu}</span>` : "",
+    hasPallets ? `<span>${t.pallet_qty} พาเลท</span>` : "",
+    who ? `<span class="cm-who">${who}</span>` : "",
+    t.rating ? `<span class="cm-rate">${"★".repeat(t.rating)}${"☆".repeat(5 - t.rating)}</span>` : "",
   ].filter(Boolean).join("");
 
   return `
@@ -2304,9 +2349,13 @@ function taskCard(t, actionsHtml, opts={}){
         : ""}
       ${t.blocked_reason ? `<div class="blocked-banner">⚠️ ถูกตีกลับ: ${t.blocked_reason}</div>` : ""}
       ${pauseBannerHTML(t)}
-      <div class="route">${t.from_location}<span class="arrow">→</span>${t.to_location}
-</div>
-      <div class="fact-strip">${facts}</div>
+      <div class="card-body">
+        <div class="card-main">
+          <div class="route">${t.from_location}<span class="arrow">→</span>${t.to_location}</div>
+          <div class="card-meta">${meta}</div>
+        </div>
+        <span class="card-chev" aria-hidden="true">›</span>
+      </div>
       ${t.photo_url ? `<img class="thumb" data-photo-url="${t.photo_url}" />` : ""}
       ${actionsHtml ? `<div class="card-actions">${actionsHtml}</div>` : ""}
     </div>`;
@@ -5100,10 +5149,10 @@ function bindCardClickToDetail(container){
     card.style.cursor = "pointer";
     card.addEventListener("click", (e)=>{
       if(e.target.closest("button")) return;
-      // Tapping a job opens its conversation, with every detail of the job at
-      // the top — the chat is where status changes are announced, so it is
-      // the one place that tells the whole story.
-      openChatSheet(card.dataset.id);
+      // Tapping a job opens the job's own screen: everything about it, the
+      // step bar, and the people on it — with a แชท button there for whoever
+      // wants the conversation. The card's chevron promises exactly this.
+      openTaskDetailSheet(card.dataset.id);
     });
   });
   loadAuthenticatedImages(container);
@@ -7091,16 +7140,57 @@ function taskDetailCardHTML(t){
         ${fact("BU", t.bu)}
         ${fact("Cost center", t.cost_center ? costCenterLabel(t.cost_center) : "")}
         ${fact("ความสำคัญ", PRIORITY_LABEL[t.priority] || t.priority)}
-        ${fact("สร้างคำขอเมื่อ", t.created_at ? fmtTime(t.created_at) : "")}
         ${t.request_type === "Booking" && t.scheduled_at ? fact("นัดหมาย", fmtTime(t.scheduled_at)) : ""}
-        ${fact("เริ่มงานเมื่อ", t.started_at ? fmtTime(t.started_at) : "")}
-        ${fact("เสร็จเมื่อ", t.completed_at ? fmtTime(t.completed_at) : "")}
         ${fact("คะแนน", t.rating ? "★".repeat(t.rating) + "☆".repeat(5 - t.rating) : "")}
       </div>
       ${t.remark ? `<div class="td-remark"><span>หมายเหตุ</span><div>${t.remark}</div></div>` : ""}
       ${t.photo_url ? `<img class="thumb" data-photo-url="${t.photo_url}" />` : ""}
       ${actions.trim() ? `<div class="card-actions">${actions}</div>` : ""}
     </div>`;
+}
+
+// The four times a job carries — asked, taken, started, finished — used to be
+// four more rows in the fact grid, where the order they happened in was
+// something the reader had to reconstruct. As a bar they read in one glance,
+// and no new field had to be stored to draw it.
+function fmtStamp2(iso){
+  if(!iso) return "—";
+  const s = fmtTime(iso).replace(/,/g, " ").replace(/\s+/g, " ").trim();
+  const sp = s.indexOf(" ");
+  return sp < 0 ? s : `${s.slice(0, sp)}<br>${s.slice(sp + 1)}`;
+}
+
+function taskTimelineHTML(t){
+  const cancelled = t.status === "Cancelled";
+  const steps = [
+    { label: "สร้างงาน", at: t.created_at },
+    { label: "รับงาน", at: t.accepted_at },
+    { label: "เริ่มงาน", at: t.started_at },
+    cancelled ? { label: "ยกเลิก", at: t.completed_at, bad: true }
+              : { label: "เสร็จสิ้น", at: t.completed_at },
+  ];
+  // The last stamped step is where the job stands now, so it is the one shown
+  // as live; the ones before it are finished, the ones after have not happened.
+  let last = -1;
+  steps.forEach((st, i)=>{ if(st.at) last = i; });
+  const done = t.status === "Completed";
+  const cells = steps.map((st, i)=>{
+    let cls = "", mark = "";
+    if(st.bad && i === last){ cls = "is-bad"; mark = "✕"; }
+    else if(i < last || (i === last && done)){ cls = "is-done"; mark = "✓"; }
+    else if(i === last){ cls = "is-now"; mark = "●"; }
+    // The connector belongs to the step on its left, and is green only once
+    // the step after it has actually happened.
+    const seg = i < last ? `<span class="td-seg" style="background:var(--green)"></span>`
+                         : `<span class="td-seg"></span>`;
+    return `<div class="td-step ${cls}">
+      ${seg}
+      <div class="td-dot">${mark}</div>
+      <div class="td-step-l">${st.label}</div>
+      <div class="td-step-t">${fmtStamp2(st.at)}</div>
+    </div>`;
+  }).join("");
+  return `<div class="card td-steps-card"><div class="td-steps">${cells}</div></div>`;
 }
 
 async function openTaskDetailSheet(taskId){
@@ -7132,6 +7222,9 @@ async function openTaskDetailSheet(taskId){
   // then whoever is doing it. The row is the summary; the full card — phone
   // number included — is the same one a name in the chat opens, so there is
   // one profile card in the app rather than two that drift apart.
+  holder.appendChild(el(`<div class="section-title">ขั้นตอนของงานนี้</div>`));
+  holder.appendChild(el(taskTimelineHTML(t)));
+
   const people = el(`<div id="td-people"></div>`);
   holder.appendChild(people);
   (async ()=>{
