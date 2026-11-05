@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261105.1512"
+APP_VERSION = "TTLOD.261105.1525"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -6338,6 +6338,46 @@ def dashboard_volume_buckets(period: str = "today", user=Depends(require_ops()))
         "totals": totals,
         "groups": [{"key": k, "label": lbl} for k, lbl, _ in VOLUME_GROUPS],
     }
+
+
+@app.get("/dashboard/volume-bucket-tasks")
+def dashboard_volume_bucket_tasks(period: str = "today", start: str = "", user=Depends(require_ops())):
+    """The jobs behind one bar of the volume chart.
+
+    `start` is the bucket's own `start` value exactly as /dashboard/volume-buckets
+    returned it (Bangkok wall-clock), so the window here is the same slot the bar
+    was counted over: one hour for "today", one day otherwise. Every job in the
+    slot comes back with its group, and the screen narrows to a group itself —
+    that way the chips can show counts and switching group costs no round-trip.
+    """
+    if period not in ("today", "week", "month"):
+        raise HTTPException(400, "period ต้องเป็น today, week หรือ month")
+    try:
+        start_bkk = datetime.fromisoformat(start)
+    except ValueError:
+        raise HTTPException(400, "start ไม่ถูกต้อง")
+    end_bkk = start_bkk + (timedelta(hours=1) if period == "today" else timedelta(days=1))
+    since_utc = (start_bkk - BKK_OFFSET).isoformat(timespec="seconds") + "Z"
+    until_utc = (end_bkk - BKK_OFFSET).isoformat(timespec="seconds") + "Z"
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, task_code, status, pallet_qty, task_type, from_location, to_location, created_at "
+            "FROM tasks WHERE created_at >= ? AND created_at < ? ORDER BY created_at LIMIT 500",
+            (since_utc, until_utc),
+        ).fetchall()
+    tasks = []
+    for r in rows:
+        g = _GROUP_OF.get(r["status"])
+        if not g:
+            continue
+        at = _to_bkk(r["created_at"])
+        tasks.append({
+            "id": r["id"], "task_code": r["task_code"], "status": r["status"], "group": g,
+            "pallet_qty": int(r["pallet_qty"] or 0), "task_type": r["task_type"],
+            "from_location": r["from_location"], "to_location": r["to_location"],
+            "created_local": at.isoformat(timespec="minutes") if at else None,
+        })
+    return {"period": period, "start": start, "tasks": tasks}
 
 
 @app.get("/dashboard/overview")

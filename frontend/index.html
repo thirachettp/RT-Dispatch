@@ -5144,25 +5144,159 @@ function renderVolumeChart(card, data){
   });
   data.buckets.forEach((b, i)=>{
     const x = padL + i * (barW + gap);
+    const hasJobs = keys.some(k=> (b.jobs[k]||0) > 0);
+    // A transparent column behind the bar, wider than the bar itself, so a short
+    // bar (or an empty hour) is still easy to point at and the hover/tap target
+    // is the whole slot rather than a few pixels of colour.
+    svg += `<rect class="vol-hit" data-i="${i}" x="${(x - gap/2).toFixed(1)}" y="${padT}" width="${(barW + gap).toFixed(1)}" height="${plotH}" fill="transparent"${hasJobs ? ' style="cursor:pointer;"' : ""}></rect>`;
     let y = padT + plotH;
     keys.forEach(k=>{
       const v = b[metric][k] || 0;
       if(v <= 0) return;
       const h = (v / top) * plotH;
       y -= h;
-      svg += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${VOLUME_COLORS[k]}"><title>${b.label} · ${TH_GROUP[k]} ${v} ${unit}</title></rect>`;
+      svg += `<rect data-i="${i}" data-k="${k}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${VOLUME_COLORS[k]}" style="cursor:pointer;"></rect>`;
     });
     if(i % every === 0){
-      svg += `<text x="${(x + barW/2).toFixed(1)}" y="${H-6}" font-size="8" fill="var(--ink-dim)" text-anchor="middle">${b.label}</text>`;
+      svg += `<text x="${(x + barW/2).toFixed(1)}" y="${H-6}" font-size="8" fill="var(--ink-dim)" text-anchor="middle" pointer-events="none">${b.label}</text>`;
     }
   });
   const axisNote = data.period === "today" ? "เวลาที่เปิดงาน (นาฬิกา)" : "วันที่เปิดงาน";
-  card.appendChild(el(`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;" role="img"
-    aria-label="ปริมาณงานแยกตาม${axisNote}">${svg}</svg>`));
+  const svgEl = el(`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;" role="img"
+    aria-label="ปริมาณงานแยกตาม${axisNote}">${svg}</svg>`);
+  card.appendChild(svgEl);
+
+  // Hover: both measures for the slot under the pointer, whichever one the
+  // chart is currently drawing. Click/tap: the jobs themselves.
+  card.style.position = "relative";
+  const tip = el(`<div style="position:absolute;display:none;z-index:5;pointer-events:none;max-width:230px;
+    background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;
+    box-shadow:0 4px 14px rgba(0,0,0,.18);padding:8px 10px;font-size:11.5px;line-height:1.5;"></div>`);
+  card.appendChild(tip);
+  const hits = svgEl.querySelectorAll(".vol-hit");
+  const slotTitle = (b)=> data.period === "today" ? `${b.label}:00–${b.label}:59 น.` : `วันที่ ${b.label}`;
+  const hideTip = ()=>{
+    tip.style.display = "none";
+    hits.forEach(h=> h.setAttribute("fill", "transparent"));
+  };
+  const showTip = (i, ev)=>{
+    const b = data.buckets[i];
+    const jobs = keys.reduce((t,k)=> t + (b.jobs[k]||0), 0);
+    const pallets = keys.reduce((t,k)=> t + (b.pallets[k]||0), 0);
+    let html = `<div style="font-weight:700;margin-bottom:2px;">${slotTitle(b)}</div>`;
+    if(!jobs){
+      html += `<div style="color:var(--ink-dim);">ไม่มีงานที่เปิดในช่วงนี้</div>`;
+    }else{
+      html += `<div><b>${jobs}</b> งาน · <b>${pallets}</b> พาเลท</div>`;
+      data.groups.forEach(g=>{
+        const j = b.jobs[g.key]||0;
+        if(!j) return;
+        html += `<div style="color:var(--ink-dim);"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${VOLUME_COLORS[g.key]};margin-right:5px;"></span>${g.label} ${j} งาน · ${b.pallets[g.key]||0} พาเลท</div>`;
+      });
+      html += `<div style="color:var(--amber);margin-top:3px;">กดเพื่อดูรายการงาน</div>`;
+    }
+    tip.innerHTML = html;
+    tip.style.display = "block";
+    const box = card.getBoundingClientRect();
+    const px = ev.clientX - box.left, py = ev.clientY - box.top;
+    const left = Math.max(4, Math.min(px + 12, box.width - tip.offsetWidth - 4));
+    const above = py - tip.offsetHeight - 10;
+    tip.style.left = left + "px";
+    tip.style.top = (above >= 4 ? above : py + 16) + "px";
+    hits.forEach(h=> h.setAttribute("fill", Number(h.dataset.i) === i ? "rgba(128,128,128,.14)" : "transparent"));
+  };
+  svgEl.addEventListener("mousemove", (ev)=>{
+    const t = ev.target.closest("[data-i]");
+    if(!t){ hideTip(); return; }
+    showTip(Number(t.dataset.i), ev);
+  });
+  svgEl.addEventListener("mouseleave", hideTip);
+  svgEl.addEventListener("click", (ev)=>{
+    const t = ev.target.closest("[data-i]");
+    if(!t) return;
+    const i = Number(t.dataset.i);
+    const b = data.buckets[i];
+    if(!keys.some(k=> (b.jobs[k]||0) > 0)) return;
+    hideTip();
+    openVolumeBucketSheet(data, i, t.dataset.k || "all");
+  });
   card.appendChild(el(`<div class="field-note" style="text-align:center;margin-top:2px;">${axisNote}</div>`));
   card.appendChild(el(`<div class="chip-row volume-legend" style="margin-top:10px;">
     ${data.groups.map(g=>`<span class="chip" style="cursor:default;"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${VOLUME_COLORS[g.key]};margin-right:5px;"></span>${g.label} ${totals[g.key]||0}</span>`).join("")}
   </div>`));
+}
+
+// The jobs behind one bar. Opened from a tap on the chart: a tap on a coloured
+// segment lands on that group, a tap on the rest of the slot shows everything
+// opened in it. Tapping a job opens its own screen on top of this one.
+async function openVolumeBucketSheet(data, idx, group){
+  const b = data.buckets[idx];
+  const title = data.period === "today"
+    ? `งานที่เปิดเวลา ${b.label}:00–${b.label}:59 น.`
+    : `งานที่เปิดวันที่ ${b.label}`;
+  const overlay = el(`
+    <div class="sheet-overlay">
+      <div class="sheet">
+        <div class="sheet-head"><h2>${title}</h2><button class="sheet-close">✕</button></div>
+        <div id="vb-body"><div class="empty">กำลังโหลด...</div></div>
+      </div>
+    </div>
+  `);
+  document.body.appendChild(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
+  overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
+  const body = overlay.querySelector("#vb-body");
+
+  let tasks;
+  try{
+    const res = await api(`/dashboard/volume-bucket-tasks?period=${data.period}&start=${encodeURIComponent(b.start)}`);
+    tasks = res.tasks;
+  }catch(e){
+    body.innerHTML = "";
+    body.appendChild(el(`<div class="empty">โหลดรายการงานไม่สำเร็จ</div>`));
+    return;
+  }
+
+  let selected = group || "all";
+  function draw(){
+    body.innerHTML = "";
+    const chips = el(`<div class="chip-row"></div>`);
+    const addChip = (key, label, count)=>{
+      const c = el(`<button class="chip ${selected === key ? "active" : ""}">${label} ${count}</button>`);
+      c.onclick = ()=>{ selected = key; draw(); };
+      chips.appendChild(c);
+    };
+    addChip("all", "ทั้งหมด", tasks.length);
+    data.groups.forEach(g=>{
+      const n = tasks.filter(t=> t.group === g.key).length;
+      if(n) addChip(g.key, g.label, n);
+    });
+    body.appendChild(chips);
+
+    const shown = selected === "all" ? tasks : tasks.filter(t=> t.group === selected);
+    const pallets = shown.reduce((s,t)=> s + t.pallet_qty, 0);
+    body.appendChild(el(`<div class="field-note" style="margin-bottom:8px;"><b>${shown.length}</b> งาน · <b>${pallets}</b> พาเลท</div>`));
+    if(!shown.length){
+      body.appendChild(el(`<div class="empty">ไม่มีงานในกลุ่มนี้</div>`));
+      return;
+    }
+    shown.forEach(t=>{
+      const clock = t.created_local ? t.created_local.slice(11, 16) : "";
+      const color = CHART_COLORS[t.status] || "#64748b";
+      const row = el(`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
+        padding:10px;margin-bottom:6px;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;cursor:pointer;">
+        <div style="min-width:0;">
+          <div style="font-family:'JetBrains Mono',monospace;font-weight:700;font-size:13px;">${escHtml(t.task_code)}</div>
+          <div class="field-note" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(t.from_location)} → ${escHtml(t.to_location)}</div>
+          <div class="field-note">${clock ? "เปิดงาน " + clock + " น. · " : ""}${t.pallet_qty} พาเลท</div>
+        </div>
+        <span style="flex:none;font-size:11px;color:#fff;background:${color};border-radius:999px;padding:3px 9px;">${escHtml(TASK_STAT_LABEL[t.status] || t.status)}</span>
+      </div>`);
+      row.onclick = ()=> openTaskDetailSheet(t.id);
+      body.appendChild(row);
+    });
+  }
+  draw();
 }
 
 // Advance booking ("จองล่วงหน้า") is switched off, not deleted. The picker
