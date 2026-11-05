@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261105.1121"
+APP_VERSION = "TTLOD.261105.1512"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -6359,13 +6359,32 @@ def dashboard_overview(period: str = "today", user=Depends(require_ops())):
                 "SELECT COUNT(*) n FROM tasks WHERE created_at>=? AND created_at<?", (iso(start), iso(end))
             ).fetchone()["n"]
             completed_rows = db.execute(
-                "SELECT pallet_qty, started_at, completed_at FROM tasks "
+                "SELECT id, pallet_qty, started_at, completed_at FROM tasks "
                 "WHERE status='Completed' AND completed_at>=? AND completed_at<?",
                 (iso(start), iso(end)),
             ).fetchall()
             completed = len(completed_rows)
             total_pallets = sum(r["pallet_qty"] for r in completed_rows)
-            durations_min, total_hours = [], 0.0
+
+            # Crew size per finished job — how many drivers actually worked it.
+            # 'Replaced'/'Cancelled' rows never did the work, so they don't count;
+            # 'Left' does (they put in time before leaving). A job with no
+            # surviving assignment rows (legacy data) is treated as one person
+            # rather than dropped, so it can't silently inflate the figure.
+            crew_size = {}
+            if completed_rows:
+                ids = [r["id"] for r in completed_rows]
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    for c in db.execute(
+                        "SELECT task_id, COUNT(DISTINCT driver_id) n FROM task_assignments "
+                        f"WHERE task_id IN ({_placeholders(len(chunk))}) "
+                        "AND assignment_status IN ('Active','Completed','Left') GROUP BY task_id",
+                        tuple(chunk),
+                    ).fetchall():
+                        crew_size[c["task_id"]] = c["n"]
+
+            durations_min, total_hours, person_hours = [], 0.0, 0.0
             for r in completed_rows:
                 if r["started_at"] and r["completed_at"]:
                     try:
@@ -6375,16 +6394,22 @@ def dashboard_overview(period: str = "today", user=Depends(require_ops())):
                         if mins > 0:
                             durations_min.append(mins)
                             total_hours += mins / 60
+                            person_hours += (mins / 60) * max(1, crew_size.get(r["id"], 1))
                     except ValueError:
                         pass
             avg_process = sum(durations_min) / len(durations_min) if durations_min else 0
             qty_per_hour = (total_pallets / total_hours) if total_hours > 0 else 0
+            # Pallets per person-hour: the same pallets, divided by hours x crew
+            # instead of hours alone, so a 3-person job is not credited as if
+            # one person had moved it.
+            qty_per_hour_per_person = (total_pallets / person_hours) if person_hours > 0 else 0
             completion_rate = (completed / total * 100) if total > 0 else 0
             return {
                 "total_jobs": total, "completed": completed,
                 "completion_rate": round(completion_rate, 1),
                 "avg_process_time_minutes": round(avg_process, 1),
                 "qty_per_hour": round(qty_per_hour, 1),
+                "qty_per_hour_per_person": round(qty_per_hour_per_person, 1),
             }
 
         cur = flow_metrics(cur_start, cur_end)

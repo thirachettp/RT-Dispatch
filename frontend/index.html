@@ -4969,10 +4969,10 @@ const BU_LIST = ["CDS","MUJI","PGE","RBS","SSP","GG","B2S","OFM","CMG","KMNY"];
 const KPI_LABEL = {
   total_jobs: "งานทั้งหมด", completed: "เสร็จสิ้น", in_progress: "กำลังทำ", overdue: "ค้างนาน (Overdue)",
   completion_rate: "อัตราสำเร็จ (%)", avg_process_time_minutes: "เวลาเฉลี่ย/งาน (นาที)",
-  qty_per_hour: "พาเลท/ชม.", people_utilization: "การใช้งานคน (%)", vehicle_utilization: "การใช้งานรถ (%)",
+  qty_per_hour: "พาเลท/ชม.", qty_per_hour_per_person: "พาเลท/ชม./คน", people_utilization: "การใช้งานคน (%)", vehicle_utilization: "การใช้งานรถ (%)",
 };
 const KPI_ORDER = ["total_jobs","completed","in_progress","overdue","completion_rate",
-  "avg_process_time_minutes","qty_per_hour","people_utilization","vehicle_utilization"];
+  "avg_process_time_minutes","qty_per_hour","qty_per_hour_per_person","people_utilization","vehicle_utilization"];
 
 // Dashboard = "How are we performing?" — pure KPI/trend/export, no action buttons.
 async function renderAdminDashboard(main){
@@ -5021,7 +5021,7 @@ async function renderAdminDashboard(main){
   main.appendChild(exportCard);
 
   const JOB_KEYS = ["total_jobs", "in_progress", "overdue", "completed", "completion_rate"];
-  const PERF_KEYS = ["avg_process_time_minutes", "qty_per_hour", "people_utilization", "vehicle_utilization"];
+  const PERF_KEYS = ["avg_process_time_minutes", "qty_per_hour", "qty_per_hour_per_person", "people_utilization", "vehicle_utilization"];
 
   function buildKpiGrid(ov, keys){
     const grid = el(`<div class="stat-grid"></div>`);
