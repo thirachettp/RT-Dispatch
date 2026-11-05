@@ -98,6 +98,18 @@
     color:var(--ink-dim);line-height:1.5;margin-top:8px;}
   .card-meta .cm-who{color:var(--ink);font-weight:700;}
   .card-meta .cm-rate{color:var(--amber);letter-spacing:.06em;}
+  /* A job's remark is the one free-text thing a requester can add ("ของแตกง่าย",
+     "รอที่ประตู 3"), and a driver deciding whether to take the job needs it
+     before opening it. Two lines at most so one long note cannot stretch the
+     list; the full text is still in the job's own screen. */
+  .card-remark{margin-top:8px;padding:6px 10px;border-radius:8px;display:flex;gap:6px;
+    background:var(--amber-dim);border-left:3px solid var(--amber);
+    font-size:12.5px;line-height:1.5;color:var(--ink);}
+  .card-remark b{flex:none;font-weight:700;}
+  /* The clamp lives on the inner text, not the padded box: clamping the box
+     itself lets a third line show through the bottom padding. */
+  .card-remark .cr-text{flex:1;min-width:0;white-space:pre-line;overflow-wrap:anywhere;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
 
   /* The four times a job has are now a bar instead of four rows in the fact
      grid: the order matters as much as the clock, and a bar shows both. */
@@ -2302,8 +2314,16 @@ const ICO = {
   star:  `<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="m12 3 2.6 5.5 6 .8-4.4 4.2 1.1 6-5.3-2.9-5.3 2.9 1.1-6L3.4 9.3l6-.8z"/></svg>`,
 };
 
+// Remarks are typed by people, so anything that puts one into markup has to
+// escape it first — a "<" in a note must show as a "<", never as a tag.
+function escHtml(s){
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 function taskCard(t, actionsHtml, opts={}){
   const cls = statusClass(t.status);
+  const remark = (t.remark || "").trim();
   // Five things and no more: code, route, when, what (BU and pallets) and who.
   // A card is read while walking; everything else lives one tap away in the
   // job's own screen, which is what the chevron on the right promises.
@@ -2361,6 +2381,7 @@ function taskCard(t, actionsHtml, opts={}){
         <div class="card-main">
           <div class="route">${t.from_location}<span class="arrow">→</span>${t.to_location}</div>
           <div class="card-meta">${meta}</div>
+          ${remark ? `<div class="card-remark"><b>หมายเหตุ</b><div class="cr-text">${escHtml(remark)}</div></div>` : ""}
         </div>
         <span class="card-chev" aria-hidden="true">›</span>
       </div>
