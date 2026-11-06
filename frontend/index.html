@@ -105,6 +105,11 @@
   .route2 .rl{display:flex;align-items:baseline;gap:8px;font-size:15px;font-weight:800;line-height:1.35;min-width:0;}
   .route2 .rk{flex:none;width:26px;font-size:11px;font-weight:700;color:var(--ink-dim);}
   .route2 .rv{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  /* On the job's own screen there is room to read everything: same two lines,
+     but a long name wraps instead of being cut. */
+  .route2.full{margin-bottom:12px;}
+  .route2.full .rl{font-size:16px;}
+  .route2.full .rv{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;}
   /* A job's remark is the one free-text thing a requester can add ("ของแตกง่าย",
      "รอที่ประตู 3"), and a driver deciding whether to take the job needs it
      before opening it. Two lines at most so one long note cannot stretch the
@@ -7307,7 +7312,10 @@ function taskDetailCardHTML(t){
         : ""}
       ${t.blocked_reason ? `<div class="blocked-banner">⚠️ ถูกตีกลับ: ${t.blocked_reason}</div>` : ""}
       ${pauseBannerHTML(t)}
-      <div class="route">${t.from_location}<span class="arrow">→</span>${t.to_location}</div>
+      <div class="route2 full">
+        <div class="rl"><span class="rk">จาก</span><span class="rv">${escHtml(t.from_location)}</span></div>
+        <div class="rl"><span class="rk">ไป</span><span class="rv">${escHtml(t.to_location)}</span></div>
+      </div>
       <div class="td-facts">
         ${fact("จำนวนพาเลท", t.pallet_qty)}
         ${fact("BU", t.bu)}
