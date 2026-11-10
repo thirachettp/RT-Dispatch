@@ -492,16 +492,111 @@ else:
 _db_local = threading.local()
 
 
+# Postgres connections are POOLED across requests, not opened per request.
+#
+# On Vercel Fluid one warm instance serves many requests in a row, yet every
+# request (and, separately, its current_user dependency) used to pay for a
+# fresh psycopg2.connect(): TCP + TLS + SCRAM password auth to Neon. That
+# handshake is client-side CPU, and it was the largest share of the app's
+# metered Active CPU. Keeping a few idle connections alive on the instance
+# turns it into a dictionary pop.
+#
+# Safety rules, each one guarding a real failure mode:
+#   * A connection is only ever used by ONE request at a time (borrowed from
+#     the pool, returned afterwards) — never shared between threads.
+#   * On error it is rolled back before it goes back, so a half-finished
+#     transaction never leaks into the next request.
+#   * Neon suspends idle compute and drops its sockets. A connection that has
+#     sat idle longer than _PG_PING_AFTER_S is pinged before reuse; if the
+#     ping fails it is thrown away and a fresh one is opened, so the first
+#     person in after a quiet spell gets a normal response, not an error.
+#   * Anything that looks broken (closed, or not idle in-transaction-wise) is
+#     discarded rather than returned.
+_PG_POOL_MAX_IDLE = 4          # idle connections kept per instance
+_PG_PING_AFTER_S = 30          # idle time after which a connection is re-checked
+_PG_MAX_AGE_S = 15 * 60        # recycle connections after this long regardless
+_pg_pool = []                  # list of (raw_conn, created_at, last_used_at)
+_pg_pool_lock = threading.Lock()
+
+
+def _pg_connect():
+    return psycopg2.connect(
+        DATABASE_URL,
+        # TCP keepalives so a silently dropped socket is noticed sooner.
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+    )
+
+
+def _pg_acquire():
+    now = time.monotonic()
+    while True:
+        with _pg_pool_lock:
+            item = _pg_pool.pop() if _pg_pool else None
+        if item is None:
+            conn = _pg_connect()
+            return conn, now
+        conn, created, last_used = item
+        if conn.closed or now - created > _PG_MAX_AGE_S:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+        if now - last_used > _PG_PING_AFTER_S:
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                cur.close()
+                conn.rollback()   # end the implicit transaction the ping opened
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+        return conn, created
+
+
+def _pg_release(conn, created, ok: bool):
+    try:
+        if ok:
+            conn.commit()
+        else:
+            conn.rollback()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if ok:
+            raise   # a failed COMMIT must still surface as an error
+        return
+    reusable = (not conn.closed
+                and conn.status == psycopg2.extensions.STATUS_READY
+                and time.monotonic() - created <= _PG_MAX_AGE_S)
+    if reusable:
+        with _pg_pool_lock:
+            if len(_pg_pool) < _PG_POOL_MAX_IDLE:
+                _pg_pool.append((conn, created, time.monotonic()))
+                return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 @contextmanager
 def _new_db_connection():
     if IS_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn, created = _pg_acquire()
         wrapped = _PgConnection(conn)
+        ok = False
         try:
             yield wrapped
-            conn.commit()
+            ok = True
         finally:
-            conn.close()
+            _pg_release(conn, created, ok)
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -6326,7 +6421,7 @@ def get_audit_logs(user=Depends(require_role("ADMIN"))):
 
 @app.get("/app-data")
 def app_data(scope: str = "core", task_scope: Optional[str] = None,
-             user=Depends(current_user)):
+             lite: int = 0, user=Depends(current_user)):
     """Returns everything a screen needs in ONE round-trip instead of the
     frontend firing 14 separate requests every refresh. Each of those was a
     separate serverless invocation + DB round-trip on Vercel/Neon, which is
@@ -6340,6 +6435,14 @@ def app_data(scope: str = "core", task_scope: Optional[str] = None,
                   task rules, team chat (the Operation/Settings tabs)
       admin_dash— + dashboard summary (the Dashboard tab)
       driver    — + vehicles, team chat (driver screens)
+
+    lite=1 leaves out the lists that almost never change (cost centres,
+    users, vehicle types, zones). The page sends it on background refreshes
+    and asks for the full bundle at least every 5 minutes, on a manual
+    refresh, and after any change made on that device — so those lists are
+    at most 5 minutes stale on OTHER devices, and never on the one that made
+    the change. Without the parameter the response is exactly as before, so
+    a copy of the page still running old JavaScript keeps working.
     """
     # Holding ONE connection open across the whole bundle is what makes the
     # single-round-trip design actually pay off. Each helper below opens its
@@ -6351,21 +6454,24 @@ def app_data(scope: str = "core", task_scope: Optional[str] = None,
             "me": me(user),
             "tasks": list_tasks(None, task_scope, user),
             "notifications": get_notifications(user),
+        }
+        if not lite:
             # Small, changes rarely, and needed by the job form and the
             # profile screen — cheaper here than a request of its own.
-            "costCenters": list_cost_centers(user),
-        }
+            out["costCenters"] = list_cost_centers(user)
         if scope == "driver":
             out["vehicles"] = list_vehicles(user)
             out["teamChatMessages"] = get_team_chat_messages(user)
             out["teamChatParticipants"] = team_chat_participants(user)
         elif scope in ("admin_ops", "admin_dash") and user["role"] in ("ADMIN", "DISPATCH"):
+            # Live: who is free, which truck is where, what broke down.
             out["drivers"] = list_drivers(user)
             out["vehicles"] = list_vehicles(user)
-            out["allUsers"] = list_all_users(user)
-            out["vehicleTypes"] = list_vehicle_types(user)
             out["breakdowns"] = list_breakdowns(user)
-            out["zones"] = list_zones(user)
+            if not lite:
+                out["allUsers"] = list_all_users(user)
+                out["vehicleTypes"] = list_vehicle_types(user)
+                out["zones"] = list_zones(user)
             out["teamChatMessages"] = get_team_chat_messages(user)
             out["teamChatParticipants"] = team_chat_participants(user)
             if scope == "admin_dash":

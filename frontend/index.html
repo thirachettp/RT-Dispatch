@@ -1712,8 +1712,31 @@ function logout(){
   render();
 }
 
+// Job-chat polling. Self-scheduling (never stacks), skipped while the screen
+// is hidden, and paired with an immediate reload whenever a push arrives or
+// the app comes back to the foreground — see the service-worker listener.
+const CHAT_POLL_MS = 12000;
+let _chatReload = null;
+function startChatPolling(fn){
+  stopChatPolling();
+  _chatReload = fn;
+  const tick = async ()=>{
+    if(_chatReload !== fn) return;
+    if(!document.hidden) await fn();
+    if(_chatReload === fn) chatPollTimer = setTimeout(tick, CHAT_POLL_MS);
+  };
+  chatPollTimer = setTimeout(tick, CHAT_POLL_MS);
+}
+function stopChatPolling(){
+  if(chatPollTimer){ clearTimeout(chatPollTimer); chatPollTimer = null; }
+  _chatReload = null;
+}
+function reloadOpenChat(){
+  if(_chatReload) _chatReload();
+}
+
 function closeSheet(overlay){
-  if(chatPollTimer){ clearInterval(chatPollTimer); chatPollTimer = null; }
+  stopChatPolling();
   overlay.remove();
 }
 
@@ -7928,6 +7951,10 @@ async function openChatSheet(taskId){
 
   let lastCount = -1;
   async function loadMessages(){
+    // The sheet can be removed without going through closeSheet() (a tapped
+    // notification clears every open sheet directly). Without this check the
+    // timer kept hitting the server for a chat nobody could see any more.
+    if(!overlay.isConnected){ stopChatPolling(); return; }
     if(document.activeElement === overlay.querySelector("#chat-input")) return; // don't yank focus while typing
     try{
       const msgs = await api(`/tasks/${taskId}/messages`, {background:true});
@@ -7981,8 +8008,11 @@ async function openChatSheet(taskId){
 
   await loadPeople();
   await Promise.all([loadTask(), loadMessages()]);
-  if(chatPollTimer) clearInterval(chatPollTimer);
-  chatPollTimer = setInterval(loadMessages, 3000);
+  // Push is the primary signal for new chat lines (every message notifies
+  // the other participants); this timer is the safety net for devices that
+  // do not get pushes. It used to fire every 3s — ten times the main poll —
+  // and kept going behind a locked screen.
+  startChatPolling(loadMessages);
 }
 
 function renderTeamChat(main){
@@ -8062,6 +8092,14 @@ function _sig(s){
 // ("รอมา 12 นาที", "ติดงานมา 30 นาที") don't freeze on screen.
 const FORCE_RENDER_AFTER_MS = 120000;
 
+// Lists that almost never change (cost centres, users, vehicle types, zones)
+// are left out of BACKGROUND refreshes and re-fetched at least this often.
+// Any refresh the code triggers itself — after saving something, a manual
+// refresh, opening the app — still asks for everything, so the device that
+// made a change always sees it at once.
+const STATIC_REFRESH_MS = 5 * 60 * 1000;
+const _fullFetchedAt = {};   // "<employee>|<scope>" -> ms of last full fetch
+
 let _refreshAbort = null;
 async function refreshAll(opts={}){
   // One combined request instead of ~14 separate ones. The scope tells the
@@ -8085,9 +8123,14 @@ async function refreshAll(opts={}){
   const ctrl = new AbortController();
   _refreshAbort = ctrl;
   try{
+    const fullKey = (state.employee_id || "") + "|" + scope;
+    const lite = !!opts.lite && !opts.visible
+      && _fullFetchedAt[fullKey] && (Date.now() - _fullFetchedAt[fullKey] < STATIC_REFRESH_MS);
     const d = await api("/app-data?scope=" + scope
-      + (state.role === "USER" && taskScope() === "unit" ? "&task_scope=unit" : ""),
+      + (state.role === "USER" && taskScope() === "unit" ? "&task_scope=unit" : "")
+      + (lite ? "&lite=1" : ""),
       {background: !opts.visible, signal: ctrl.signal});
+    if(!lite) _fullFetchedAt[fullKey] = Date.now();
     // Merge returned keys into state (only overwrites what the scope included,
     // so data from another tab stays cached until you go back to it).
     Object.assign(state, d);
@@ -8258,7 +8301,7 @@ function startPolling(){
     // Never poll a backgrounded tab. A driver leaves this app open all shift;
     // polling behind a locked screen burns their battery and our quota for a
     // screen nobody is looking at. visibilitychange re-syncs on return.
-    if(!document.hidden) await refreshAll();
+    if(!document.hidden) await refreshAll({lite:true});
     if(state.token) pollTimer = setTimeout(tick, nextPollDelay());
   };
   pollTimer = setTimeout(tick, nextPollDelay());
@@ -8275,7 +8318,7 @@ setInterval(updateRefreshBar, 10000);
 // visible, so always re-sync straight away rather than waiting for the timer.
 document.addEventListener("visibilitychange", ()=>{
   if(document.hidden) return;
-  if(state.token){ refreshAll(); startPolling(); }
+  if(state.token){ refreshAll({lite:true}); startPolling(); reloadOpenChat(); }
 });
 window.addEventListener("online", ()=>{
   if(state.token){ refreshAll(); startPolling(); }
@@ -8296,7 +8339,10 @@ if("serviceWorker" in navigator){
       refreshAll().then(openPendingTask);
       return;
     }
-    refreshAll();
+    refreshAll({lite:true});
+    // A push may be a new line in the chat that is open right now; that
+    // sheet is not part of refreshAll(), so reload it too.
+    reloadOpenChat();
   });
 }
 
