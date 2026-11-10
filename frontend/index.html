@@ -108,6 +108,18 @@
   /* On the job's own screen there is room to read everything: same two lines,
      but a long name wraps instead of being cut. */
   .route2.full{margin-bottom:12px;}
+  /* Notification switches (Profile) */
+  .nrow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0;
+    border-top:1px solid var(--line);cursor:pointer;}
+  .nrow:first-of-type{border-top:0;}
+  .nrow .nt{font-weight:700;font-size:14px;line-height:1.35;}
+  .nrow .nd{font-size:12px;color:var(--ink-dim);line-height:1.4;margin-top:1px;}
+  .sw{flex:none;width:44px;height:26px;border-radius:999px;background:#cbd2da;position:relative;
+    transition:background .15s;}
+  .sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;
+    background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:left .15s;}
+  .sw.on{background:var(--green);}
+  .sw.on::after{left:21px;}
   .route2.full .rl{font-size:16px;}
   .route2.full .rv{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;}
   /* A job's remark is the one free-text thing a requester can add ("ของแตกง่าย",
@@ -3895,6 +3907,10 @@ function renderProfile(main){
   main.appendChild(pushCard);
   renderPushSection(pushCard);
 
+  const prefCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(prefCard);
+  renderNotificationPrefs(prefCard);
+
   main.appendChild(el(`<div class="section-title">เครื่องที่เข้าสู่ระบบอยู่</div>`));
   const devCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
   main.appendChild(devCard);
@@ -3961,6 +3977,37 @@ async function renderSessionsSection(card){
 // Every failure mode below used to surface as the same silence. Each state is
 // now named explicitly, with the specific next step for that state, because
 // "notifications don't work" is otherwise undebuggable from the driver's side.
+// Which kinds of notification buzz this person's phone. Switching one off only
+// stops the push — the message still lands in the in-app list — and the choice
+// belongs to the person, not the device, so it follows them to a new phone.
+async function renderNotificationPrefs(card){
+  let items;
+  try{ items = (await api("/notification-prefs", {background:true})).items; }
+  catch(e){ card.innerHTML = ""; card.appendChild(el(`<div class="empty">โหลดการตั้งค่าไม่สำเร็จ</div>`)); return; }
+  card.innerHTML = `<div style="font-weight:700;font-size:13px;margin-bottom:2px;">เลือกเรื่องที่อยากให้เด้ง</div>
+    <div class="field-note" style="margin-bottom:4px;">ปิดแล้วเครื่องจะไม่เด้ง แต่ข้อความยังอยู่ในรายการแจ้งเตือนในแอป ไม่หายไป</div>`;
+  items.forEach(it=>{
+    const row = el(`<div class="nrow" role="switch" aria-checked="${it.enabled}">
+      <div><div class="nt">${escHtml(it.label)}</div><div class="nd">${escHtml(it.desc)}</div></div>
+      <div class="sw ${it.enabled ? "on" : ""}"></div>
+    </div>`);
+    row.onclick = async ()=>{
+      const sw = row.querySelector(".sw");
+      const next = !sw.classList.contains("on");
+      sw.classList.toggle("on", next);               // show it at once...
+      row.setAttribute("aria-checked", String(next));
+      try{
+        await api("/notification-prefs", {method:"PUT", body: JSON.stringify({category: it.key, enabled: next})});
+      }catch(e){                                     // ...and put it back if it did not save
+        sw.classList.toggle("on", !next);
+        row.setAttribute("aria-checked", String(!next));
+        toast(e.message || "บันทึกไม่สำเร็จ");
+      }
+    };
+    card.appendChild(row);
+  });
+}
+
 function pushDiagnosticsHTML(status){
   const rows = [
     ["ติดตั้งลงหน้าจอโฮม", isStandalone() ? "✅ ใช่" : (isIOS() ? "❌ ยัง (จำเป็นบน iPhone)" : "— ไม่จำเป็น")],
@@ -4984,10 +5031,10 @@ const BU_LIST = ["CDS","MUJI","PGE","RBS","SSP","GG","B2S","OFM","CMG","KMNY"];
 const KPI_LABEL = {
   total_jobs: "งานทั้งหมด", completed: "เสร็จสิ้น", in_progress: "กำลังทำ", overdue: "ค้างนาน (Overdue)",
   completion_rate: "อัตราสำเร็จ (%)", avg_process_time_minutes: "เวลาเฉลี่ย/งาน (นาที)",
-  qty_per_hour: "พาเลท/ชม.", qty_per_hour_per_person: "พาเลท/ชม./คน", people_utilization: "การใช้งานคน (%)", vehicle_utilization: "การใช้งานรถ (%)",
+  qty_per_hour: "พาเลท/ชม.", qty_per_hour_per_person: "พาเลท/ชม./คน",
 };
 const KPI_ORDER = ["total_jobs","completed","in_progress","overdue","completion_rate",
-  "avg_process_time_minutes","qty_per_hour","qty_per_hour_per_person","people_utilization","vehicle_utilization"];
+  "avg_process_time_minutes","qty_per_hour","qty_per_hour_per_person"];
 
 // Dashboard = "How are we performing?" — pure KPI/trend/export, no action buttons.
 async function renderAdminDashboard(main){
@@ -5019,6 +5066,14 @@ async function renderAdminDashboard(main){
   const perfCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
   main.appendChild(perfCard);
 
+  main.appendChild(el(`<div class="section-title">กำลังคน</div>`));
+  const headCard = el(`<div class="card" id="headcount-card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(headCard);
+
+  main.appendChild(el(`<div class="section-title">แยกตาม Cost center</div>`));
+  const ccCard = el(`<div class="card" id="cc-chart-card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(ccCard);
+
   main.appendChild(el(`<div class="section-title">ปริมาณงานตามเวลาที่เปิดงาน</div>`));
   const chartCard = el(`<div class="card" id="volume-chart-card"><div class="empty">กำลังโหลดกราฟ...</div></div>`);
   main.appendChild(chartCard);
@@ -5036,7 +5091,7 @@ async function renderAdminDashboard(main){
   main.appendChild(exportCard);
 
   const JOB_KEYS = ["total_jobs", "in_progress", "overdue", "completed", "completion_rate"];
-  const PERF_KEYS = ["avg_process_time_minutes", "qty_per_hour", "qty_per_hour_per_person", "people_utilization", "vehicle_utilization"];
+  const PERF_KEYS = ["avg_process_time_minutes", "qty_per_hour", "qty_per_hour_per_person"];
 
   function buildKpiGrid(ov, keys){
     const grid = el(`<div class="stat-grid"></div>`);
@@ -5062,6 +5117,16 @@ async function renderAdminDashboard(main){
       jobsCard.innerHTML = ""; jobsCard.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`));
       perfCard.innerHTML = ""; perfCard.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`));
     }
+    try{
+      const hc = await api(`/dashboard/headcount?period=${state.dashPeriod}`, {background:true});
+      headCard.innerHTML = "";
+      renderHeadcountCard(headCard, hc);
+    }catch(e){ headCard.innerHTML = ""; headCard.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`)); }
+    try{
+      const cc = await api(`/dashboard/cost-centers?period=${state.dashPeriod}`, {background:true});
+      ccCard.innerHTML = "";
+      renderCostCenterChart(ccCard, cc, state.dashPeriod);
+    }catch(e){ ccCard.innerHTML = ""; ccCard.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`)); }
     try{
       const vol = await api(`/dashboard/volume-buckets?period=${state.dashPeriod}`, {background:true});
       chartCard.innerHTML = "";
@@ -5103,6 +5168,184 @@ function niceMax(v){
   const mag = Math.pow(10, Math.floor(Math.log10(Math.max(1, v))));
   const r = v / mag;
   return (r <= 1 ? 1 : r <= 2 ? 2 : r <= 5 ? 5 : 10) * mag;
+}
+
+// One row per cost centre: how much work it opened in the period, as a bar split
+// by where those jobs stand now (same four groups and colours as the volume
+// chart, so "not green" means the same thing in both). Longest bar first; the
+// bars share one scale so they can be compared by eye. Tap a row for its jobs.
+// Who turned up: today's count, then one bar per day. A day counts when someone
+// boards a vehicle, opens the app or picks up a job; the total is the crew
+// accounts that exist now (there is no roster), so earlier days are shown as a
+// head count only. Days before the first record have no bar rather than a zero.
+function renderHeadcountCard(card, data){
+  const full = data.total > 0 ? Math.min(100, Math.round(data.today / data.total * 100)) : 0;
+  card.appendChild(el(`<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;">
+    <span style="font-size:34px;font-weight:800;line-height:1;">${data.today}</span>
+    <span style="font-size:16px;color:var(--ink-dim);">/ ${data.total} คน</span>
+    <span class="field-note" style="margin-left:auto;">มาทำงานวันนี้ (${full}%)</span>
+  </div>`));
+  card.appendChild(el(`<div style="height:8px;border-radius:4px;background:var(--panel-2);overflow:hidden;margin-bottom:8px;">
+    <div style="width:${full}%;height:100%;background:var(--green);"></div></div>`));
+  card.appendChild(el(`<div class="field-note" style="margin-bottom:12px;">นับตั้งแต่ขึ้นรถ เปิดแอป หรือรับงานครั้งแรกของวัน</div>`));
+
+  const n = data.days.length;
+  const W = 340, H = 120, padT = 16, padB = 18, padL = 4, padR = 4;
+  const plotH = H - padT - padB, plotW = W - padL - padR;
+  const gap = n > 10 ? 2 : 8;
+  const barW = (plotW - gap * (n - 1)) / n;
+  const top = Math.max(1, data.total, ...data.days.map(d=> d.present || 0));
+  const every = n <= 8 ? 1 : 5;
+  let svg = `<line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="var(--line)"></line>`;
+  data.days.forEach((d, i)=>{
+    const x = padL + i * (barW + gap);
+    const isToday = i === n - 1;
+    const hasData = d.present !== null && d.present !== undefined;
+    svg += `<rect class="hc-hit" data-i="${i}" x="${(x - gap/2).toFixed(1)}" y="${padT}" width="${(barW + gap).toFixed(1)}" height="${plotH + padB}" fill="transparent" style="cursor:${hasData && d.present ? "pointer" : "default"};"></rect>`;
+    if(hasData){
+      const h = d.present / top * plotH;
+      svg += `<rect x="${x.toFixed(1)}" y="${(padT + plotH - h).toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(h, d.present ? 1 : 0).toFixed(1)}" rx="2" fill="${isToday ? "var(--green)" : "var(--amber)"}" pointer-events="none"></rect>`;
+      if(n <= 10 || isToday) svg += `<text x="${(x + barW/2).toFixed(1)}" y="${(padT + plotH - h - 3).toFixed(1)}" font-size="9" font-weight="700" fill="var(--ink)" text-anchor="middle" pointer-events="none">${d.present}</text>`;
+    }else{
+      svg += `<line x1="${(x + 2).toFixed(1)}" y1="${padT + plotH - 2}" x2="${(x + barW - 2).toFixed(1)}" y2="${padT + plotH - 2}" stroke="var(--line)" stroke-dasharray="2 2" pointer-events="none"></line>`;
+    }
+    if(i % every === 0 || isToday){
+      svg += `<text x="${(x + barW/2).toFixed(1)}" y="${H - 5}" font-size="8" fill="var(--ink-dim)" text-anchor="middle" pointer-events="none">${d.label}</text>`;
+    }
+  });
+  const svgEl = el(`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;" role="img"
+    aria-label="จำนวนคนที่มาทำงานรายวัน">${svg}</svg>`);
+  svgEl.addEventListener("click", (ev)=>{
+    const t = ev.target.closest(".hc-hit");
+    if(!t) return;
+    const d = data.days[Number(t.dataset.i)];
+    if(d && d.present) openHeadcountDaySheet(d);
+  });
+  card.appendChild(svgEl);
+  if(data.days.some(d=> d.present === null || d.present === undefined) && data.since){
+    const [, m, dd] = data.since.split("-");
+    card.appendChild(el(`<div class="field-note" style="margin-top:6px;">เริ่มเก็บข้อมูลการมาทำงานตั้งแต่ ${Number(dd)}/${Number(m)} — วันก่อนหน้านั้นไม่มีข้อมูล</div>`));
+  }else if(!data.since){
+    card.appendChild(el(`<div class="field-note" style="margin-top:6px;">ยังไม่มีข้อมูล จะเริ่มนับเมื่อมีคนขับเปิดแอปหรือขึ้นรถ</div>`));
+  }
+  card.appendChild(el(`<div class="field-note" style="margin-top:4px;">กดแท่งเพื่อดูรายชื่อคนที่มาในวันนั้น</div>`));
+}
+
+async function openHeadcountDaySheet(day){
+  const overlay = el(`
+    <div class="sheet-overlay">
+      <div class="sheet">
+        <div class="sheet-head"><h2>คนที่มาทำงาน ${escHtml(day.label)}</h2><button class="sheet-close">✕</button></div>
+        <div id="hc-body"><div class="empty">กำลังโหลด...</div></div>
+      </div>
+    </div>
+  `);
+  document.body.appendChild(overlay);
+  overlay.querySelector(".sheet-close").onclick = ()=> closeSheet(overlay);
+  overlay.onclick = (e)=>{ if(e.target === overlay) closeSheet(overlay); };
+  const body = overlay.querySelector("#hc-body");
+  try{
+    const res = await api(`/dashboard/headcount-day?date=${encodeURIComponent(day.date)}`);
+    body.innerHTML = "";
+    body.appendChild(el(`<div class="field-note" style="margin-bottom:8px;"><b>${res.people.length}</b> คน (เวลาที่เริ่มต้นวันของแต่ละคน)</div>`));
+    if(!res.people.length) body.appendChild(el(`<div class="empty">ไม่มีข้อมูล</div>`));
+    res.people.forEach(p=>{
+      body.appendChild(el(`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
+        padding:10px;margin-bottom:6px;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;">
+        <div style="min-width:0;"><div style="font-weight:700;font-size:14px;">${escHtml(p.full_name)}</div>
+          <div class="field-note">${escHtml(p.employee_id)}</div></div>
+        <div style="flex:none;text-align:right;"><div style="font-weight:700;font-size:13px;">${escHtml(p.time)} น.</div>
+          <div class="field-note">${escHtml(p.source)}</div></div>
+      </div>`));
+    });
+  }catch(e){
+    body.innerHTML = "";
+    body.appendChild(el(`<div class="empty">โหลดรายชื่อไม่สำเร็จ</div>`));
+  }
+}
+
+const CC_TOP_N = 8;
+function renderCostCenterChart(card, data, period){
+  if(!state.ccMetric) state.ccMetric = "pallets";
+  const metric = state.ccMetric;
+  const unit = metric === "jobs" ? "งาน" : "พาเลท";
+  const keys = data.groups.map(g=> g.key);
+  const sum = (o)=> keys.reduce((t,k)=> t + (o[k]||0), 0);
+
+  const toggle = el(`<div class="chip-row" style="margin-bottom:10px;">
+    <button class="chip ${metric === "jobs" ? "active" : ""}" data-metric="jobs">จำนวนงาน</button>
+    <button class="chip ${metric === "pallets" ? "active" : ""}" data-metric="pallets">จำนวนพาเลท</button>
+  </div>`);
+  toggle.querySelectorAll("[data-metric]").forEach(b=> b.onclick = ()=>{
+    state.ccMetric = b.dataset.metric;
+    card.innerHTML = "";
+    renderCostCenterChart(card, data, period);
+  });
+  card.appendChild(toggle);
+
+  const totalJobs = sum(data.totals.jobs), totalPallets = sum(data.totals.pallets);
+  if(!data.items.length || !totalJobs){
+    card.appendChild(el(`<div class="empty">ยังไม่มีงานในช่วงนี้</div>`));
+    return;
+  }
+  card.appendChild(el(`<div class="field-note" style="margin-bottom:8px;">
+    ทุก cost center รวม <b>${totalPallets}</b> พาเลท · <b>${totalJobs}</b> งาน (เรียงจากมากไปน้อย)</div>`));
+  card.appendChild(el(`<div class="field-note" style="margin-bottom:12px;">${data.groups.map(g=>
+    `<span style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;">
+       <span style="width:9px;height:9px;border-radius:2px;background:${VOLUME_COLORS[g.key]};"></span>${escHtml(g.label)}</span>`
+  ).join("")}</div>`));
+
+  // Biggest first by the measure on screen; ties fall back to the other measure
+  // and then the code so the order never jumps between refreshes.
+  const other = metric === "jobs" ? "pallets" : "jobs";
+  const items = data.items.slice().sort((a,b)=>
+    sum(b[metric]) - sum(a[metric]) || sum(b[other]) - sum(a[other]) || String(a.code).localeCompare(String(b.code)));
+  const max = Math.max(1, ...items.map(i=> sum(i[metric])));
+  const list = el(`<div></div>`);
+  card.appendChild(list);
+
+  function labelOf(i){
+    if(i.code === data.no_cost_center) return `<b>ไม่ระบุ</b> <span style="color:var(--ink-dim);">งานที่ไม่มี cost center</span>`;
+    return `<b style="font-family:'JetBrains Mono',monospace;">${escHtml(i.code)}</b>${i.name
+      ? ` <span style="color:var(--ink-dim);">${escHtml(i.name)}</span>` : ""}`;
+  }
+  function rowOf(i){
+    const tot = sum(i[metric]);
+    const segs = keys.map(k=>{
+      const v = i[metric][k] || 0;
+      return v > 0 ? `<div style="width:${(v / max * 100).toFixed(2)}%;background:${VOLUME_COLORS[k]};height:100%;"></div>` : "";
+    }).join("");
+    const row = el(`<div style="margin-bottom:12px;cursor:pointer;">
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:13px;line-height:1.3;margin-bottom:4px;">
+        <span style="min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${labelOf(i)}</span>
+        <span style="flex:none;"><b>${tot}</b> <span style="color:var(--ink-dim);font-size:11px;">${unit} · ${metric === "jobs"
+          ? sum(i.pallets) + " พาเลท" : sum(i.jobs) + " งาน"}</span></span>
+      </div>
+      <div style="height:14px;border-radius:4px;background:var(--panel-2);overflow:hidden;display:flex;">${segs}</div>
+    </div>`);
+    row.onclick = ()=> openJobListSheet({
+      title: i.code === data.no_cost_center ? "งานที่ไม่มี cost center"
+        : `Cost center ${i.code}${i.name ? " " + i.name : ""}`,
+      groups: data.groups,
+      group: "all",
+      load: ()=> api(`/dashboard/cost-center-tasks?period=${period}&cc=${encodeURIComponent(i.code)}`),
+    });
+    return row;
+  }
+
+  let expanded = false;
+  function draw(){
+    list.innerHTML = "";
+    (expanded ? items : items.slice(0, CC_TOP_N)).forEach(i=> list.appendChild(rowOf(i)));
+    if(items.length > CC_TOP_N){
+      const more = el(`<button class="btn" style="width:100%;margin-bottom:8px;">${expanded
+        ? "แสดงเฉพาะ " + CC_TOP_N + " อันดับแรก" : "ดูทั้งหมด (" + items.length + " cost center)"}</button>`);
+      more.onclick = ()=>{ expanded = !expanded; draw(); };
+      list.appendChild(more);
+    }
+  }
+  draw();
+  card.appendChild(el(`<div class="field-note" style="margin-top:4px;">กดแถวเพื่อดูรายการงานของ cost center นั้น</div>`));
 }
 
 const VOLUME_COLORS = {
@@ -5244,15 +5487,27 @@ function renderVolumeChart(card, data){
 // The jobs behind one bar. Opened from a tap on the chart: a tap on a coloured
 // segment lands on that group, a tap on the rest of the slot shows everything
 // opened in it. Tapping a job opens its own screen on top of this one.
-async function openVolumeBucketSheet(data, idx, group){
+function openVolumeBucketSheet(data, idx, group){
   const b = data.buckets[idx];
-  const title = data.period === "today"
-    ? `งานที่เปิดเวลา ${b.label}:00–${b.label}:59 น.`
-    : `งานที่เปิดวันที่ ${b.label}`;
+  openJobListSheet({
+    title: data.period === "today"
+      ? `งานที่เปิดเวลา ${b.label}:00–${b.label}:59 น.`
+      : `งานที่เปิดวันที่ ${b.label}`,
+    groups: data.groups,
+    group,
+    load: ()=> api(`/dashboard/volume-bucket-tasks?period=${data.period}&start=${encodeURIComponent(b.start)}`),
+  });
+}
+
+// The jobs behind one bar of a dashboard chart, as a sheet: status chips with
+// counts to narrow it, then the jobs; tapping a job opens its own screen on top.
+// `load` returns {tasks}, each carrying its status group, so changing group
+// costs no round-trip.
+async function openJobListSheet({title, groups, group, load}){
   const overlay = el(`
     <div class="sheet-overlay">
       <div class="sheet">
-        <div class="sheet-head"><h2>${title}</h2><button class="sheet-close">✕</button></div>
+        <div class="sheet-head"><h2>${escHtml(title)}</h2><button class="sheet-close">✕</button></div>
         <div id="vb-body"><div class="empty">กำลังโหลด...</div></div>
       </div>
     </div>
@@ -5264,7 +5519,7 @@ async function openVolumeBucketSheet(data, idx, group){
 
   let tasks;
   try{
-    const res = await api(`/dashboard/volume-bucket-tasks?period=${data.period}&start=${encodeURIComponent(b.start)}`);
+    const res = await load();
     tasks = res.tasks;
   }catch(e){
     body.innerHTML = "";
@@ -5282,7 +5537,7 @@ async function openVolumeBucketSheet(data, idx, group){
       chips.appendChild(c);
     };
     addChip("all", "ทั้งหมด", tasks.length);
-    data.groups.forEach(g=>{
+    groups.forEach(g=>{
       const n = tasks.filter(t=> t.group === g.key).length;
       if(n) addChip(g.key, g.label, n);
     });

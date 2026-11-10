@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, UploadFile, File
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse, Response
@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261106.1547"
+APP_VERSION = "TTLOD.261110.1511"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -346,14 +346,27 @@ _push_queue_var = contextvars.ContextVar("scdc_push_queue", default=None)
 
 def _flush_push_queue(jobs):
     """Runs after the response is delivered. Opens its own connection: the
-    request's was already committed and closed by then."""
+    request's was already committed and closed by then.
+
+    People are pushed to in parallel. A new job now reaches every driver, and
+    each push is a blocking HTTPS call to Google/Apple — one person after
+    another, a few dozen drivers would run past the time a serverless function
+    is allowed to live and the last of them would never be told."""
+    def _deliver(job):
+        user_id, title, body, url, tag = job
+        try:
+            with get_db() as db:
+                send_web_push_to_user(db, user_id, title, body, url, tag)
+        except Exception as e:
+            log.warning("Deferred push to user %s failed: %s", user_id, e)
+
     try:
-        with get_db() as db:
-            for user_id, title, body, url, tag in jobs:
-                try:
-                    send_web_push_to_user(db, user_id, title, body, url, tag)
-                except Exception as e:
-                    log.warning("Deferred push to user %s failed: %s", user_id, e)
+        if len(jobs) <= 1:
+            for j in jobs:
+                _deliver(j)
+        else:
+            with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as pool:
+                list(pool.map(_deliver, jobs))
     except Exception as e:
         # A push problem must never be able to surface as a request failure —
         # by this point the user already has their response.
@@ -1087,6 +1100,28 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     created_at TEXT NOT NULL
 );
 
+-- Which notification categories a person has switched OFF on their phone.
+-- Only a switched-off category has a row (enabled=0): no row means "on", so a
+-- new category — or a new account — starts on without anything to backfill.
+CREATE TABLE IF NOT EXISTS notification_prefs (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    category TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (user_id, category)
+);
+
+-- One row per crew member per working day, written the first time that day they
+-- do any of: board a vehicle, open the app, pick up a job. This is the only
+-- record of who turned up — driver_status says who is on a vehicle NOW and is
+-- overwritten as the day goes on. work_date is the Bangkok calendar date.
+CREATE TABLE IF NOT EXISTS crew_attendance (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    work_date TEXT NOT NULL,
+    first_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    PRIMARY KEY (user_id, work_date)
+);
+
 -- Small key/value table for server-wide settings that used to be stored as
 -- files (the VAPID private key, notably) — a database row survives exactly
 -- as long as the rest of the app's data does, unlike a file on disk, which
@@ -1262,7 +1297,7 @@ def _column_exists(db, table, column):
 # only when the database is FRESH, so a table added to SCHEMA alone would never
 # exist on the live one and every screen that touched it would 500. This runs
 # on every boot for both backends instead.
-NEW_TABLES = ("driver_zones", "zone_locations", "cost_centers")
+NEW_TABLES = ("driver_zones", "zone_locations", "cost_centers", "notification_prefs", "crew_attendance")
 
 
 def ensure_tables():
@@ -1371,7 +1406,7 @@ def register_cost_center(db, code: str) -> bool:
         return False
     db.execute("INSERT INTO cost_centers (code, name, pending, active, created_at) "
                "VALUES (?,NULL,1,1,?)", (code, now_iso()))
-    notify_ops(db, f"มี cost center ใหม่ {code} ถูกใช้งาน — ตั้งชื่อหรือปิดได้ในหน้าจัดการระบบ")
+    notify_ops(db, f"มี cost center ใหม่ {code} ถูกใช้งาน — ตั้งชื่อหรือปิดได้ในหน้าจัดการระบบ", cat="system")
     return True
 
 
@@ -1976,11 +2011,74 @@ def transition(db, task_row, to_status: str, changed_by: int, note: str = None):
         post_system_message(db, task_row["id"], changed_by, text)
 
 
-def notify(db, user_id: int, message: str, task_id: Optional[int] = None, kind: str = "task"):
+# What a person can switch off on their phone. Switching a category off stops
+# the PUSH only — the message is still saved to their in-app list, so nothing is
+# lost, it just stops buzzing. Which categories a person is offered depends on
+# their role: there is no point offering a driver "system" or "overdue".
+OPS_ROLES = ("ADMIN", "DISPATCH")
+_ALL_ROLES = ("ADMIN", "DISPATCH", "DRIVER", "USER")
+NOTIFICATION_CATEGORIES = (
+    # key, label, description by role group, roles offered the switch
+    ("new_job", "งานใหม่ที่เปิดเข้ามา", "มีคนเปิดงานใหม่", ("ADMIN", "DISPATCH", "DRIVER")),
+    ("mine", "งานของฉัน", "งานที่มอบหมายให้ฉัน และสถานะงานที่ฉันเป็นผู้ขอ", _ALL_ROLES),
+    ("progress", "ความคืบหน้างาน", "คนขับรับงาน เข้าร่วม ออกจากงาน และผู้ขอยืนยันงานเสร็จ", OPS_ROLES),
+    ("overdue", "งานค้างนาน", "งานรอนานเกินกำหนด หรือไม่มีคนขับ", OPS_ROLES),
+    ("problem", "ปัญหาและรถเสีย", "แจ้งเสีย หยุดชั่วคราว ปัญหาในงาน", OPS_ROLES),
+    ("chat", "ข้อความแชท", "ข้อความในงานและแชททีม", _ALL_ROLES),
+    ("headcount", "สรุปกำลังคนตอน 09:00", "จำนวนคนที่มาทำงานวันนี้", OPS_ROLES),
+    ("system", "เรื่องระบบ", "cost center ใหม่ คนขับสมัครใหม่ จุดใหม่ในโซน", OPS_ROLES),
+)
+# Per-role wording where the plain description would mislead.
+_CATEGORY_DESC_BY_ROLE = {
+    ("new_job", "DRIVER"): "มีคนเปิดงานใหม่ จะได้เห็นงานที่ว่างให้รับ",
+    ("mine", "DRIVER"): "งานที่มอบหมายให้ฉัน",
+    ("mine", "USER"): "สถานะงานที่ฉันเป็นผู้ขอ",
+}
+_CATEGORY_KEYS = {c[0] for c in NOTIFICATION_CATEGORIES}
+
+
+def categories_for_role(role: str):
+    return [c for c in NOTIFICATION_CATEGORIES if role in c[3]]
+
+
+# Passed as cat=None, a notification ignores the switches and always pushes —
+# for the admin's own broadcast announcements, which are not something a person
+# should be able to miss by having muted a category.
+_AUTO = object()
+
+
+def _notif_cat(kind: str, cat):
+    """No category given: chat is chat, everything else sent straight to one
+    person about their own job is "mine"."""
+    if cat is _AUTO:
+        return "chat" if kind in ("chat", "team_chat") else "mine"
+    return cat
+
+
+def users_muting(db, cat) -> set:
+    """Everyone who has switched this category off — fetched once and reused
+    when a notification goes to many people, rather than one lookup each."""
+    if not cat:
+        return set()
+    return {r["user_id"] for r in db.execute(
+        "SELECT user_id FROM notification_prefs WHERE category=? AND enabled=0", (cat,)).fetchall()}
+
+
+def notify(db, user_id: int, message: str, task_id: Optional[int] = None, kind: str = "task",
+           cat=_AUTO, muted: Optional[set] = None):
     db.execute(
         "INSERT INTO notifications (user_id, message, task_id, kind, created_at) VALUES (?,?,?,?,?)",
         (user_id, message, task_id, kind, now_iso()),
     )
+    cat = _notif_cat(kind, cat)
+    if muted is None:
+        muted = users_muting(db, cat)
+    if user_id in muted:
+        return    # kept in their list, just not pushed to the phone
+    _queue_push(db, user_id, message, task_id, kind)
+
+
+def _queue_push(db, user_id: int, message: str, task_id: Optional[int], kind: str):
     # The kind rides along so a tapped chat notification opens the chat and a
     # job notification opens the job, the same split the in-app list uses.
     push_url = f"/?task={task_id}&kind={kind}" if (kind in ("task", "chat") and task_id) else "/"
@@ -2001,7 +2099,28 @@ def notify(db, user_id: int, message: str, task_id: Optional[int] = None, kind: 
         queue.append((user_id, "SCDC", message, push_url, tag))
 
 
-def notify_ops(db, message: str, task_id: Optional[int] = None, kind: str = "task"):
+def notify_many(db, recipients, task_id: Optional[int], kind: str, cat):
+    """Same message-per-person notify(), for a long list: the in-app rows go in
+    with one INSERT instead of one round-trip each (a new job reaches every
+    driver, and the database is not next door). recipients = [(user_id, text)]."""
+    if not recipients:
+        return
+    now = now_iso()
+    for i in range(0, len(recipients), 200):
+        chunk = recipients[i:i + 200]
+        db.execute(
+            "INSERT INTO notifications (user_id, message, task_id, kind, created_at) VALUES "
+            + ",".join(["(?,?,?,?,?)"] * len(chunk)),
+            tuple(v for uid, msg in chunk for v in (uid, msg, task_id, kind, now)),
+        )
+    muted = users_muting(db, cat)
+    for uid, msg in recipients:
+        if uid not in muted:
+            _queue_push(db, uid, msg, task_id, kind)
+
+
+def notify_ops(db, message: str, task_id: Optional[int] = None, kind: str = "task",
+               cat: str = "progress", exclude_user_id: Optional[int] = None):
     """Everyone who runs the floor — admins AND dispatchers.
 
     This used to be notify_admins() and selected role='ADMIN' only, which left
@@ -2010,11 +2129,33 @@ def notify_ops(db, message: str, task_id: Optional[int] = None, kind: str = "tas
     without that filter, someone who has left the company keeps receiving job
     notifications on their own phone, because a soft-deleted row still has live
     push subscriptions.
+
+    `cat` is the switch a person can turn off (see NOTIFICATION_CATEGORIES);
+    most of what ops are told is a job moving along, hence the default.
     """
+    muted = users_muting(db, cat)
     for a in db.execute(
         "SELECT id FROM users WHERE role IN ('ADMIN','DISPATCH') AND deleted_at IS NULL"
     ).fetchall():
-        notify(db, a["id"], message, task_id, kind)
+        if a["id"] == exclude_user_id:
+            continue
+        notify(db, a["id"], message, task_id, kind, cat=cat, muted=muted)
+
+
+def notify_new_job(db, task_id: int, code: str, creator, from_loc: str, to_loc: str, pallets):
+    """A job was opened: tell everyone who could act on it — admins, dispatchers
+    and every driver — except the person who just opened it. Switchable per
+    person under "new_job"."""
+    ops_msg = f"งานใหม่ {code} สร้างโดย {person_name(creator)}"
+    drv_msg = f"งานใหม่ {code} · {from_loc} → {to_loc} · {pallets} พาเลท"
+    recipients = []
+    for r in db.execute(
+        "SELECT id, role FROM users WHERE role IN ('ADMIN','DISPATCH','DRIVER') AND deleted_at IS NULL"
+    ).fetchall():
+        if r["id"] == creator["id"]:
+            continue
+        recipients.append((r["id"], drv_msg if r["role"] == "DRIVER" else ops_msg))
+    notify_many(db, recipients, task_id, "task", "new_job")
 
 
 
@@ -2159,7 +2300,7 @@ def check_waiting_too_long(db):
         "SELECT * FROM tasks WHERE status='Waiting' AND waiting_alert_sent=0 AND created_at<?", (cutoff,)
     ).fetchall()
     for t in rows:
-        notify_ops(db, f"งาน {t['task_code']} รอนานเกิน {WAITING_TOO_LONG_MINUTES} นาทีแล้ว", t["id"])
+        notify_ops(db, f"งาน {t['task_code']} รอนานเกิน {WAITING_TOO_LONG_MINUTES} นาทีแล้ว", t["id"], cat="overdue")
         db.execute("UPDATE tasks SET waiting_alert_sent=1 WHERE id=?", (t["id"],))
 
 
@@ -2494,7 +2635,7 @@ def register(body: RegisterBody):
                        "ON CONFLICT DO NOTHING", (user_id, licence))
             # Anyone who knows the code can make themselves a driver, so every
             # use is announced instead of happening silently.
-            notify_ops(db, f"{full_name or body.employee_id} สมัครเป็นคนขับด้วยรหัสเชิญ (ใบอนุญาต {licence})")
+            notify_ops(db, f"{full_name or body.employee_id} สมัครเป็นคนขับด้วยรหัสเชิญ (ใบอนุญาต {licence})", cat="system")
             audit(db, user_id, "register_with_invite_code", f"{body.employee_id} -> DRIVER {licence}")
         return {"ok": True, "reactivated": bool(existing), "role": role, "license": licence}
 
@@ -2548,6 +2689,10 @@ def me(user=Depends(current_user)):
                     "ON v.id = dl.default_vehicle_id AND v.retired_at IS NULL "
                     "WHERE dl.driver_id=? ORDER BY dl.vehicle_type", (user["id"],)).fetchall()
             ]
+        # Opening the app is one of the ways of turning up for the day. A
+        # dispatcher only counts as crew if they hold a licence.
+        if user["role"] == "DRIVER" or out["licenses"]:
+            touch_attendance(user["id"], "app")
     return out
 
 
@@ -3137,7 +3282,7 @@ def add_cost_center(body: CostCenterBody, user=Depends(current_user)):
         audit(db, user["id"], "add_cost_center", f"{code}" + (f" ({name})" if name else ""))
         if not is_admin:
             notify_ops(db, f"{person_name(user)} เพิ่ม cost center {code}"
-                           + (f" ({name})" if name else "") + " — ตรวจได้ในหน้าจัดการระบบ")
+                           + (f" ({name})" if name else "") + " — ตรวจได้ในหน้าจัดการระบบ", cat="system")
         return {"ok": True, "code": code, "pending": not is_admin}
 
 
@@ -3269,7 +3414,7 @@ def request_zone_location(zone_key: str, body: ZoneLocationBody, user=Depends(cu
             (zone_key, code, (body.label or "").strip() or None, order, now_iso()))
         audit(db, user["id"], "request_zone_location", f"{zone_key}: {code}")
         notify_ops(db, f"{person_name(user)} เพิ่มจุด {code} ในโซน {zone['zone_name_th']} "
-                       f"— ตรวจได้ในหน้าจัดการระบบ")
+                       f"— ตรวจได้ในหน้าจัดการระบบ", cat="system")
         return {"ok": True, "code": code, "pending": True}
 
 
@@ -3635,7 +3780,7 @@ def create_task(body: TaskCreate, user=Depends(require_role("USER", "ADMIN", "DI
             "INSERT INTO task_status_history (task_id, from_status, to_status, changed_by, changed_at) "
             "VALUES (?,?,?,?,?)", (task_id, None, "Waiting", user["id"], now_iso()),
         )
-        notify_ops(db, f"งานใหม่ {code} สร้างโดย {person_name(user)}", task_id)
+        notify_new_job(db, task_id, code, user, from_location, to_location, body.pallet_qty)
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         result = task_to_dict(row, db, viewer_role=user["role"])
         available = db.execute(
@@ -4279,6 +4424,7 @@ def self_assign_task(task_id: int, body: SelfAssignBody, user=Depends(require_cr
                    (now_iso(), body.battery_level, task_id))
         if body.battery_level is not None:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
+        record_attendance(db, user["id"], "job")
         notify_ops(db, f"คนขับ {person_name(user)} รับงาน {row['task_code']} ด้วยตัวเอง", task_id)
         return {"ok": True}
 
@@ -4311,6 +4457,7 @@ def take_over_task(task_id: int, body: SelfAssignBody, user=Depends(require_crew
                    (now_iso(), body.battery_level, task_id))
         if body.battery_level is not None:
             db.execute("UPDATE vehicles SET battery_level=? WHERE id=?", (body.battery_level, vehicle["id"]))
+        record_attendance(db, user["id"], "job")
         notify_ops(db, f"คนขับ {person_name(user)} รับช่วงงาน {row['task_code']}", task_id)
         return {"ok": True}
 
@@ -4338,6 +4485,7 @@ def accept_task(task_id: int, body: AcceptBody, user=Depends(require_crew())):
                 db.execute("UPDATE vehicles SET battery_level=? WHERE id=?",
                            (body.battery_level, row["current_vehicle_id"]))
         notify(db, row["requester_id"], f"คนขับกดรับงาน {row['task_code']} แล้ว", task_id)
+        record_attendance(db, user["id"], "job")
         notify_ops(db, f"คนขับ {person_name(user)} กดรับงาน {row['task_code']}", task_id)
         return {"ok": True}
 
@@ -4513,6 +4661,7 @@ def join_task(task_id: int, body: JoinTaskBody, user=Depends(require_crew())):
                             f"{person_label(db, user['id'])} เข้าร่วมงาน"
                             + ("" if takes_it_up else " (อยู่ในคิวงานของเขา)"))
         notify(db, row["requester_id"], f"คนขับ {person_name(user)} เข้าร่วมงาน {row['task_code']}", task_id)
+        record_attendance(db, user["id"], "job")
         notify_ops(db, f"คนขับ {person_name(user)} เข้าร่วมงาน {row['task_code']}", task_id)
         return {"ok": True}
 
@@ -4595,7 +4744,7 @@ def leave_task(task_id: int, user=Depends(require_crew())):
                 (task_id,),
             )
             transition(db, row, "Waiting", user["id"], note="Last driver left before starting")
-            notify_ops(db, f"งาน {row['task_code']} ไม่มีคนขับแล้ว กลับไปรอมอบหมายใหม่", task_id)
+            notify_ops(db, f"งาน {row['task_code']} ไม่มีคนขับแล้ว กลับไปรอมอบหมายใหม่", task_id, cat="overdue")
             return {"ok": True}
         if row["current_driver_id"] == user["id"]:
             nxt = db.execute(
@@ -4683,7 +4832,7 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
             for a in db.execute("SELECT driver_id FROM task_assignments WHERE task_id=? "
                                 "AND assignment_status='Active'", (task_id,)).fetchall():
                 notify(db, a["driver_id"], f"งาน {row['task_code']} มีเหตุขัดข้อง: {body.reason}", task_id)
-            notify_ops(db, f"งาน {row['task_code']} ขัดข้องฝั่งผู้ขอ: {body.reason}", task_id)
+            notify_ops(db, f"งาน {row['task_code']} ขัดข้องฝั่งผู้ขอ: {body.reason}", task_id, cat="problem")
             return {"ok": True}
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -4708,7 +4857,7 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
         if body.category == "user":
             transition(db, row, "Pause", user["id"], note=note)
             notify(db, row["requester_id"], f"งาน {row['task_code']} หยุดชั่วคราว: {body.reason}", task_id)
-            notify_ops(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งผู้ขอ): {body.reason}", task_id)
+            notify_ops(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งผู้ขอ): {body.reason}", task_id, cat="problem")
             return {"ok": True}
 
         # A vehicle problem only stops the reporting driver. If someone else
@@ -4721,7 +4870,7 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
         if others == 0:
             transition(db, row, "Pause", user["id"], note=note)
             notify(db, row["requester_id"], f"งาน {row['task_code']} หยุดชั่วคราว: {body.reason}", task_id)
-            notify_ops(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งรถ): {body.reason}", task_id)
+            notify_ops(db, f"งาน {row['task_code']} หยุดชั่วคราว (ฝั่งรถ): {body.reason}", task_id, cat="problem")
             return {"ok": True}
 
         # Others remain active: step this driver back (like /leave) and flag
@@ -4758,7 +4907,7 @@ def pause_task(task_id: int, body: PauseBody, user=Depends(current_user)):
                f"คนขับ {person_name(user)} แจ้งปัญหารถในงาน {row['task_code']} "
                f"({body.reason}) — งานยังดำเนินต่อโดยคนขับที่เหลือ", task_id)
         notify_ops(db, f"แจ้งปัญหารถในงาน {row['task_code']} โดย {person_name(user)}: "
-                          f"{body.reason} (งานยังดำเนินการอยู่ เหลือคนขับ {others} คน)", task_id)
+                          f"{body.reason} (งานยังดำเนินการอยู่ เหลือคนขับ {others} คน)", task_id, cat="problem")
         return {"ok": True}
 
 
@@ -5553,7 +5702,7 @@ def set_driver_status(body: DriverStatusBody, user=Depends(require_crew())):
     with get_db() as db:
         db.execute("UPDATE users SET driver_status=? WHERE id=?", (body.status, user["id"]))
         if body.status == "Breakdown":
-            notify_ops(db, f"คนขับ {person_name(user)} แจ้งสถานะรถเสีย")
+            notify_ops(db, f"คนขับ {person_name(user)} แจ้งสถานะรถเสีย", cat="problem")
         return {"ok": True}
 
 
@@ -5646,6 +5795,7 @@ def vehicle_check_in(body: CheckInBody, user=Depends(require_crew())):
             recompute_driver_status(db, user["id"])
         audit(db, user["id"], "vehicle_check_in",
               body.vehicle_code + (f" battery={body.battery_level}%" if body.battery_level is not None else ""))
+        record_attendance(db, user["id"], "vehicle")
         return {"ok": True}
 
 
@@ -5933,7 +6083,7 @@ def report_breakdown(body: BreakdownBody, user=Depends(require_crew())):
             "VALUES (?,?,?,?,?,?,?)",
             (body.target_type, target_id, label, body.description, user["id"], "Open", now_iso()),
         )
-        notify_ops(db, f"แจ้งเสีย: {'คนขับ' if body.target_type == 'driver' else 'รถ'} {label} โดย {person_name(user)}")
+        notify_ops(db, f"แจ้งเสีย: {'คนขับ' if body.target_type == 'driver' else 'รถ'} {label} โดย {person_name(user)}", cat="problem")
         return {"ok": True}
 
 
@@ -6017,7 +6167,7 @@ def broadcast_notification(body: BroadcastBody, user=Depends(require_ops())):
         # The sender does not need their own announcement back.
         targets = [t for t in targets if t["id"] != user["id"]]
         for t in targets:
-            notify(db, t["id"], f"[แอดมิน] {message}")
+            notify(db, t["id"], f"[แอดมิน] {message}", cat=None)
         audit(db, user["id"], "broadcast", f"{body.role}: {message}")
         return {"ok": True, "sent_to": len(targets)}
 
@@ -6123,6 +6273,37 @@ def push_test(user=Depends(current_user)):
     if result["sent"] == 0:
         raise HTTPException(502, result["reason"])
     return {"ok": True, "sent": result["sent"], "attempted": result["attempted"]}
+
+
+class NotificationPrefBody(BaseModel):
+    category: str
+    enabled: bool
+
+
+@app.get("/notification-prefs")
+def get_notification_prefs(user=Depends(current_user)):
+    """The switches this person is offered (by role), and which are on."""
+    with get_db() as db:
+        off = {r["category"] for r in db.execute(
+            "SELECT category FROM notification_prefs WHERE user_id=? AND enabled=0", (user["id"],)).fetchall()}
+    return {"items": [
+        {"key": k, "label": label, "enabled": k not in off,
+         "desc": _CATEGORY_DESC_BY_ROLE.get((k, user["role"]), desc)}
+        for k, label, desc, _roles in categories_for_role(user["role"])
+    ]}
+
+
+@app.put("/notification-prefs")
+def set_notification_pref(body: NotificationPrefBody, user=Depends(current_user)):
+    if body.category not in {c[0] for c in categories_for_role(user["role"])}:
+        raise HTTPException(400, "ไม่มีหมวดการแจ้งเตือนนี้")
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO notification_prefs (user_id, category, enabled) VALUES (?,?,?) "
+            "ON CONFLICT (user_id, category) DO UPDATE SET enabled = excluded.enabled",
+            (user["id"], body.category, 1 if body.enabled else 0),
+        )
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -6380,11 +6561,254 @@ def dashboard_volume_bucket_tasks(period: str = "today", start: str = "", user=D
     return {"period": period, "start": start, "tasks": tasks}
 
 
+def _dash_window_start_bkk(period: str) -> datetime:
+    """Start of the dashboard's period as a Bangkok wall-clock datetime — the
+    same window the volume chart draws: today since midnight, this week and
+    this month as the last 7 / 30 calendar days including today."""
+    if period not in ("today", "week", "month"):
+        raise HTTPException(400, "period ต้องเป็น today, week หรือ month")
+    now_bkk = datetime.utcnow() + BKK_OFFSET
+    days = {"today": 1, "week": 7, "month": 30}[period]
+    return (now_bkk - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+NO_COST_CENTER = "_none"
+
+
+@app.get("/dashboard/cost-centers")
+def dashboard_cost_centers(period: str = "today", user=Depends(require_ops())):
+    """Work opened in the period, split by the cost centre it is charged to.
+
+    Same window and the same four status groups as the volume chart, so a bar
+    here and a bar there agree on what "still outstanding" means. Both measures
+    come back together so the screen's งาน/พาเลท switch needs no round-trip.
+    Jobs with no cost centre are kept as their own row rather than dropped —
+    otherwise the rows would not add up to the totals shown elsewhere.
+    """
+    since_utc = (_dash_window_start_bkk(period) - BKK_OFFSET).isoformat(timespec="seconds") + "Z"
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT cost_center, status, COUNT(*) n, COALESCE(SUM(pallet_qty), 0) p "
+            "FROM tasks WHERE created_at >= ? GROUP BY cost_center, status",
+            (since_utc,),
+        ).fetchall()
+        names = {r["code"]: r["name"] for r in db.execute("SELECT code, name FROM cost_centers").fetchall()}
+    by_cc = {}
+    for r in rows:
+        g = _GROUP_OF.get(r["status"])
+        if not g:
+            continue
+        code = (r["cost_center"] or "").strip() or NO_COST_CENTER
+        e = by_cc.setdefault(code, {
+            "code": code,
+            "name": "" if code == NO_COST_CENTER else (names.get(code) or ""),
+            "jobs": {k: 0 for k, _, _ in VOLUME_GROUPS},
+            "pallets": {k: 0 for k, _, _ in VOLUME_GROUPS},
+        })
+        e["jobs"][g] += int(r["n"] or 0)
+        e["pallets"][g] += int(r["p"] or 0)
+    items = list(by_cc.values())
+    totals = {m: {k: sum(i[m][k] for i in items) for k, _, _ in VOLUME_GROUPS} for m in ("jobs", "pallets")}
+    return {
+        "period": period,
+        "no_cost_center": NO_COST_CENTER,
+        "items": items,
+        "totals": totals,
+        "groups": [{"key": k, "label": lbl} for k, lbl, _ in VOLUME_GROUPS],
+    }
+
+
+@app.get("/dashboard/cost-center-tasks")
+def dashboard_cost_center_tasks(period: str = "today", cc: str = "", user=Depends(require_ops())):
+    """The jobs behind one row of the cost-centre chart. `cc` is the row's
+    `code` exactly as /dashboard/cost-centers returned it (NO_COST_CENTER for
+    jobs charged to none). Every job comes back with its status group and the
+    screen narrows to a group itself, as it does for the volume chart."""
+    if not cc:
+        raise HTTPException(400, "ต้องระบุ cc")
+    since_utc = (_dash_window_start_bkk(period) - BKK_OFFSET).isoformat(timespec="seconds") + "Z"
+    sql = ("SELECT id, task_code, status, pallet_qty, task_type, from_location, to_location, created_at "
+           "FROM tasks WHERE created_at >= ? AND ")
+    if cc == NO_COST_CENTER:
+        sql += "(cost_center IS NULL OR TRIM(cost_center) = '')"
+        args = (since_utc,)
+    else:
+        sql += "cost_center = ?"
+        args = (since_utc, cc)
+    with get_db() as db:
+        rows = db.execute(sql + " ORDER BY created_at DESC LIMIT 500", args).fetchall()
+    tasks = []
+    for r in rows:
+        g = _GROUP_OF.get(r["status"])
+        if not g:
+            continue
+        at = _to_bkk(r["created_at"])
+        tasks.append({
+            "id": r["id"], "task_code": r["task_code"], "status": r["status"], "group": g,
+            "pallet_qty": int(r["pallet_qty"] or 0), "task_type": r["task_type"],
+            "from_location": r["from_location"], "to_location": r["to_location"],
+            "created_local": at.isoformat(timespec="minutes") if at else None,
+        })
+    return {"period": period, "cc": cc, "tasks": tasks}
+
+
+# ---------------------------------------------------------------------------
+# Crew attendance — who turned up each day
+# ---------------------------------------------------------------------------
+# "Turned up" means the first time that day they board a vehicle, open the app,
+# or pick up a job — whichever comes first. A crew member is a driver, or a
+# dispatcher who holds a licence (the same definition the rest of the app uses
+# for "can be put on a job"). Pending accounts that never set a password are
+# not counted: they are an invitation, not a person who could have come in.
+CREW_MEMBER_SQL = (
+    "(users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS "
+    "(SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) "
+    "AND users.deleted_at IS NULL AND users.password_hash <> ?"
+)
+ATTENDANCE_SOURCE_TH = {"vehicle": "ขึ้นรถ", "app": "เปิดแอป", "job": "รับงาน"}
+
+
+def bkk_today() -> str:
+    return (datetime.utcnow() + BKK_OFFSET).strftime("%Y-%m-%d")
+
+
+def record_attendance(db, user_id: int, source: str):
+    """Idempotent: the first event of the day wins, later ones change nothing."""
+    db.execute(
+        "INSERT INTO crew_attendance (user_id, work_date, first_at, source) VALUES (?,?,?,?) "
+        "ON CONFLICT (user_id, work_date) DO NOTHING",
+        (user_id, bkk_today(), now_iso(), source),
+    )
+
+
+_attendance_seen = set()
+
+
+def touch_attendance(user_id: int, source: str):
+    """For read-only requests such as /me, which is hit constantly: remember in
+    this process that today is already recorded, and do the write on its own
+    connection so a problem here can never fail the request that triggered it."""
+    key = (user_id, bkk_today())
+    if key in _attendance_seen:
+        return
+    try:
+        with get_db() as db:
+            record_attendance(db, user_id, source)
+        if len(_attendance_seen) > 5000:
+            _attendance_seen.clear()
+        _attendance_seen.add(key)
+    except Exception as e:
+        log.warning("Could not record attendance for user %s: %s", user_id, e)
+
+
+def crew_total(db) -> int:
+    return db.execute(f"SELECT COUNT(*) n FROM users WHERE {CREW_MEMBER_SQL}",
+                      (PENDING_PASSWORD,)).fetchone()["n"]
+
+
+def crew_present_on(db, day: str) -> int:
+    return db.execute(
+        "SELECT COUNT(*) n FROM crew_attendance a JOIN users ON users.id = a.user_id "
+        f"WHERE a.work_date=? AND {CREW_MEMBER_SQL}", (day, PENDING_PASSWORD),
+    ).fetchone()["n"]
+
+
+@app.get("/dashboard/headcount")
+def dashboard_headcount(period: str = "today", user=Depends(require_ops())):
+    """Today's headcount and the days leading up to it.
+
+    The denominator is the crew accounts that exist NOW — the app has no roster
+    of who was rostered on which day, so a past day is shown as a count of who
+    turned up, not as a share of anything. Days before the first recorded
+    attendance come back as null (no data) rather than 0, which would read as
+    "nobody came".
+    """
+    if period not in ("today", "week", "month"):
+        raise HTTPException(400, "period ต้องเป็น today, week หรือ month")
+    n = 30 if period == "month" else 7
+    today = datetime.strptime(bkk_today(), "%Y-%m-%d")
+    dates = [(today - timedelta(days=n - 1 - i)).strftime("%Y-%m-%d") for i in range(n)]
+    with get_db() as db:
+        total = crew_total(db)
+        rows = db.execute(
+            "SELECT a.work_date, COUNT(*) n FROM crew_attendance a JOIN users ON users.id = a.user_id "
+            f"WHERE a.work_date >= ? AND a.work_date <= ? AND {CREW_MEMBER_SQL} GROUP BY a.work_date",
+            (dates[0], dates[-1], PENDING_PASSWORD),
+        ).fetchall()
+        since = db.execute("SELECT MIN(work_date) d FROM crew_attendance").fetchone()["d"]
+    by_day = {r["work_date"]: int(r["n"]) for r in rows}
+    days = []
+    for d in dates:
+        dt = datetime.strptime(d, "%Y-%m-%d")
+        days.append({
+            "date": d, "label": f"{dt.day}/{dt.month}",
+            "present": (by_day.get(d, 0) if since and d >= since else None),
+        })
+    return {"period": period, "total": total, "today": by_day.get(dates[-1], 0),
+            "since": since, "days": days}
+
+
+@app.get("/dashboard/headcount-day")
+def dashboard_headcount_day(date: str, user=Depends(require_ops())):
+    """Who turned up on one day, and what they did first."""
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "รูปแบบวันที่ไม่ถูกต้อง")
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT users.employee_id, users.full_name, a.first_at, a.source "
+            "FROM crew_attendance a JOIN users ON users.id = a.user_id "
+            f"WHERE a.work_date=? AND {CREW_MEMBER_SQL} ORDER BY a.first_at",
+            (date, PENDING_PASSWORD),
+        ).fetchall()
+    people = []
+    for r in rows:
+        at = _to_bkk(r["first_at"])
+        people.append({
+            "employee_id": r["employee_id"], "full_name": r["full_name"] or r["employee_id"],
+            "time": at.strftime("%H:%M") if at else "",
+            "source": ATTENDANCE_SOURCE_TH.get(r["source"], r["source"]),
+        })
+    return {"date": date, "people": people}
+
+
+@app.get("/cron/headcount-summary")
+def cron_headcount_summary(request: Request):
+    """Called by Vercel Cron every morning (see vercel.json): tells admins and
+    dispatchers how many crew have turned up so far today.
+
+    Vercel authenticates its own calls with `Authorization: Bearer $CRON_SECRET`,
+    so with the variable unset this refuses everyone — it is never open to the
+    public. It claims today's date in app_config before sending, so a retry or
+    a second invocation in the same day does not notify twice.
+    """
+    secret = os.environ.get("CRON_SECRET", "")
+    if not secret:
+        raise HTTPException(503, "ยังไม่ได้ตั้งค่า CRON_SECRET")
+    if not secrets.compare_digest(request.headers.get("authorization", ""), f"Bearer {secret}"):
+        raise HTTPException(401, "ไม่ได้รับอนุญาต")
+    today = bkk_today()
+    with get_db() as db:
+        claimed = db.execute(
+            "INSERT INTO app_config (key, value) VALUES ('headcount_push_date', ?) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value "
+            "WHERE app_config.value <> excluded.value RETURNING key", (today,),
+        ).fetchone()
+        if not claimed:
+            return {"ok": True, "skipped": "already_sent_today"}
+        present, total = crew_present_on(db, today), crew_total(db)
+        clock = (datetime.utcnow() + BKK_OFFSET).strftime("%H:%M")
+        notify_ops(db, f"วันนี้มีคนมาทำงาน {present} จาก {total} คน (ณ {clock} น.)",
+                   None, "headcount", cat="headcount")
+    return {"ok": True, "present": present, "total": total}
+
+
 @app.get("/dashboard/overview")
 def dashboard_overview(period: str = "today", user=Depends(require_ops())):
     """Management KPIs: 'how are we performing' — period-bound flow metrics with
     trend vs the immediately preceding period of equal length, plus live snapshot
-    metrics (in-progress/overdue/utilization) that don't have a meaningful trend."""
+    metrics (in-progress/overdue) that don't have a meaningful trend."""
     days = {"today": 1, "week": 7, "month": 30}.get(period, 1)
     now = datetime.utcnow()
     cur_start, cur_end = now - timedelta(days=days), now
@@ -6471,19 +6895,12 @@ def dashboard_overview(period: str = "today", user=Depends(require_ops())):
         ).fetchone()["n"]
         overdue = waiting_overdue + inprogress_overdue
 
-        total_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND deleted_at IS NULL").fetchone()["n"]
-        busy_drivers = db.execute("SELECT COUNT(*) n FROM users WHERE (users.role='DRIVER' OR (users.role='DISPATCH' AND EXISTS (SELECT 1 FROM driver_licenses dl WHERE dl.driver_id = users.id))) AND driver_status='Busy' AND deleted_at IS NULL").fetchone()["n"]
-        total_vehicles = db.execute("SELECT COUNT(*) n FROM vehicles").fetchone()["n"]
-        busy_vehicles = db.execute("SELECT COUNT(*) n FROM vehicles WHERE status='Busy'").fetchone()["n"]
-
         return {
             "period": period,
             "kpi": {
                 **cur,
                 "in_progress": in_progress,
                 "overdue": overdue,
-                "people_utilization": round(busy_drivers / total_drivers * 100, 1) if total_drivers else 0,
-                "vehicle_utilization": round(busy_vehicles / total_vehicles * 100, 1) if total_vehicles else 0,
             },
             "trend": trend,
         }
