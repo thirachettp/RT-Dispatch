@@ -7501,19 +7501,19 @@ def app_icon(size: int):
     if size not in ICON_SIZES:
         raise HTTPException(404, "ไม่มีไอคอนขนาดนี้")
     return Response(content=app_icon_png(size), media_type="image/png",
-                    headers={"Cache-Control": "public, max-age=604800"})
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/apple-touch-icon.png")
 def apple_touch_icon():
     return Response(content=app_icon_png(180), media_type="image/png",
-                    headers={"Cache-Control": "public, max-age=604800"})
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/favicon.ico")
 def favicon():
     return Response(content=app_icon_png(192), media_type="image/png",
-                    headers={"Cache-Control": "public, max-age=604800"})
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 BASE_MANIFEST = {
@@ -7528,9 +7528,9 @@ BASE_MANIFEST = {
     "background_color": "#f5f6f8",
     "theme_color": "#f5f6f8",
     "icons": [
-        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+        {"src": "/icon-192.png?v=2", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+        {"src": "/icon-512.png?v=2", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+        {"src": "/icon-512.png?v=2", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
     ],
 }
 

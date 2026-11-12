@@ -37,7 +37,7 @@ self.addEventListener("push", (event) => {
   const options = {
     body: data.body,
     // Served by the app itself, so it is there on every deployment.
-    icon: "/icon-192.png",
+    icon: "/icon-192.png?v=2",
     data: { url: data.url || "/" },
     // The server sends a tag per job (and one per chat thread). Every
     // notification used to share one fixed tag, which meant each new one
