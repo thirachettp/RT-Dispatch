@@ -98,6 +98,31 @@
     color:var(--ink-dim);line-height:1.5;margin-top:8px;}
   .card-meta .cm-who{color:var(--ink);font-weight:700;}
   .card-meta .cm-rate{color:var(--amber);letter-spacing:.06em;}
+  /* Card header, right side: status on top, when it was opened and how long ago
+     under it. One block, so "state of the job" reads as a single thing. */
+  .ct-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;min-width:0;}
+  .ct-when{display:flex;align-items:center;gap:6px;white-space:nowrap;}
+  .cm-dt{font-size:12.5px;font-weight:700;color:var(--ink);}
+  .cm-el{display:inline-flex;align-items:center;gap:4px;font-family:'JetBrains Mono',monospace;
+    font-size:11px;font-weight:700;background:var(--panel-2);color:#374151;border-radius:999px;padding:2px 8px;}
+  .cm-el.late{background:#fef3c7;color:#92400e;}
+  .cm-el-ico{display:block;width:12px;height:12px;}
+  .cm-el-ico svg{width:100%;height:100%;display:block;}
+  /* Info rows hang off one keyline: a 24px icon column that lines up with the
+     จาก / ไป labels above, so every row's text starts at the same x. */
+  .kl-row{display:flex;align-items:center;margin-top:4px;min-width:0;}
+  .kl-what{margin-top:7px;}
+  .kl-ico{flex:none;width:24px;display:flex;align-items:center;color:var(--ink-dim);}
+  .kl-ico svg{width:15px;height:15px;display:block;}
+  .kl-main{flex:1;min-width:0;display:flex;align-items:center;justify-content:space-between;gap:10px;}
+  .kl-l{display:flex;align-items:center;gap:6px;min-width:0;}
+  .kl-r{flex:none;font-size:12px;color:var(--ink-dim);}
+  .kl-r b{font-size:13px;color:var(--ink);}
+  .kl-t{min-width:0;font-size:12.5px;color:var(--ink-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .kl-t.strong{font-size:13px;font-weight:600;color:var(--ink);}
+  .bu-chip{flex:none;font-size:10px;font-weight:800;background:var(--amber-dim);color:#1d4ed8;border-radius:5px;padding:1px 6px;}
+  .kl-main .cm-rate{flex:none;color:var(--amber);letter-spacing:.06em;font-size:12px;}
+  .cc-name{min-width:0;font-size:13px;font-weight:700;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   /* Job card route: origin and destination on their own lines. A name too long
      for the card is cut with "…" rather than wrapped, so every card keeps the
      same height; the full text is on the job's own screen one tap away. */
@@ -2368,12 +2393,35 @@ function escHtml(s){
                   .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+// Elapsed time on a card: "12M" under an hour, "1H05M" after. A job still open
+// counts up to now; a finished one shows how long it took, so the number never
+// keeps growing on work that is already done.
+function fmtElapsedShort(mins){
+  if(mins === null || mins === undefined) return "";
+  if(mins < 60) return `${mins}M`;
+  return `${Math.floor(mins / 60)}H${String(mins % 60).padStart(2, "0")}M`;
+}
+// Cost centre as a name only (the card is read at a glance); falls back to the
+// code when the centre has no name yet, so the slot is never empty.
+function costCenterName(code){
+  const c = String(code || "").trim();
+  if(!c) return "";
+  const hit = (state.costCenters || []).find(x=> x.code === c);
+  return (hit && hit.name) ? hit.name : c;
+}
+// A job nobody has picked up for this long gets an amber warning on its time.
+const WAIT_WARN_MINS = 30;
+
+const ICO_TAG  = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13 13 20a2 2 0 0 1-2.8 0L3 12.8V4h8.8L20 11.2a2 2 0 0 1 0 2.8Z"/><circle cx="7.5" cy="8.5" r="1"/></svg>`;
+const ICO_WARN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4 2.8 20h18.4Z"/><path d="M12 10v4"/><path d="M12 17.2v.1"/></svg>`;
+
 function taskCard(t, actionsHtml, opts={}){
   const cls = statusClass(t.status);
   const remark = (t.remark || "").trim();
-  // Five things and no more: code, route, when, what (BU and pallets) and who.
-  // A card is read while walking; everything else lives one tap away in the
-  // job's own screen, which is what the chevron on the right promises.
+  // Read in four groups, top to bottom: which job and how it stands (code,
+  // status, when it was opened and how long ago), where (from / to), what
+  // (BU, cost centre, pallets) and who (the person who opened it, then the
+  // vehicles on it). Everything else is one tap away behind the chevron.
   const counts = t.driver_counts || {};
   const present = allVehicleTypes(Object.keys(counts)).filter(k=> counts[k]);
   const totalUnits = present.reduce((n, k)=> n + counts[k], 0);
@@ -2394,29 +2442,55 @@ function taskCard(t, actionsHtml, opts={}){
   } else if(drivers.length){
     crewLabel = `${drivers.length} คน`;
   }
-  // Before anyone takes the job the useful name is the person who asked;
-  // after that it is the vehicle doing it.
-  const who = crewLabel || t.requester_name || t.requester_employee_id || "";
+  const opener = t.requester_name || t.requester_employee_id || "";
   const hasPallets = !(t.pallet_qty === null || t.pallet_qty === undefined || t.pallet_qty === "");
+  const done = t.status === "Completed" || t.status === "Cancelled";
+  const endIso = done ? (t.completed_at || null) : null;
+  const mins = t.created_at
+    ? (endIso ? Math.max(0, Math.round((new Date(endIso) - new Date(t.created_at)) / 60000))
+              : minutesAgo(t.created_at))
+    : null;
+  // Amber only for a job still waiting — and always with an icon and the
+  // number, so the warning never depends on colour alone.
+  const late = t.status === "Waiting" && mins !== null && mins >= WAIT_WARN_MINS;
+  const elapsed = mins === null ? "" :
+    `<span class="cm-el${late ? " late" : ""}"${late ? ` title="รอมานานกว่า ${WAIT_WARN_MINS} นาที"` : ""}>${late ? `<i class="cm-el-ico">${ICO_WARN}</i>` : ""}${fmtElapsedShort(mins)}</span>`;
+  const ccName = costCenterName(t.cost_center);
+  const rating = t.rating ? `<span class="cm-rate">${"★".repeat(t.rating)}${"☆".repeat(5 - t.rating)}</span>` : "";
 
-  const meta = [
-    `<span>${fmtTime(t.created_at)}</span>`,
-    t.request_type === "Booking" && t.scheduled_at
-      ? `<span>นัดหมาย ${fmtTime(t.scheduled_at)}</span>` : "",
-    t.bu ? `<span>BU ${t.bu}</span>` : "",
-    hasPallets ? `<span>${t.pallet_qty} พาเลท</span>` : "",
-    who ? `<span class="cm-who">${who}</span>` : "",
-    t.rating ? `<span class="cm-rate">${"★".repeat(t.rating)}${"☆".repeat(5 - t.rating)}</span>` : "",
-  ].filter(Boolean).join("");
+  const whatRow = (t.bu || ccName || hasPallets) ? `
+          <div class="kl-row kl-what">
+            <i class="kl-ico">${ICO_TAG}</i>
+            <div class="kl-main">
+              <span class="kl-l">${t.bu ? `<span class="bu-chip">${escHtml(t.bu)}</span>` : ""}${ccName ? `<span class="cc-name">${escHtml(ccName)}</span>` : ""}</span>
+              ${hasPallets ? `<span class="kl-r"><b>${escHtml(t.pallet_qty)}</b> พาเลท</span>` : ""}
+            </div>
+          </div>` : "";
+  const bookRow = (t.request_type === "Booking" && t.scheduled_at) ? `
+          <div class="kl-row"><i class="kl-ico">${ICO.cal}</i>
+            <div class="kl-main"><span class="kl-t">นัดหมาย ${fmtTime(t.scheduled_at)}</span></div></div>` : "";
+  const whoRow = opener ? `
+          <div class="kl-row">
+            <i class="kl-ico">${ICO.user}</i>
+            <div class="kl-main"><span class="kl-t strong">${escHtml(opener)}</span>${rating}</div>
+          </div>` : "";
+  const crewRow = crewLabel ? `
+          <div class="kl-row">
+            <i class="kl-ico">${ICO.truck}</i>
+            <div class="kl-main"><span class="kl-t strong">${escHtml(crewLabel)}</span></div>
+          </div>` : "";
 
   return `
     <div class="card ${cls}" data-id="${t.id}">
       <div class="card-top">
         <span class="task-code mono"><span class="tc-ico">${ICO.box}</span>${t.task_code}</span>
-        ${opts.zoneTag ? `<span class="zone-tag ${opts.zoneTag.cls}">${opts.zoneTag.label}</span>` : ""}
-        ${opts.queuePos
-          ? `<span class="queue-chip">คิวที่ ${opts.queuePos}</span>`
-          : `<span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span>`}
+        <div class="ct-right">
+          ${opts.queuePos
+            ? `<span class="queue-chip">คิวที่ ${opts.queuePos}</span>`
+            : `<span class="status-chip"><span class="dot"></span>${STATUS_LABEL[t.status] || t.status}</span>`}
+          ${opts.zoneTag ? `<span class="zone-tag ${opts.zoneTag.cls}">${opts.zoneTag.label}</span>` : ""}
+          <div class="ct-when"><span class="cm-dt">${fmtTime(t.created_at)}</span>${elapsed}</div>
+        </div>
       </div>
       ${t.status === "Waiting" && t.queue_position
         ? `<div class="wait-line">รออยู่ลำดับที่ <b>${t.queue_position}</b>${
@@ -2430,7 +2504,7 @@ function taskCard(t, actionsHtml, opts={}){
             <div class="rl"><span class="rk">จาก</span><span class="rv">${escHtml(t.from_location)}</span></div>
             <div class="rl"><span class="rk">ไป</span><span class="rv">${escHtml(t.to_location)}</span></div>
           </div>
-          <div class="card-meta">${meta}</div>
+          ${whatRow}${bookRow}${whoRow}${crewRow}
           ${remark ? `<div class="card-remark"><b>หมายเหตุ</b><div class="cr-text">${escHtml(remark)}</div></div>` : ""}
         </div>
         <span class="card-chev" aria-hidden="true">›</span>
