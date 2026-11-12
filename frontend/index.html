@@ -4062,7 +4062,22 @@ async function renderPushSection(pushCard){
   let status;
   try{ status = await api("/push/status", {background:true}); }catch(e){ status = {available:false, subscribed:false}; }
 
-  pushCard.appendChild(el(pushDiagnosticsHTML(status)));
+  // /push/status counts this PERSON's rows across every device and every
+  // address the app has ever lived at, so on its own it says "on" for a phone
+  // that has nothing registered here — and the switch then looked stuck, since
+  // turning it off finds no local subscription and removes nothing. What this
+  // browser actually holds decides the switch.
+  let localSub = null;
+  try{
+    const reg = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((_, rej)=> setTimeout(()=> rej(new Error("sw timeout")), 4000)),
+    ]);
+    localSub = await reg.pushManager.getSubscription();
+  }catch(e){ localSub = null; }
+  const isOn = !!localSub && !!status.subscribed;
+
+  pushCard.appendChild(el(pushDiagnosticsHTML({...status, subscribed: isOn})));
 
   if(!status.available){
     pushCard.appendChild(el(`<div class="field-note">เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า Web Push</div>`));
@@ -4082,13 +4097,13 @@ async function renderPushSection(pushCard){
     pushCard.appendChild(el(`<div class="field-note">คุณเคยปฏิเสธการแจ้งเตือนไว้ — ต้องไปเปิดเองในตั้งค่าเครื่อง/เบราว์เซอร์ (Settings → Notifications) แล้วกลับมาเปิดใหม่ที่นี่</div>`));
     return;
   }
-  const btn = el(`<button class="btn ${status.subscribed ? 'red' : 'amber'}" style="width:100%;">
-    ${status.subscribed ? 'ปิดการแจ้งเตือน' : 'เปิดการแจ้งเตือน'}
+  const btn = el(`<button class="btn ${isOn ? 'red' : 'amber'}" style="width:100%;">
+    ${isOn ? 'ปิดการแจ้งเตือน' : 'เปิดการแจ้งเตือน'}
   </button>`);
   pushCard.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">รับแจ้งเตือนแม้ปิดแอปอยู่ (มือถือ iOS ต้อง "เพิ่มลงหน้าจอโฮม" ก่อนถึงจะใช้ได้)</div>`));
   pushCard.appendChild(btn);
   const resultBox = el(`<div id="push-test-result" style="margin-top:10px;"></div>`);
-  if(status.subscribed){
+  if(isOn){
     // Subscribing successfully is not proof that delivery works — an expired
     // VAPID signature or a revoked subscription both look identical from here
     // until an actual send is attempted.
@@ -4100,7 +4115,7 @@ async function renderPushSection(pushCard){
   btn.onclick = async ()=>{
     resultBox.innerHTML = "";
     try{
-      if(status.subscribed){
+      if(isOn){
         await unsubscribeFromPush();
         localStorage.setItem(NOTIF_PROMPTED_KEY, "true"); // don't auto-prompt again after an explicit opt-out
         await renderPushSection(pushCard);
