@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261112.1605"
+APP_VERSION = "TTLOD.261112.1958"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -3974,13 +3974,32 @@ def _history_cutoff_iso() -> str:
     return (datetime.utcnow() - timedelta(days=HISTORY_WINDOW_DAYS)).isoformat(timespec="seconds") + "Z"
 
 
+# Background polls ("lite") only need work that is still moving. Finished
+# work never changes again, yet the 14-day history above used to ride along
+# on every poll from every open device. A poll now sends live jobs plus any
+# job that finished in the last few minutes (so the screen sees the final
+# state in the same response), and the page re-fetches the full history every
+# few minutes and whenever a job it was showing as live goes missing.
+LIVE_POLL_GRACE_MINUTES = 10
+
+
+def _live_grace_cutoff_iso() -> str:
+    return (datetime.utcnow() - timedelta(minutes=LIVE_POLL_GRACE_MINUTES)).isoformat(timespec="seconds") + "Z"
+
+
 @app.get("/tasks")
 def list_tasks(status_filter: Optional[str] = None, scope: Optional[str] = None,
-               user=Depends(current_user)):
+               user=Depends(current_user), live_only: int = 0):
     with get_db() as db:
         if user["role"] in ("ADMIN", "DISPATCH"):
             check_waiting_too_long(db)
-        cutoff = _history_cutoff_iso()
+        # live_only swaps the "recent history" clause (created in the last 14
+        # days) for "finished in the last few minutes". Live jobs, and the
+        # requester's own unrated completed jobs, are included either way.
+        if live_only:
+            hist_col, cutoff = "completed_at", _live_grace_cutoff_iso()
+        else:
+            hist_col, cutoff = "created_at", _history_cutoff_iso()
         if user["role"] == "USER" and scope == "unit" and (user["cost_center"] or "").strip():
             # Everything booked to the same cost centre as this person, their
             # own jobs included. The match is on the JOB's cost centre rather
@@ -3991,7 +4010,7 @@ def list_tasks(status_filter: Optional[str] = None, scope: Optional[str] = None,
             # not this person's to score, so it does not linger in their list.
             q = ("SELECT * FROM tasks WHERE cost_center=? AND ("
                  "status NOT IN ('Completed','Cancelled') "
-                 "OR created_at >= ? "
+                 f"OR {hist_col} >= ? "
                  "OR (status='Completed' AND rating IS NULL AND requester_id=?))")
             params = [(user["cost_center"] or "").strip(), cutoff, user["id"]]
         elif user["role"] == "USER":
@@ -4000,7 +4019,7 @@ def list_tasks(status_filter: Optional[str] = None, scope: Optional[str] = None,
             # can never vanish just because the task got old.
             q = ("SELECT * FROM tasks WHERE requester_id=? AND ("
                  "status NOT IN ('Completed','Cancelled') "
-                 "OR created_at >= ? "
+                 f"OR {hist_col} >= ? "
                  "OR (status='Completed' AND rating IS NULL))")
             params = [user["id"], cutoff]
         elif user["role"] == "DRIVER":
@@ -4010,11 +4029,11 @@ def list_tasks(status_filter: Optional[str] = None, scope: Optional[str] = None,
             q = ("SELECT DISTINCT tasks.* FROM tasks "
                  "LEFT JOIN task_assignments ON task_assignments.task_id = tasks.id AND task_assignments.driver_id=? "
                  "WHERE (tasks.status NOT IN ('Completed','Cancelled') "
-                 "OR (task_assignments.driver_id IS NOT NULL AND tasks.created_at >= ?))")
+                 f"OR (task_assignments.driver_id IS NOT NULL AND tasks.{hist_col} >= ?))")
             params = [user["id"], cutoff]
         else:
             q = ("SELECT * FROM tasks WHERE (status NOT IN ('Completed','Cancelled') "
-                 "OR created_at >= ?)")
+                 f"OR {hist_col} >= ?)")
             params = [cutoff]
         if status_filter:
             q += " AND status=?"
@@ -5202,14 +5221,22 @@ def team_chat_participants(user=Depends(require_role("ADMIN", "DISPATCH", "DRIVE
 
 
 @app.get("/team-chat/messages")
-def get_team_chat_messages(user=Depends(require_role("ADMIN", "DISPATCH", "DRIVER"))):
+def get_team_chat_messages(user=Depends(require_role("ADMIN", "DISPATCH", "DRIVER")),
+                           after: Optional[int] = None):
+    """The latest 200 lines, oldest first. With `after`, only lines newer than
+    that id — background polls use it so an unchanged chat costs nothing."""
+    base = ("SELECT team_chat_messages.*, users.employee_id AS sender_employee_id, users.full_name AS sender_name, "
+            "users.role AS sender_role FROM team_chat_messages JOIN users ON users.id = team_chat_messages.sender_id ")
     with get_db() as db:
-        rows = db.execute(
-            "SELECT team_chat_messages.*, users.employee_id AS sender_employee_id, users.full_name AS sender_name, "
-            "users.role AS sender_role FROM team_chat_messages JOIN users ON users.id = team_chat_messages.sender_id "
-            "ORDER BY team_chat_messages.created_at LIMIT 200"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        if after is not None:
+            rows = db.execute(base + "WHERE team_chat_messages.id > ? ORDER BY team_chat_messages.id LIMIT 200",
+                              (after,)).fetchall()
+            return [dict(r) for r in rows]
+        # Newest 200, shown oldest first. (This used to be ORDER BY created_at
+        # ... LIMIT 200 ascending, i.e. the OLDEST 200 — once the chat passed
+        # 200 lines new messages never appeared.)
+        rows = db.execute(base + "ORDER BY team_chat_messages.id DESC LIMIT 200").fetchall()
+        return [dict(r) for r in reversed(rows)]
 
 
 @app.post("/team-chat/messages")
@@ -6226,11 +6253,20 @@ class BroadcastBody(BaseModel):
 
 
 @app.get("/notifications")
-def get_notifications(user=Depends(current_user)):
+def get_notifications(user=Depends(current_user), after: Optional[int] = None):
+    """Latest 50. With `after`, only what is newer than that id plus anything
+    still unread — enough for a device that already holds the rest to bring
+    its list and unread badge up to date."""
     with get_db() as db:
-        rows = db.execute(
-            "SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50", (user["id"],)
-        ).fetchall()
+        if after is not None:
+            rows = db.execute(
+                "SELECT * FROM notifications WHERE user_id=? AND (id > ? OR is_read=0) "
+                "ORDER BY created_at DESC LIMIT 50", (user["id"], after)
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50", (user["id"],)
+            ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -6419,9 +6455,23 @@ def get_audit_logs(user=Depends(require_role("ADMIN"))):
 # Combined data endpoint — one request instead of ~14
 # ---------------------------------------------------------------------------
 
+def _add_team_chat(out: dict, user, lite, chat_after):
+    """Team chat part of the /app-data bundle. A background poll from a device
+    that already holds the chat sends chat_after and gets only newer lines;
+    the participant list (people rarely join) is left to the periodic full
+    refresh."""
+    if lite and chat_after is not None:
+        out["teamChatMessages"] = get_team_chat_messages(user, after=chat_after)
+        out["teamChatDelta"] = True
+    else:
+        out["teamChatMessages"] = get_team_chat_messages(user)
+        out["teamChatParticipants"] = team_chat_participants(user)
+
+
 @app.get("/app-data")
 def app_data(scope: str = "core", task_scope: Optional[str] = None,
-             lite: int = 0, user=Depends(current_user)):
+             lite: int = 0, chat_after: Optional[int] = None,
+             notif_after: Optional[int] = None, user=Depends(current_user)):
     """Returns everything a screen needs in ONE round-trip instead of the
     frontend firing 14 separate requests every refresh. Each of those was a
     separate serverless invocation + DB round-trip on Vercel/Neon, which is
@@ -6443,6 +6493,13 @@ def app_data(scope: str = "core", task_scope: Optional[str] = None,
     at most 5 minutes stale on OTHER devices, and never on the one that made
     the change. Without the parameter the response is exactly as before, so
     a copy of the page still running old JavaScript keeps working.
+
+    A lite response is also lighter in what it carries:
+      tasks          live jobs (+ ones finished in the last few minutes) only;
+                     flagged with tasksLiveOnly so the page keeps the finished
+                     history it already has instead of replacing it
+      team chat      only lines after chat_after (teamChatDelta), no participants
+      notifications  only those after notif_after plus unread (notifDelta)
     """
     # Holding ONE connection open across the whole bundle is what makes the
     # single-round-trip design actually pay off. Each helper below opens its
@@ -6450,19 +6507,23 @@ def app_data(scope: str = "core", task_scope: Optional[str] = None,
     # one instead of each doing its own TLS handshake to the database. This
     # request went from 12 connections to 1 (plus one for authentication).
     with get_db():
+        use_notif_delta = bool(lite) and notif_after is not None
         out = {
             "me": me(user),
-            "tasks": list_tasks(None, task_scope, user),
-            "notifications": get_notifications(user),
+            "tasks": list_tasks(None, task_scope, user, live_only=1 if lite else 0),
+            "notifications": get_notifications(user, after=notif_after if use_notif_delta else None),
         }
+        if lite:
+            out["tasksLiveOnly"] = True
+        if use_notif_delta:
+            out["notifDelta"] = True
         if not lite:
             # Small, changes rarely, and needed by the job form and the
             # profile screen — cheaper here than a request of its own.
             out["costCenters"] = list_cost_centers(user)
         if scope == "driver":
             out["vehicles"] = list_vehicles(user)
-            out["teamChatMessages"] = get_team_chat_messages(user)
-            out["teamChatParticipants"] = team_chat_participants(user)
+            _add_team_chat(out, user, lite, chat_after)
         elif scope in ("admin_ops", "admin_dash") and user["role"] in ("ADMIN", "DISPATCH"):
             # Live: who is free, which truck is where, what broke down.
             out["drivers"] = list_drivers(user)
@@ -6472,8 +6533,7 @@ def app_data(scope: str = "core", task_scope: Optional[str] = None,
                 out["allUsers"] = list_all_users(user)
                 out["vehicleTypes"] = list_vehicle_types(user)
                 out["zones"] = list_zones(user)
-            out["teamChatMessages"] = get_team_chat_messages(user)
-            out["teamChatParticipants"] = team_chat_participants(user)
+            _add_team_chat(out, user, lite, chat_after)
             if scope == "admin_dash":
                 out["dashboard"] = dashboard(user)
                 out["auditLogs"] = get_audit_logs(user)

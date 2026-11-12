@@ -8202,6 +8202,64 @@ const FORCE_RENDER_AFTER_MS = 120000;
 const STATIC_REFRESH_MS = 5 * 60 * 1000;
 const _fullFetchedAt = {};   // "<employee>|<scope>" -> ms of last full fetch
 
+// Highest id in a list of rows ({id: n}); 0 for an empty one.
+function _maxId(arr){
+  let m = 0;
+  for(const x of (arr || [])) if(x && x.id > m) m = x.id;
+  return m;
+}
+
+// A lite /app-data response carries only what is moving: live jobs, chat
+// lines and notifications newer than the ones we hold. This folds it into the
+// current state and edits `d` in place so the normal Object.assign follows.
+// Returns true when something we were showing has dropped out of the response
+// in a way a lite poll cannot explain (a live job missing, or one of my own
+// unrated jobs gone), meaning a full refresh should follow right away.
+function mergeLitePayload(d){
+  let needFull = false;
+  if(d.tasksLiveOnly){
+    const fresh = d.tasks || [];
+    const freshIds = new Set(fresh.map(t=> t.id));
+    const kept = [];
+    for(const t of (state.tasks || [])){
+      if(freshIds.has(t.id)) continue;
+      if(t.status === "Completed" || t.status === "Cancelled"){
+        // Finished work only reaches us in the periodic full refresh; keep it.
+        // Exception: one of MY unrated jobs, which the server keeps listing
+        // until it is rated, has stopped being listed — rated on another device.
+        if(state.role === "USER" && t.status === "Completed" && t.rating == null
+           && t.requester_employee_id === state.employee_id) needFull = true;
+        kept.push(t);
+      }else{
+        needFull = true;   // was live a moment ago, now missing: it finished
+      }
+    }
+    d.tasks = fresh.concat(kept).sort((a,b)=>
+      a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : b.id - a.id);
+  }
+  delete d.tasksLiveOnly;
+
+  if(d.teamChatDelta){
+    const prev = state.teamChatMessages || [];
+    const have = new Set(prev.map(m=> m.id));
+    const add = (d.teamChatMessages || []).filter(m=> !have.has(m.id));
+    d.teamChatMessages = add.length ? prev.concat(add).slice(-200) : prev;
+  }
+  delete d.teamChatDelta;
+
+  if(d.notifDelta){
+    const got = d.notifications || [];
+    const gotIds = new Set(got.map(n=> n.id));
+    // Every unread notification is always returned, so one we still show as
+    // unread that did not come back has been read on another device.
+    const carried = (state.notifications || []).filter(n=> !gotIds.has(n.id))
+      .map(n=> n.is_read ? n : Object.assign({}, n, {is_read: 1}));
+    d.notifications = got.concat(carried).sort((a,b)=> b.id - a.id).slice(0, 50);
+  }
+  delete d.notifDelta;
+  return needFull;
+}
+
 let _refreshAbort = null;
 async function refreshAll(opts={}){
   // One combined request instead of ~14 separate ones. The scope tells the
@@ -8224,15 +8282,21 @@ async function refreshAll(opts={}){
   if(_refreshAbort) _refreshAbort.abort();
   const ctrl = new AbortController();
   _refreshAbort = ctrl;
+  let needFull = false;
   try{
     const fullKey = (state.employee_id || "") + "|" + scope;
     const lite = !!opts.lite && !opts.visible
       && _fullFetchedAt[fullKey] && (Date.now() - _fullFetchedAt[fullKey] < STATIC_REFRESH_MS);
+    // A background poll tells the server what it already holds (newest chat
+    // line and notification ids) so only newer ones come back.
     const d = await api("/app-data?scope=" + scope
       + (state.role === "USER" && taskScope() === "unit" ? "&task_scope=unit" : "")
-      + (lite ? "&lite=1" : ""),
+      + (lite ? "&lite=1&chat_after=" + _maxId(state.teamChatMessages)
+              + "&notif_after=" + _maxId(state.notifications) : ""),
       {background: !opts.visible, signal: ctrl.signal});
     if(!lite) _fullFetchedAt[fullKey] = Date.now();
+    // Fold the slimmed-down parts of a lite response into what we already hold.
+    needFull = mergeLitePayload(d);
     // Merge returned keys into state (only overwrites what the scope included,
     // so data from another tab stays cached until you go back to it).
     Object.assign(state, d);
@@ -8284,6 +8348,9 @@ async function refreshAll(opts={}){
     updateHeaderFromState();
     updateRefreshBar();
   }catch(e){ /* render error shouldn't break the poll loop */ }
+  // Something we showed as live vanished from a lite response: fetch the full
+  // picture now (non-lite, so this cannot repeat itself).
+  if(needFull) setTimeout(()=> refreshAll(), 0);
 }
 
 function updateHeaderFromState(){
