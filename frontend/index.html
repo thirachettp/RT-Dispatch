@@ -904,7 +904,7 @@ const HELP_BY_ROLE = {
     ["ติดตามงาน", "การ์ดงานบอกสถานะและจำนวนรถที่รับงาน กดที่การ์ดเพื่อเข้าแชทและดูรายละเอียดทั้งหมด"],
     ["แจ้งปัญหา", "ถ้าของยังไม่พร้อมหรือจุดถูกบัง กด “แจ้งปัญหา” งานจะหยุดไว้จนกว่าจะกดแก้ไขเรียบร้อย"],
     ["ให้คะแนน", "เมื่องานเสร็จ ให้ดาวได้ในหน้างานของฉัน"],
-    ["ค้นหาย้อนหลัง", "แท็บประวัติ ค้นด้วยเลขงาน โซน หรือ location ได้"],
+    ["ค้นหาย้อนหลัง", "แท็บประวัติ ค้นด้วยเลขงาน ผู้ขอ ต้นทาง ปลายทาง หรือคนขับได้"],
   ]],
   DRIVER: ["สำหรับคนขับ", [
     ["เปิดแอพ", "ถ้าแอดมินตั้งรถประจำไว้ ระบบจะขึ้นรถให้อัตโนมัติ ไม่ต้องเลือกรถทุกวัน"],
@@ -3058,7 +3058,7 @@ function taskFilterCount(name){
 
 function taskFilterChips(name){
   const f = taskFilter(name), out = [];
-  if(f.q) out.push(`เลขงาน "${f.q}"`);
+  if(f.q) out.push(`ค้นหา "${f.q}"`);
   TASK_FILTERS[name].groups.forEach(g=>
     (f[g] || []).forEach(v=> out.push(TASK_FILTER_GROUPS[g].name(v))));
   return out;
@@ -3069,10 +3069,28 @@ function taskFilterValues(g, t){
   return Array.isArray(got) ? got : (got === null || got === undefined || got === "" ? [] : [got]);
 }
 
+// One search box for a job, matched against everything a person might
+// remember about it: the job number, who booked it, where from and to, the
+// crew on it, the cost centre, the remark. Several words must ALL match, so
+// "สมชาย คลัง" narrows rather than widens. Job numbers also match without
+// their dashes ("260922005" finds TK260922-005).
+function taskSearchHay(t){
+  const crew = (t.drivers || []).map(d=> [d.full_name, d.name, d.employee_id, d.vehicle_code].filter(Boolean).join(" "));
+  const text = [t.task_code, t.requester_name, t.requester_employee_id, t.requester_contact,
+                t.from_location, t.to_location, t.cost_center, t.remark, ...crew]
+    .filter(Boolean).join(" ").toLowerCase();
+  return text + " " + text.replace(/[^a-z0-9\u0e00-\u0e7f]/g, "");
+}
+function taskMatchesQuery(t, query){
+  const terms = String(query || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if(!terms.length) return true;
+  const hay = taskSearchHay(t);
+  return terms.every(w=> hay.includes(w) || hay.includes(w.replace(/[^a-z0-9\u0e00-\u0e7f]/g, "")));
+}
+
 function taskMatchesFilter(name, t){
   const f = taskFilter(name);
-  const q = String(f.q || "").trim().toLowerCase();
-  if(q && !String(t.task_code || "").toLowerCase().includes(q)) return false;
+  if(!taskMatchesQuery(t, f.q)) return false;
   for(const g of TASK_FILTERS[name].groups){
     const picked = f[g] || [];
     if(!picked.length) continue;
@@ -4571,7 +4589,7 @@ function openAdminSearchSheet(){
     <div class="sheet-overlay">
       <div class="sheet">
         <div class="sheet-head"><h2>ค้นหา</h2><button class="sheet-close">✕</button></div>
-        <input id="admin-search-input" placeholder="พิมพ์รหัสงาน / ชื่อคน / รหัสรถ..." autofocus />
+        <input id="admin-search-input" placeholder="พิมพ์รหัสงาน / ผู้ขอ / ต้นทาง / ปลายทาง / ชื่อคน / รหัสรถ..." autofocus />
         <div id="admin-search-results" style="margin-top:14px;"></div>
       </div>
     </div>
@@ -4598,11 +4616,7 @@ function openAdminSearchSheet(){
     const q = input.value.trim().toLowerCase();
     results.innerHTML = "";
     if(!q){ return; }
-    const taskMatches = state.tasks.filter(t=>
-      t.task_code.toLowerCase().includes(q) ||
-      (t.from_location||"").toLowerCase().includes(q) ||
-      (t.to_location||"").toLowerCase().includes(q)
-    ).slice(0, 8);
+    const taskMatches = state.tasks.filter(t=> taskMatchesQuery(t, q)).slice(0, 8);
     const peopleMatches = state.allUsers.filter(u=>
       u.employee_id.toLowerCase().includes(q) || (u.full_name||"").toLowerCase().includes(q)
     ).slice(0, 8);
@@ -4954,7 +4968,7 @@ function taskFilterBar(main, name, tasks){
   const f = taskFilter(name);
   const n = taskFilterCount(name);
   const bar = el(`<div class="card" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
-    <input id="dq" value="${f.q || ""}" placeholder="ค้นหาเลขงาน เช่น 004"
+    <input id="dq" value="${f.q || ""}" placeholder="ค้นหา เลขงาน / ผู้ขอ / ต้นทาง / ปลายทาง"
            style="flex:1;min-width:0;margin:0;" />
     <button class="btn${n ? " amber" : ""}" id="dfilter" style="flex:none;min-height:44px;">
       ตัวกรอง${n ? ` (${n})` : ""}</button>
@@ -5914,8 +5928,8 @@ function renderOperationJobs(main){
   </div>`));
 
   const filterBar = el(`<div class="card">
-    <label>ค้นหาเลขงาน</label>
-    <input id="oj-q" placeholder="เช่น TK260922-005 หรือแค่ 005" autocomplete="off" />
+    <label>ค้นหางาน</label>
+    <input id="oj-q" placeholder="เลขงาน / ผู้ขอ / ต้นทาง / ปลายทาง / คนขับ" autocomplete="off" />
     <div style="margin-top:8px;">
       <div><label>สถานะ</label><select id="oj-status">
         <option value="active">ยังไม่เสร็จ (ไม่รวมเสร็จสิ้น/ยกเลิก)</option>
@@ -5951,8 +5965,7 @@ function renderOperationJobs(main){
     return t.status === f.status;
   }
   function codeMatch(t){
-    const q = normCode(f.q);
-    return !q || normCode(t.task_code).includes(q);
+    return taskMatchesQuery(t, f.q);
   }
 
   function drawList(){
@@ -5977,7 +5990,7 @@ function renderOperationJobs(main){
       } else if(f.q){
         // Finished work older than the loaded window isn't on this screen —
         // say so, rather than implying the task doesn't exist.
-        listBox.appendChild(el(`<div class="empty">ไม่พบเลขงาน "${f.q}" ในงานที่แสดงอยู่
+        listBox.appendChild(el(`<div class="empty">ไม่พบ "${f.q}" ในงานที่แสดงอยู่
           <div class="field-note" style="margin-top:4px;">งานที่เสร็จหรือยกเลิกไปนานกว่า 14 วันจะไม่แสดงในหน้านี้</div></div>`));
       } else {
         listBox.appendChild(el(`<div class="empty">ไม่พบงานตามตัวกรอง</div>`));
