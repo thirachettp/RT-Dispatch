@@ -163,7 +163,7 @@ DRIVER_STATUS_LABEL_TH = {
     "Available": "ว่าง", "Busy": "ติดงาน", "Breakdown": "รถเสีย", "Offline": "ออฟไลน์",
 }
 
-app = FastAPI(title="CRL ForkliftDispatch", description="Warehouse Forklift Request & Dispatch")
+app = FastAPI(title="RT Dispatch", description="Warehouse Forklift Request & Dispatch")
 
 # /app-data returns a large JSON document on every refresh and was being sent
 # uncompressed. It is highly repetitive JSON, so gzip typically cuts it by
@@ -7404,8 +7404,8 @@ def service_worker():
 # just cannot be the single point of failure any more — and the icons it points
 # at are drawn here, so they always exist.
 
-BRAND_BG = (0x25, 0x63, 0xEB)       # --amber in the stylesheet
-BRAND_FG = (0xFF, 0xFF, 0xFF)
+BRAND_BG = (0x0F, 0x17, 0x2A)       # dark slate — new-app icon (was blue 0x2563EB)
+BRAND_FG = (0x25, 0x63, 0xEB)       # original blue mark on the dark square
 
 # The forklift mark from the sign-in screen, in its own 24x24 grid:
 # (kind, ...) with rects as x,y,w,h and circles as cx,cy,r.
@@ -7517,8 +7517,8 @@ def favicon():
 
 
 BASE_MANIFEST = {
-    "name": "CRL ForkliftDispatch",
-    "short_name": "ForkliftDispatch",
+    "name": "RT Dispatch",
+    "short_name": "RT Dispatch",
     "lang": "th",
     "start_url": "/",
     "scope": "/",

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" id="viewport-meta" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
-<title>CRL ForkliftDispatch — Warehouse Forklift Request &amp; Dispatch</title>
+<title>RT Dispatch — Warehouse Forklift Request &amp; Dispatch</title>
 <link rel="manifest" href="/manifest.json">
 <!-- iOS takes its home-screen icon from here, and that icon is what every
      notification from the installed app is shown with. Both are served by the
@@ -12,7 +12,7 @@
 <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="ForkliftDispatch">
+<meta name="apple-mobile-web-app-title" content="RT Dispatch">
 <meta name="theme-color" content="#f5f6f8">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+Thai:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -865,7 +865,7 @@ function renderInstallScreen(){
       <div class="login-card" style="max-width:460px;">
         <div class="mark"><div class="logo-mark">${LOGO_SVG}</div><b style="font-size:15px;">CRL</b></div>
         <h1>ติดตั้งแอพลงหน้าจอ</h1>
-        <p class="sub">CRL ForkliftDispatch · ${isIOS() ? "สำหรับ iPhone / iPad" : "สำหรับ Android / คอมพิวเตอร์"}</p>
+        <p class="sub">RT Dispatch · ${isIOS() ? "สำหรับ iPhone / iPad" : "สำหรับ Android / คอมพิวเตอร์"}</p>
         ${isStandalone()
           ? `<div class="card" style="border:1px solid var(--green);background:var(--green-dim);">
                <b style="color:var(--green);">✅ ติดตั้งเรียบร้อยแล้ว</b>
@@ -951,7 +951,7 @@ function renderHelpTab(main){
 
   main.appendChild(el(`<div class="section-title">เกี่ยวกับแอพ</div>`));
   main.appendChild(el(`<div class="card">
-    <div class="as-d"><span>ชื่อแอพ</span><b>CRL ForkliftDispatch</b></div>
+    <div class="as-d"><span>ชื่อแอพ</span><b>RT Dispatch</b></div>
     <div class="as-d"><span>คำอธิบาย</span><b>Warehouse Forklift Request &amp; Dispatch</b></div>
     <div class="as-d"><span>เวอร์ชัน</span><b class="mono">${APP_VERSION}</b></div>
     <div class="as-d"><span>เปิดจากหน้าจอโฮม</span><b>${isStandalone() ? "ใช่" : "ยัง"}</b></div>
@@ -1761,7 +1761,7 @@ function renderLogin(){
     <div class="login-wrap">
       <div class="login-card">
         <div class="mark"><div class="logo-mark">${LOGO_SVG}</div><b style="font-size:15px;letter-spacing:.03em;">CRL</b></div>
-        <h1>CRL ForkliftDispatch</h1>
+        <h1>RT Dispatch</h1>
         <p class="sub">Warehouse Forklift Request &amp; Dispatch</p>
         <form id="login-form" method="post" action="#" novalidate>
           <label for="li-emp">ผู้ใช้งาน</label>
@@ -1894,7 +1894,7 @@ function renderRegister(prefill = {}){
       <div class="login-card">
         <div class="mark"><div class="logo-mark">${LOGO_SVG}</div><b style="font-size:15px;">CRL</b></div>
         <h1>สมัครสมาชิก</h1>
-        <p class="sub">CRL ForkliftDispatch</p>
+        <p class="sub">RT Dispatch</p>
         <label for="rg-emp">รหัสพนักงาน</label><input id="rg-emp" name="username" autocomplete="username" />
         <div class="grid2">
           <div><label>ชื่อ</label><input id="rg-first" placeholder="เช่น สมชาย" /></div>
@@ -2079,7 +2079,7 @@ function renderShell(){
       .filter(Boolean).join(" · ");
     brandInner = `<b>${(state.me && state.me.full_name) || state.employee_id}</b><small>${sub}</small>`;
   } else {
-    brandInner = `<b>${(state.me && state.me.full_name) || "SCDC Dispatch"}</b><small>${state.employee_id || ""}</small>`;
+    brandInner = `<b>${(state.me && state.me.full_name) || "RT Dispatch"}</b><small>${state.employee_id || ""}</small>`;
   }
 
   // A dispatcher who also drives is BOTH, so the icons are composed rather
