@@ -248,7 +248,7 @@
     border-radius:999px;padding:6px 13px;font-size:12.5px;font-family:inherit;cursor:pointer;}
   .eta-quick button.on{background:var(--amber);border-color:var(--amber);color:#fff;}
   .brand{display:flex;align-items:center;gap:10px;}
-  .logo-mark{width:28px;height:28px;border-radius:8px;background:var(--amber);display:flex;
+  .logo-mark{width:28px;height:28px;border-radius:8px;background:#0f172a;display:flex;
     align-items:center;justify-content:center;flex:none;}
   .logo-mark svg{width:16px;height:16px;display:block;}
   .brand b{letter-spacing:.02em;}
@@ -683,7 +683,7 @@ const NOTIF_PROMPTED_KEY = "scdc_notif_prompted";
 // permission state and its own storage. This is the single most common reason
 // notifications "just don't work" on iPhone.
 // The CRL mark, defined once so every sign-in style screen shows the same one.
-const LOGO_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#fff"/><rect x="9" y="5" width="1.6" height="12" fill="#fff"/><rect x="12.5" y="5" width="1.6" height="12" fill="#fff"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#fff"/><circle cx="13" cy="18.5" r="1.8" fill="#fff"/><circle cx="18" cy="18.5" r="1.8" fill="#fff"/></svg>`;
+const LOGO_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 15h7v2H2z" fill="#2563eb"/><rect x="9" y="5" width="1.6" height="12" fill="#2563eb"/><rect x="12.5" y="5" width="1.6" height="12" fill="#2563eb"/><rect x="10.5" y="10" width="9" height="6" rx="1" fill="#2563eb"/><circle cx="13" cy="18.5" r="1.8" fill="#2563eb"/><circle cx="18" cy="18.5" r="1.8" fill="#2563eb"/></svg>`;
 
 function isIOS(){
   return /iPad|iPhone|iPod/.test(navigator.userAgent || "")
