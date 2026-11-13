@@ -650,7 +650,7 @@
   .desk-tl-head{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;justify-content:space-between;margin-bottom:6px;}
   .desk-tl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;font-size:12px;}
   .desk-tl-legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px;}
-  .desk-tl-bars{display:flex;gap:6px;align-items:flex-end;height:104px;}
+  .desk-tl-bars{display:flex;gap:6px;align-items:flex-end;height:122px;}
   .desk-bar{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;border:0;background:none;padding:0;font:inherit;color:inherit;cursor:pointer;min-width:0;}
   .desk-bar .stack{width:100%;max-width:64px;display:flex;flex-direction:column;border-radius:4px 4px 0 0;overflow:hidden;}
   .desk-bar.on .stack{outline:2px solid var(--ink);outline-offset:1px;}
@@ -6432,7 +6432,7 @@ function renderOpsDesk(main){
     const unit = D.metric === "pallet" ? "พาเลท" : "งาน";
     const totAll = h.tot.wait + h.tot.active + h.tot.done + h.tot.cancel;
     const max = Math.max(1, ...h.hours.map(x=> { const b = h.by[x]; return b ? b.wait + b.active + b.done + b.cancel : 0; }));
-    const H = 58;
+    const H = 86;   // tallest bar = full height (axis 0 → max), so no empty band above it
     tlBox.innerHTML = `
       <div class="desk-tl-head">
         <div><b>${unit}ที่เปิดวันนี้ตามชั่วโมง</b> <span class="field-note">${totAll} ${unit} · ยังไม่เสร็จ ${h.tot.wait + h.tot.active}</span></div>
