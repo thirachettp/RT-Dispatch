@@ -3673,15 +3673,27 @@ def tasks_to_dicts(rows, db, viewer_role: Optional[str] = None) -> list:
     arows = db.execute(
         "SELECT task_assignments.task_id, task_assignments.vehicle_id, "
         "task_assignments.assigned_vehicle_type, task_assignments.is_active_for_driver, "
-        "task_assignments.assigned_at, users.employee_id, users.full_name "
+        "task_assignments.assigned_at, task_assignments.assignment_status, "
+        "users.employee_id, users.full_name "
         "FROM task_assignments JOIN users ON users.id = task_assignments.driver_id "
         f"WHERE task_assignments.task_id IN ({_placeholders(len(task_ids))}) "
-        "AND task_assignments.assignment_status='Active' "
+        "AND task_assignments.assignment_status IN ('Active','Completed','Left') "
         "ORDER BY task_assignments.assigned_at",
         tuple(task_ids),
     ).fetchall()
+    # A live job lists only who is on it now (Active). A finished job lists
+    # everyone who took part (Completed, or Left partway) — completing flips
+    # every assignment out of Active, so filtering on Active alone left the
+    # history card and the detail screen with no drivers at all.
+    status_by_task = {d["id"]: d["status"] for d in dicts}
     for a in arows:
-        assignments_by_task.setdefault(a["task_id"], []).append(a)
+        finished = status_by_task.get(a["task_id"]) == "Completed"
+        if finished != (a["assignment_status"] in ("Completed", "Left")):
+            continue
+        bucket = assignments_by_task.setdefault(a["task_id"], [])
+        if finished and any(b["employee_id"] == a["employee_id"] for b in bucket):
+            continue          # same driver left and rejoined: list once
+        bucket.append(a)
 
     # 1a2. Where each waiting request sits in the queue. One pass over the
     #      waiting tasks rather than a position query per card.
@@ -3793,7 +3805,7 @@ def tasks_to_dicts(rows, db, viewer_role: Optional[str] = None) -> list:
                 # so the card can say "RT 1 · PE 2" from the moment work is
                 # handed out rather than once everyone has a vehicle.
                 "vehicle_type": a["assigned_vehicle_type"],
-                "awaiting_vehicle": a["vehicle_id"] is None,
+                "awaiting_vehicle": a["vehicle_id"] is None and a["assignment_status"] == "Active",
                 # False when this job is sitting in that driver's queue behind
                 # another one. The driver's own screen uses it to separate the
                 # job in hand from what is waiting.
