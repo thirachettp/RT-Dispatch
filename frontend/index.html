@@ -4839,13 +4839,13 @@ function renderHistoryChart(holder, data, selectedKey, onPick){
     holder.appendChild(el(`<div class="empty">ยังไม่มีงานที่เสร็จในช่วงนี้</div>`));
     return;
   }
-  const top = niceMax(max);
+  const top = max;   // axis runs 0 → tallest bar, no empty band above it
   const n = bars.length;
   const W = 340, H = 140, padT = 12, padB = 22, padL = 22, padR = 2;
   const plotH = H - padT - padB, plotW = W - padL - padR;
   const gap = n > 12 ? 3 : 6;
   const barW = Math.max(6, (plotW - gap * (n - 1)) / n);
-  const ticks = top % 2 === 0 ? [0, top / 2, top] : [0, top];
+  const ticks = top >= 4 ? [0, Math.round(top / 2), top] : [0, top];
 
   let svg = "";
   ticks.forEach(v=>{
@@ -5633,8 +5633,8 @@ function renderVolumeChart(card, data){
   const max = Math.max(1, ...data.buckets.map(b=> keys.reduce((t,k)=> t + (b[metric][k]||0), 0)));
   // A round number at or above the tallest bar, so the axis reads as a scale
   // rather than as "whatever the biggest bar happened to be".
-  const top = niceMax(max);
-  const ticks = top % 2 === 0 ? [0, top/2, top] : [0, top];
+  const top = max;   // axis runs 0 → tallest bar, no empty band above it
+  const ticks = top >= 4 ? [0, Math.round(top / 2), top] : [0, top];
   // Label every bar when there is room, otherwise every 3rd (hours) or 5th (days).
   const every = n <= 8 ? 1 : (n <= 24 ? 3 : 5);
 
