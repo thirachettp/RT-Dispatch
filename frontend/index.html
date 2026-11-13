@@ -636,6 +636,50 @@
     .sheet-overlay{align-items:center;}
     .sheet{max-width:560px;border-radius:16px;max-height:82vh;}
   }
+
+  /* ---------------- Operations: dispatch desk ---------------- */
+  .ops-seg{display:flex;gap:6px;margin-bottom:12px;}
+  .ops-seg button{flex:1;min-height:44px;padding:8px 6px;border-radius:10px;border:1px solid var(--line);background:var(--panel-2);color:var(--ink-dim);font:inherit;font-weight:700;font-size:13px;cursor:pointer;}
+  .ops-seg button.on{background:var(--amber);border-color:var(--amber);color:#fff;}
+  .ops-seg .n{font-weight:800;margin-left:4px;}
+  .ops-seg button{white-space:nowrap;}
+  .tag-free{margin-left:auto;flex:none;font-size:11px;font-weight:700;color:var(--green);border:1px solid #86efac;border-radius:999px;padding:2px 8px;}
+  .desk-kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;}
+  .desk-kpi .stat .n.bad{color:var(--red);}
+  .desk-tl{background:var(--panel-2);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin-bottom:12px;}
+  .desk-tl-head{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;justify-content:space-between;margin-bottom:6px;}
+  .desk-tl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;font-size:12px;}
+  .desk-tl-legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px;}
+  .desk-tl-bars{display:flex;gap:6px;align-items:flex-end;height:130px;}
+  .desk-bar{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;border:0;background:none;padding:0;font:inherit;color:inherit;cursor:pointer;min-width:0;}
+  .desk-bar .stack{width:100%;max-width:64px;display:flex;flex-direction:column;border-radius:4px 4px 0 0;overflow:hidden;}
+  .desk-bar.on .stack{outline:2px solid var(--ink);outline-offset:1px;}
+  .desk-bar .tot{font-size:12px;font-weight:700;}
+  .desk-bar .hr{font-size:11px;color:var(--ink-dim);margin-top:3px;}
+  .desk-bar.empty{cursor:default;}
+  .ops-cols{display:grid;grid-template-columns:minmax(290px,1fr) minmax(360px,1.25fr) minmax(290px,1fr);gap:12px;align-items:start;}
+  .ops-col{min-width:0;}
+  .ops-col-scroll{max-height:calc(100vh - 430px);min-height:260px;overflow:auto;padding-right:2px;}
+  .desk-card{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:8px;}
+  .desk-card.sel{border-color:var(--amber);box-shadow:0 0 0 2px rgba(37,99,235,.25);}
+  .desk-card .code{font-weight:800;}
+  .desk-card .sub{font-size:12px;color:var(--ink-dim);margin-top:2px;}
+  .desk-card .row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;}
+  .desk-card .acts{display:flex;gap:6px;margin-top:8px;}
+  .desk-card .acts .btn{flex:1;min-height:44px;}
+  .desk-grp{font-size:12px;font-weight:700;color:var(--ink-dim);margin:10px 0 6px;}
+  .desk-drv{display:flex;align-items:center;gap:10px;min-height:44px;padding:6px 10px;border:1px solid var(--line);border-radius:10px;margin-bottom:6px;cursor:pointer;background:var(--panel-2);}
+  .desk-drv.on{border-color:var(--amber);background:rgba(37,99,235,.08);}
+  .desk-drv input{width:20px;height:20px;flex:none;}
+  .desk-drv .nm{font-weight:700;}
+  .desk-drv .sb{font-size:12px;color:var(--ink-dim);}
+  .desk-drv.off{opacity:.55;cursor:default;}
+
+  @media (min-width:1200px){
+    #app.ops-wide:not(.app-full){max-width:1680px;grid-template-columns:200px 1fr;}
+    #app.ops-wide:not(.app-full) main{max-width:none;}
+  }
+  @media (max-width:1199px){ .desk-kpi{grid-template-columns:repeat(2,1fr);} .ops-cols{grid-template-columns:1fr;} }
 </style>
 <!-- Vercel Web Analytics: page views only, no cookies, no personal data. The
      script itself is served by Vercel at /_vercel/insights/script.js once
@@ -2268,6 +2312,8 @@ async function renderContent(){
   else if(state.role === "DRIVER") renderDriverTab(main);
   else if(isOps()) renderAdminTab(main);
   syncFab();
+  const appEl = document.getElementById("app");
+  if(appEl) appEl.classList.toggle("ops-wide", state.tab === "operation" && state.subtab === "jobs" && isOps());
 
   // Restore scroll position so the 3s auto-refresh poll doesn't yank the user
   // back to the top of a long list they were scrolled through. The page itself
@@ -6279,7 +6325,7 @@ async function refreshDispatchBoard(){
 
 // Default view: everything still in play. Finished and cancelled work is one
 // tap away under "ทั้งหมด" but doesn't crowd the working list.
-const OPS_DEFAULT_FILTER = {status: "active", overdue: false, q: ""};
+const OPS_DEFAULT_FILTER = {status: "Waiting", overdue: false, q: ""};
 
 // Task codes are compared letters-and-digits only, so "tk260922005",
 // "260922-005" and "005" all find TK260922-005.
@@ -6291,7 +6337,285 @@ function isOverdue(t, now){
   return false;
 }
 
+// ===================== Dispatch desk (wide screens) =====================
+// The PC layout for a screen left open all day: a status-coloured hourly
+// timeline and the headline numbers on top, then three columns that follow the
+// dispatcher's loop — what needs handing out, who can take it, and what is
+// already running. Finished and cancelled jobs are hidden from the lists (they
+// still show in the timeline) and come back through search.
+// Like the rest of the dispatch flow it never ranks or recommends drivers:
+// the list is grouped by availability and sorted by name only.
+
+const BKK_MS = 7 * 3600 * 1000;
+function bkkParts(iso){
+  const d = new Date(new Date(iso).getTime() + BKK_MS);
+  return {day: d.toISOString().slice(0,10), hour: d.getUTCHours()};
+}
+
+function opsHourly(tasks, metric){
+  const today = bkkParts(new Date().toISOString()).day;
+  const by = {};
+  tasks.forEach(t=>{
+    if(!t.created_at) return;
+    const p = bkkParts(t.created_at);
+    if(p.day !== today) return;
+    const b = by[p.hour] || (by[p.hour] = {wait:0, active:0, done:0, cancel:0, tasks:0});
+    const v = metric === "pallet" ? (Number(t.pallet_qty) || 0) : 1;
+    const k = t.status === "Completed" ? "done" : t.status === "Cancelled" ? "cancel"
+            : t.status === "Waiting" ? "wait" : "active";
+    b[k] += v; b.tasks++;
+  });
+  const hours = Object.keys(by).map(Number).sort((a,b)=> a-b);
+  if(!hours.length) return {hours: [], by, tot: {wait:0, active:0, done:0, cancel:0}};
+  // Trim empty hours at both ends, but keep the gaps inside so the time scale
+  // stays true.
+  const range = [];
+  for(let h = hours[0]; h <= hours[hours.length-1]; h++) range.push(h);
+  const tot = {wait:0, active:0, done:0, cancel:0};
+  hours.forEach(h=> Object.keys(tot).forEach(k=> tot[k] += by[h][k]));
+  return {hours: range, by, tot};
+}
+
+function renderOpsDesk(main){
+  if(!state.opsDesk) state.opsDesk = {metric: "job", hour: null, q: "", showDone: false, sel: null, pick: {}};
+  const D = state.opsDesk;
+  const root = el(`<div></div>`);
+  main.appendChild(root);
+
+  const all = state.tasks || [];
+  const waiting = all.filter(t=> t.status === "Waiting")
+    .sort((a,b)=> String(a.created_at||"").localeCompare(String(b.created_at||"")));
+  const working = all.filter(t=> ["Assigned","In Progress","Pause"].includes(t.status));
+  const now = Date.now();
+  const overdue = all.filter(t=> isOverdue(t, now)).length;
+  const snap = driverSnapshot();
+  const present = snap.filter(d=> d.status !== "Not Checked-in");
+  const freeN = snap.filter(d=> d.status === "Available" && d.vehicleCode).length;
+  const longest = waiting.length ? minsSince(waiting[0].created_at) : 0;
+
+  root.appendChild(el(`<div class="desk-kpi">
+    <div class="stat"><div class="n">${waiting.length}</div><div class="l">รอมอบหมาย</div></div>
+    <div class="stat"><div class="n ${longest >= 30 ? "bad" : ""}">${waiting.length ? longest + " น." : "-"}</div><div class="l">รอนานสุด</div></div>
+    <div class="stat"><div class="n">${working.length}</div><div class="l">กำลังทำ${overdue ? ` · ค้างนาน ${overdue}` : ""}</div></div>
+    <div class="stat"><div class="n">${freeN} / ${present.length}</div><div class="l">คนขับว่าง / ที่มาทำงาน</div></div>
+  </div>`));
+
+  // ---- timeline ----
+  const tlBox = el(`<div class="desk-tl"></div>`);
+  root.appendChild(tlBox);
+  function drawTimeline(){
+    const h = opsHourly(all, D.metric);
+    const unit = D.metric === "pallet" ? "พาเลท" : "งาน";
+    const totAll = h.tot.wait + h.tot.active + h.tot.done + h.tot.cancel;
+    const max = Math.max(1, ...h.hours.map(x=> { const b = h.by[x]; return b ? b.wait + b.active + b.done + b.cancel : 0; }));
+    const H = 84;
+    tlBox.innerHTML = `
+      <div class="desk-tl-head">
+        <div><b>${unit}ที่เปิดวันนี้ตามชั่วโมง</b> <span class="field-note">${totAll} ${unit} · ยังไม่เสร็จ ${h.tot.wait + h.tot.active}</span></div>
+        <div class="desk-tl-legend">
+          <span><i style="background:var(--warn)"></i>รอ <b>${h.tot.wait}</b></span>
+          <span><i style="background:var(--amber)"></i>กำลังทำ <b>${h.tot.active}</b></span>
+          <span><i style="background:var(--green)"></i>เสร็จ <b>${h.tot.done}</b></span>
+          <span><i style="background:#a3b1c2"></i>ยกเลิก <b>${h.tot.cancel}</b></span>
+          <span class="ops-seg" style="margin:0;gap:4px;">
+            <button data-m="job" class="${D.metric === "job" ? "on" : ""}" style="min-height:36px;padding:4px 12px;">งาน</button>
+            <button data-m="pallet" class="${D.metric === "pallet" ? "on" : ""}" style="min-height:36px;padding:4px 12px;">พาเลท</button>
+          </span>
+        </div>
+      </div>
+      ${h.hours.length ? `<div class="desk-tl-bars">${h.hours.map(x=>{
+        const b = h.by[x];
+        if(!b) return `<div class="desk-bar empty"><div class="tot">&nbsp;</div><div class="hr">${String(x).padStart(2,"0")}:00</div></div>`;
+        const tot = b.wait + b.active + b.done + b.cancel;
+        const seg = (v, c)=> v ? `<div style="height:${Math.max(3, Math.round(v / max * H))}px;background:${c}"></div>` : "";
+        return `<button class="desk-bar ${D.hour === x ? "on" : ""}" data-h="${x}" aria-label="ชั่วโมง ${x}:00 มี ${tot} ${unit}">
+          <div class="tot">${tot}</div>
+          <div class="stack">${seg(b.cancel,"#a3b1c2")}${seg(b.wait,"var(--warn)")}${seg(b.active,"var(--amber)")}${seg(b.done,"var(--green)")}</div>
+          <div class="hr">${String(x).padStart(2,"0")}:00</div></button>`;
+      }).join("")}</div>
+      <div class="field-note" style="margin-top:6px;">แสดงเฉพาะช่วงที่มีงาน (ช่วงที่ว่างตรงกลางยังเว้นไว้ตามเวลาจริง) · ส่วนที่ไม่ใช่สีเขียวคืองานที่ยังค้างจากชั่วโมงนั้น · กดแท่งเพื่อดูรายการงานของชั่วโมงนั้น</div>`
+      : `<div class="empty">วันนี้ยังไม่มีงานที่เปิด</div>`}`;
+    tlBox.querySelectorAll("[data-m]").forEach(b=> b.onclick = ()=>{ D.metric = b.dataset.m; drawTimeline(); });
+    tlBox.querySelectorAll("[data-h]").forEach(b=> b.onclick = ()=>{
+      const x = Number(b.dataset.h); D.hour = D.hour === x ? null : x; drawTimeline(); drawRight();
+    });
+  }
+
+  // ---- columns ----
+  const cols = el(`<div class="ops-cols">
+    <section class="ops-col" id="dk-left"></section>
+    <section class="ops-col" id="dk-mid"></section>
+    <section class="ops-col" id="dk-right"></section>
+  </div>`);
+  root.appendChild(cols);
+  const left = cols.querySelector("#dk-left"), mid = cols.querySelector("#dk-mid"), right = cols.querySelector("#dk-right");
+
+  if(!waiting.some(t=> String(t.id) === String(D.sel))) D.sel = waiting.length ? waiting[0].id : null;
+
+  function drawLeft(){
+    left.innerHTML = `<div class="section-title" style="margin-top:0;">ต้องมอบหมาย (${waiting.length}) <span class="field-note">เก่าสุดก่อน · กดการ์ดเพื่อเลือกคนขับ</span></div>`;
+    const box = el(`<div class="ops-col-scroll"></div>`);
+    left.appendChild(box);
+    if(!waiting.length){ box.appendChild(el(`<div class="empty">ไม่มีงานที่รอมอบหมาย 🎉</div>`)); return; }
+    waiting.forEach(t=>{
+      const c = el(`<div class="desk-card ${String(t.id) === String(D.sel) ? "sel" : ""}" data-id="${t.id}" style="cursor:pointer;">
+        <div class="row"><div><div class="code">${escHtml(t.task_code)}</div>
+          <div class="sub">${escHtml(t.from_location || "-")} → ${escHtml(t.to_location || "-")}</div></div>
+          ${waitBadge(minsSince(t.created_at))}</div>
+        <div class="sub">${t.pallet_qty || 0} พาเลท · ผู้ขอ ${escHtml(t.requester_name || t.requester_employee_id || "-")}</div>
+        <div class="acts"><button class="btn amber" data-pick>มอบหมาย</button><button class="btn" data-sendback>ตีกลับ</button></div>
+      </div>`);
+      c.onclick = (e)=>{
+        if(e.target.closest("[data-sendback]")){ openSendBackSheet(t.id); return; }
+        D.sel = t.id; drawLeft(); drawMid();
+      };
+      box.appendChild(c);
+    });
+  }
+
+  function drawMid(){
+    mid.innerHTML = `<div class="section-title" style="margin-top:0;">มอบหมายงาน</div>`;
+    const t = waiting.find(x=> String(x.id) === String(D.sel));
+    const box = el(`<div class="ops-col-scroll"></div>`);
+    mid.appendChild(box);
+    if(!t){ box.appendChild(el(`<div class="empty">เลือกงานทางซ้ายเพื่อเลือกคนขับ</div>`)); return; }
+    const pick = (D.pick[t.id] = D.pick[t.id] || {});
+    box.appendChild(el(`<div class="desk-card sel">
+      <div class="code">${escHtml(t.task_code)}</div>
+      <div class="sub">${escHtml(t.from_location || "-")} → ${escHtml(t.to_location || "-")} · ${t.pallet_qty || 0} พาเลท · ${waitBadge(minsSince(t.created_at))}</div>
+      ${t.remark ? `<div class="sub">หมายเหตุ: ${escHtml(t.remark)}</div>` : ""}
+    </div>`));
+
+    const typeOf = (d)=> d.vehicleType || d.licenses[0] || null;
+    const byName = (a,b)=> a.name.localeCompare(b.name, "th");
+    const free = snap.filter(d=> d.status === "Available" && d.vehicleCode).sort(byName);
+    const busy = snap.filter(d=> d.status === "Busy").sort(byName);
+    const out = snap.filter(d=> !free.includes(d) && !busy.includes(d)).sort(byName);
+
+    const row = (d, sub)=>{
+      const type = typeOf(d);
+      const on = !!pick[d.emp];
+      const lab = el(`<label class="desk-drv ${on ? "on" : ""} ${type ? "" : "off"}">
+        <input type="checkbox" ${on ? "checked" : ""} ${type ? "" : "disabled"} />
+        <span style="min-width:0;"><span class="nm">${escHtml(d.name)}</span>
+          <span class="sb"> · ${type ? escHtml(type) : "ไม่มีใบอนุญาต"}${d.vehicleCode ? " " + escHtml(d.vehicleCode) : ""}</span><br>
+          <span class="sb">${sub}</span></span>
+        ${d.status === "Available" && d.vehicleCode ? `<span class="tag-free">ว่าง</span>` : ""}
+      </label>`);
+      lab.querySelector("input").onchange = (e)=>{
+        if(e.target.checked) pick[d.emp] = type; else delete pick[d.emp];
+        lab.classList.toggle("on", e.target.checked); syncBtn();
+      };
+      return lab;
+    };
+    const group = (title, list, subOf)=>{
+      if(!list.length) return;
+      box.appendChild(el(`<div class="desk-grp">${title} · ${list.length} คน</div>`));
+      list.forEach(d=> box.appendChild(row(d, subOf(d))));
+    };
+    group("ว่างพร้อมรับงาน", free, d=> d.queueLen ? `มี ${d.queueLen} งานในคิว` : "พร้อมรับงานทันที");
+    group("ติดงานอยู่", busy, d=> `${d.task ? `${escHtml(d.task.task_code)} · ทำมา ${fmtDuration(d.busyMins)}` : "ติดงานอยู่"}${d.queueLen ? ` · มี ${d.queueLen} งานในคิว` : ""}`);
+    group("ยังไม่พร้อม", out, d=> d.vehicleCode ? (DRIVER_STATUS_LABEL[d.status] || d.status) : "ยังไม่เช็คอินรถ");
+    if(!snap.length) box.appendChild(el(`<div class="empty">ยังไม่มีคนขับในระบบ</div>`));
+
+    const foot = el(`<div style="position:sticky;bottom:0;background:var(--bg,#fff);padding-top:8px;">
+      <div class="field-note" style="margin-bottom:6px;">ติ๊กได้หลายคนต่อหนึ่งงาน · รายชื่อไม่ได้จัดอันดับ ผู้กระจายงานเป็นผู้เลือกเอง</div>
+      <div style="display:flex;gap:8px;"><button class="primary" id="dk-go" style="flex:1;min-height:48px;" disabled>เลือกคนขับก่อน</button>
+      <button class="btn" id="dk-more" style="min-height:48px;">ตัวเลือกเพิ่มเติม</button></div></div>`);
+    mid.appendChild(foot);
+    const go = foot.querySelector("#dk-go");
+    function syncBtn(){
+      const n = Object.keys(pick).length;
+      go.disabled = !n; go.textContent = n ? `มอบหมาย ${n} คน` : "เลือกคนขับก่อน";
+    }
+    syncBtn();
+    foot.querySelector("#dk-more").onclick = ()=> openAssignSheet(t.id, false);
+    async function submit(force){
+      const crew = Object.entries(pick).map(([employee_id, vehicle_type])=> ({employee_id, vehicle_type}));
+      if(!crew.length) return;
+      const lock = `desk:${t.id}`;
+      if(_inFlightActions.has(lock)) return;
+      _inFlightActions.add(lock); go.disabled = true; go.textContent = "กำลังมอบหมาย...";
+      try{
+        await api(`/tasks/${t.id}/assign`, {method:"POST", body: JSON.stringify({crew, reason: "", force: !!force})});
+        toast(`มอบหมาย ${t.task_code} แล้ว (${crew.length} คน)`);
+        delete D.pick[t.id];
+        await refreshAll();
+      }catch(e){
+        if(e.status === 409 && !force){
+          if(confirm(`${e.message}\n\nยืนยันมอบหมายทั้งที่ไม่ตรงเงื่อนไข?`)){ _inFlightActions.delete(lock); return submit(true); }
+        } else toast(e.message || "มอบหมายไม่สำเร็จ");
+        syncBtn();
+      }finally{ _inFlightActions.delete(lock); }
+    }
+    go.onclick = ()=> submit(false);
+  }
+
+  const rightHead = el(`<div></div>`);
+  right.appendChild(rightHead);
+  const rightList = el(`<div class="ops-col-scroll"></div>`);
+  right.appendChild(rightList);
+  const doneN = all.filter(t=> ["Completed","Cancelled"].includes(t.status)).length;
+  rightHead.innerHTML = `<div class="section-title" style="margin-top:0;">กำลังทำ (${working.length})
+      <span class="field-note">ค้างนานขึ้นก่อน</span></div>
+    <input id="dk-q" placeholder="ค้นหาทุกงาน: เลขงาน / ผู้ขอ / คนขับ / สถานที่" autocomplete="off" style="margin-bottom:6px;" />
+    <button class="btn" id="dk-done" style="width:100%;min-height:40px;margin-bottom:8px;"></button>`;
+  const qIn = rightHead.querySelector("#dk-q"), doneBtn = rightHead.querySelector("#dk-done");
+  qIn.value = D.q;
+  function drawRight(){
+    doneBtn.textContent = D.showDone ? `ซ่อนงานที่จบแล้ว (${doneN})` : `งานที่จบแล้ว ${doneN} งาน — ซ่อนอยู่ · กดเพื่อแสดง`;
+    const q = (D.q || "").trim();
+    let list;
+    if(q || D.hour !== null || D.showDone){
+      list = all.filter(t=>
+        (!q || taskMatchesQuery(t, q)) &&
+        (D.hour === null || (t.created_at && bkkParts(t.created_at).day === bkkParts(new Date().toISOString()).day && bkkParts(t.created_at).hour === D.hour)) &&
+        (q || D.showDone || !["Completed","Cancelled"].includes(t.status)));
+      list.sort((a,b)=> String(b.created_at||"").localeCompare(String(a.created_at||"")));
+    } else {
+      list = working.slice().sort((a,b)=>
+        String(a.started_at || a.accepted_at || a.created_at || "").localeCompare(String(b.started_at || b.accepted_at || b.created_at || "")));
+    }
+    rightList.innerHTML = "";
+    if(D.hour !== null || q){
+      const chip = el(`<div class="field-note" style="margin-bottom:6px;">${D.hour !== null ? `ชั่วโมง ${String(D.hour).padStart(2,"0")}:00 ` : ""}${q ? `ค้นหา "${escHtml(q)}" ` : ""}· ${list.length} งาน
+        <button class="btn" style="min-height:32px;padding:2px 10px;margin-left:6px;">ล้าง</button></div>`);
+      chip.querySelector("button").onclick = ()=>{ D.hour = null; D.q = ""; qIn.value = ""; drawTimeline(); drawRight(); };
+      rightList.appendChild(chip);
+    }
+    if(!list.length){ rightList.appendChild(el(`<div class="empty">${q ? "ไม่พบงานที่ค้นหา" : "ไม่มีงานที่กำลังทำ"}</div>`)); return; }
+    list.forEach(t=>{
+      const names = (t.drivers || []).map(d=> d.full_name || d.employee_id).join(", ");
+      const since = t.started_at || t.accepted_at || t.created_at;
+      const live = ["Assigned","In Progress","Pause"].includes(t.status);
+      const od = isOverdue(t, Date.now());
+      const c = el(`<div class="desk-card" data-id="${t.id}" style="cursor:pointer;">
+        <div class="row"><div><div class="code">${escHtml(t.task_code)}</div>
+          <div class="sub">${names ? escHtml(names) + " · " : ""}${escHtml(t.from_location || "-")} → ${escHtml(t.to_location || "-")}</div></div>
+          <span class="badge ${od ? "bad" : live ? "ok" : ""}">${live ? fmtDuration(minutesAgo(since)) : (STATUS_LABEL[t.status] || t.status)}</span></div>
+        ${live ? `<div class="acts"><button class="btn blue" data-re>แก้ไขการมอบหมาย</button></div>` : ""}
+      </div>`);
+      c.onclick = (e)=>{
+        if(e.target.closest("[data-re]")){ openAssignSheet(t.id, true); return; }
+        openTaskDetailSheet(t.id);
+      };
+      rightList.appendChild(c);
+    });
+  }
+  qIn.addEventListener("input", ()=>{ D.q = qIn.value; drawRight(); });
+  doneBtn.onclick = ()=>{ D.showDone = !D.showDone; drawRight(); };
+
+  drawTimeline(); drawLeft(); drawMid(); drawRight();
+}
+
 function renderOperationJobs(main){
+  // The three-column desk needs room; below that the single-column list is
+  // the better fit (phones, narrow windows).
+  if(window.matchMedia && window.matchMedia("(min-width:1200px)").matches) renderOpsDesk(main);
+  else renderOperationJobsList(main);
+}
+
+function renderOperationJobsList(main){
   if(!state.opsJobFilter || state.opsJobFilter.status === "") {
     // "" was the old "show everything" default; the working list is now the default.
     state.opsJobFilter = {...OPS_DEFAULT_FILTER};
@@ -6301,7 +6625,15 @@ function renderOperationJobs(main){
 
   // Who is free, and who frees up when — the first thing needed before
   // handing out work, so it sits above the queue.
-  renderDriversNowPanel(main);
+  // Folded on a phone so the queue is what you see first; the summary line
+  // still says how many are free.
+  {
+    const snapM = driverSnapshot();
+    const freeM = snapM.filter(d=> d.status === "Available" && d.vehicleCode).length;
+    const wrap = el(`<details style="margin-bottom:12px;"><summary class="card" style="cursor:pointer;min-height:44px;margin:0;font-weight:700;">คนขับว่าง ${freeM} จาก ${snapM.filter(d=> d.status !== "Not Checked-in").length} คนที่มาทำงาน <span class="field-note">· แตะเพื่อดูรายละเอียด</span></summary></details>`);
+    renderDriversNowPanel(wrap);
+    main.appendChild(wrap);
+  }
 
   const now = Date.now();
   const activeTasks = state.tasks.filter(t=> !["Completed","Cancelled"].includes(t.status));
@@ -6312,14 +6644,23 @@ function renderOperationJobs(main){
     <div class="stat"><div class="n">${activeTasks.filter(t=> isOverdue(t, now)).length}</div><div class="l">ค้างนาน (Overdue)</div></div>
   </div>`));
 
+  const nWorking = activeTasks.length - waiting;
+  const seg = el(`<div class="ops-seg" role="tablist">
+    <button data-st="Waiting">ต้องมอบหมาย<span class="n">${waiting}</span></button>
+    <button data-st="working">กำลังทำ<span class="n">${nWorking}</span></button>
+    <button data-st="all">ทั้งหมด</button>
+  </div>`);
+  main.appendChild(seg);
+  const paintSeg = ()=> seg.querySelectorAll("button").forEach(b=> b.classList.toggle("on", b.dataset.st === (["Waiting","working","all"].includes(f.status) ? f.status : "all")));
   const filterBar = el(`<div class="card">
-    <label>ค้นหางาน</label>
+    <label>ค้นหางาน (รวมงานที่เสร็จ/ยกเลิก)</label>
     <input id="oj-q" placeholder="เลขงาน / ผู้ขอ / ต้นทาง / ปลายทาง / คนขับ" autocomplete="off" />
-    <div style="margin-top:8px;">
+    <details style="margin-top:8px;"><summary class="field-note" style="cursor:pointer;min-height:36px;">ตัวกรองเพิ่มเติม</summary>
       <div><label>สถานะ</label><select id="oj-status">
-        <option value="active">ยังไม่เสร็จ (ไม่รวมเสร็จสิ้น/ยกเลิก)</option>
-        <option value="all">ทั้งหมด</option>
         <option value="Waiting">รอดำเนินการ</option>
+        <option value="working">กำลังทำ (มอบหมายแล้ว/กำลังทำ/หยุด)</option>
+        <option value="active">ยังไม่เสร็จทั้งหมด</option>
+        <option value="all">ทั้งหมด (รวมเสร็จสิ้น/ยกเลิก)</option>
         <option value="Assigned">มอบหมายแล้ว</option>
         <option value="In Progress">กำลังทำ</option>
         <option value="Pause">ขัดข้อง</option>
@@ -6329,7 +6670,7 @@ function renderOperationJobs(main){
       <label style="display:flex;align-items:center;gap:8px;padding:10px 0 0;">
         <input type="checkbox" id="oj-overdue" style="width:auto;" /> เฉพาะงานค้าง (Overdue)
       </label>
-    </div>
+    </details>
   </div>`);
   main.appendChild(filterBar);
   const qInput = filterBar.querySelector("#oj-q");
@@ -6345,8 +6686,12 @@ function renderOperationJobs(main){
   main.appendChild(listBox);
 
   function statusMatch(t){
+    // Finished and cancelled work stays out of the way, but a search always
+    // looks through everything so an old job is never "missing".
+    if(f.q && f.q.trim()) return true;
     if(f.status === "all") return true;
     if(f.status === "active") return !["Completed","Cancelled"].includes(t.status);
+    if(f.status === "working") return ["Assigned","In Progress","Pause"].includes(t.status);
     return t.status === f.status;
   }
   function codeMatch(t){
@@ -6360,7 +6705,7 @@ function renderOperationJobs(main){
     // Oldest first: work should be handed out front-to-back, so the job that
     // has waited longest is the one at the top.
     tasks.sort((a,b)=> String(a.created_at||"").localeCompare(String(b.created_at||"")));
-    listBox.appendChild(el(`<div class="section-title">งาน (${tasks.length}) · เก่าสุดก่อน</div>`));
+    listBox.appendChild(el(`<div class="section-title">งาน (${tasks.length}) · เก่าสุดก่อน${f.q && f.q.trim() ? " · ค้นหาทุกสถานะ" : ""}</div>`));
 
     if(tasks.length === 0){
       // A task number that exists but sits outside the current status filter
@@ -6411,7 +6756,9 @@ ${actions}
   }
 
   qInput.addEventListener("input", ()=>{ f.q = qInput.value; drawList(); });
-  statusSel.onchange = ()=>{ f.status = statusSel.value; drawList(); };
+  seg.querySelectorAll("button").forEach(b=> b.onclick = ()=>{ f.status = b.dataset.st; statusSel.value = f.status; paintSeg(); drawList(); });
+  paintSeg();
+  statusSel.onchange = ()=>{ f.status = statusSel.value; paintSeg(); drawList(); };
   overdueCb.onchange = ()=>{ f.overdue = overdueCb.checked; drawList(); };
   drawList();
 }
@@ -6557,6 +6904,7 @@ async function openAssignSheet(taskId, isReassign){
         emp: d.emp, name: d.name, type,
         veh: mustSwap ? null : d.vehicleCode, hasVehicle: !mustSwap && !!d.vehicleCode,
         issues, k: key(d.emp, type),
+        free: d.status === "Available" && !!d.vehicleCode && !mustSwap,
         // Whose area this job is in. A suggestion, never a restriction — the
         // dispatcher can still pick anybody on the list.
         zone: zoneMatchOf(t, d.zones),
@@ -6604,7 +6952,7 @@ async function openAssignSheet(taskId, isReassign){
           r.zone ? ` <span class="zone-tag ${r.zone.cls}">${r.zone.short}</span>` : ""}</span>
         ${r.issues.length ? `<span class="dp-warn">⚠ ${r.issues.join(" · ")}</span>` : ""}
       </span>
-      ${before.has(r.k) ? `<span class="tag-on">ทำงานอยู่</span>` : ""}
+      ${before.has(r.k) ? `<span class="tag-on">ทำงานอยู่</span>` : (r.free ? `<span class="tag-free">ว่าง</span>` : "")}
     </label>`;
 
   const overlay = el(`
