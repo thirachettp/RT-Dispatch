@@ -5221,6 +5221,21 @@ async function renderAdminDashboard(main){
   });
   main.appendChild(periodBar);
 
+  // Four tabs instead of one long scroll: what is happening now, how long
+  // people wait, who is carrying the work, and what went wrong. All four load
+  // together (same requests as before) and the tabs only show/hide them.
+  if(!state.dashTab) state.dashTab = "now";
+  const DTABS = [["now","ตอนนี้"],["wait","เวลารอ"],["drivers","คนขับ"],["quality","คุณภาพ"]];
+  const tabBar = el(`<div class="ops-seg" role="tablist">${DTABS.map(([k,l])=>`<button data-t="${k}">${l}</button>`).join("")}</div>`);
+  main.appendChild(tabBar);
+  const host = {};
+  DTABS.forEach(([k])=>{ host[k] = el(`<div data-dtab="${k}"></div>`); });
+  function paintDashTab(){
+    tabBar.querySelectorAll("button").forEach(x=> x.classList.toggle("on", x.dataset.t === state.dashTab));
+    DTABS.forEach(([k])=> host[k].style.display = k === state.dashTab ? "" : "none");
+  }
+  tabBar.querySelectorAll("button").forEach(x=> x.onclick = ()=>{ state.dashTab = x.dataset.t; paintDashTab(); });
+
   const pullIndicator = el(`<div style="text-align:center;font-size:12px;color:var(--ink-dim);height:0;overflow:hidden;transition:height .15s;">ดึงลงเพื่อรีเฟรช</div>`);
   main.appendChild(pullIndicator);
 
@@ -5230,50 +5245,55 @@ async function renderAdminDashboard(main){
   </div>`);
   main.appendChild(refreshRow);
 
-  main.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">สถานการณ์ตอนนี้ <span class="field-note" style="font-weight:400;">(ไม่ขึ้นกับช่วงเวลาที่เลือก)</span></div>`));
+  host.now.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">สถานการณ์ตอนนี้ <span class="field-note" style="font-weight:400;">(ไม่ขึ้นกับช่วงเวลาที่เลือก)</span></div>`));
   const liveCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(liveCard);
+  host.now.appendChild(liveCard);
 
-  main.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">สถานะงาน</div>`));
+  host.now.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">สถานะงาน</div>`));
   const jobsCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(jobsCard);
+  host.now.appendChild(jobsCard);
 
-  main.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">ประสิทธิภาพ</div>`));
+  host.wait.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">ประสิทธิภาพ</div>`));
   const perfCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(perfCard);
+  host.wait.appendChild(perfCard);
 
-  main.appendChild(el(`<div class="section-title">เวลารอคอย</div>`));
+  host.wait.appendChild(el(`<div class="section-title">เวลารอคอย</div>`));
   const waitCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(waitCard);
+  host.wait.appendChild(waitCard);
 
-  main.appendChild(el(`<div class="section-title">กำลังคน</div>`));
+  host.drivers.appendChild(el(`<div class="section-title">กำลังคน</div>`));
   const headCard = el(`<div class="card" id="headcount-card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(headCard);
+  host.drivers.appendChild(headCard);
 
-  main.appendChild(el(`<div class="section-title">แยกตาม Cost center</div>`));
+  host.drivers.appendChild(el(`<div class="section-title">แยกตาม Cost center</div>`));
   const ccCard = el(`<div class="card" id="cc-chart-card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(ccCard);
+  host.drivers.appendChild(ccCard);
 
-  main.appendChild(el(`<div class="section-title">ปริมาณงานตามเวลาที่เปิดงาน</div>`));
+  host.now.appendChild(el(`<div class="section-title">ปริมาณงานตามเวลาที่เปิดงาน</div>`));
   const chartCard = el(`<div class="card" id="volume-chart-card"><div class="empty">กำลังโหลดกราฟ...</div></div>`);
-  main.appendChild(chartCard);
+  host.now.appendChild(chartCard);
+  host.now.appendChild(el(`<div class="section-title">งานที่รอนานสุด</div>`));
+  const oldestCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+  host.now.appendChild(oldestCard);
 
-  main.appendChild(el(`<div class="section-title">ภาระงานรายคนขับ</div>`));
+  host.drivers.appendChild(el(`<div class="section-title">ภาระงานรายคนขับ</div>`));
   const drvCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(drvCard);
+  host.drivers.appendChild(drvCard);
 
-  main.appendChild(el(`<div class="section-title">เส้นทางที่ถูกเรียกมากที่สุด</div>`));
+  host.drivers.appendChild(el(`<div class="section-title">เส้นทางที่ถูกเรียกมากที่สุด</div>`));
   const routeCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(routeCard);
+  host.drivers.appendChild(routeCard);
 
-  main.appendChild(el(`<div class="section-title">ยกเลิกและหยุดงาน</div>`));
+  host.quality.appendChild(el(`<div class="section-title">ยกเลิกและหยุดงาน</div>`));
   const cpCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(cpCard);
+  host.quality.appendChild(cpCard);
 
-  main.appendChild(el(`<div class="section-title">รีวิวและคะแนน</div>`));
+  host.quality.appendChild(el(`<div class="section-title">รีวิวและคะแนน</div>`));
   const revCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
-  main.appendChild(revCard);
+  host.quality.appendChild(revCard);
 
+  DTABS.forEach(([k])=> main.appendChild(host[k]));
+  paintDashTab();
   main.appendChild(el(`<div class="section-title">ส่งออกข้อมูล</div>`));
   const exportCard = el(`<div class="card">
     <div class="field-note" style="margin-bottom:10px;">ดาวน์โหลดข้อมูลงานเป็น Excel (รายละเอียดครบ + ช่วงเวลาที่หยุด/ปัญหาแยกชีต) เพื่อนำไปวัด performance ต่อ</div>
@@ -5330,14 +5350,14 @@ async function renderAdminDashboard(main){
     }catch(e){ chartCard.innerHTML = ""; chartCard.appendChild(el(`<div class="empty">โหลดกราฟไม่สำเร็จ</div>`)); }
     try{
       const ins = await api(`/dashboard/insights?period=${state.dashPeriod}`, {background:true});
-      renderLiveCard(liveCard, ins);
+      renderLiveCard(liveCard, ins, oldestCard);
       renderWaitCard(waitCard, ins);
       renderDriversCard(drvCard, ins);
       renderRoutesCard(routeCard, ins);
       renderCancelPauseCard(cpCard, ins);
       renderReviewsCard(revCard, ins);
     }catch(e){
-      [liveCard, waitCard, drvCard, routeCard, cpCard, revCard].forEach(c=>{
+      [liveCard, oldestCard, waitCard, drvCard, routeCard, cpCard, revCard].forEach(c=>{
         c.innerHTML = ""; c.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`));
       });
     }
@@ -5764,7 +5784,7 @@ function renderSlotBars(card, slots, {unit, hotAt, titleOf}){
   }
 }
 
-function renderLiveCard(card, ins){
+function renderLiveCard(card, ins, oldestCard){
   const L = ins.live;
   const long = L.waiting_over;
   card.innerHTML = "";
@@ -5785,8 +5805,11 @@ function renderLiveCard(card, ins){
   else{ msg = `${long} งานรอเกิน ${L.threshold} นาที และคนขับที่มาวันนี้มีงานครบทุกคนแล้ว`; tone = "var(--red)"; }
   card.appendChild(el(`<div style="margin:8px 0 4px;font-size:13px;font-weight:700;color:${tone};">${escHtml(msg)}</div>`));
 
+  const oc = oldestCard || card;
+  if(oldestCard) oldestCard.innerHTML = "";
+  if(oldestCard && !L.oldest.length) oldestCard.appendChild(el(`<div class="empty">ไม่มีงานที่รออยู่</div>`));
   if(L.oldest.length){
-    card.appendChild(el(`<div class="field-note" style="margin:8px 0 6px;">งานที่รอนานสุด (กดเพื่อดูรายละเอียด)</div>`));
+    oc.appendChild(el(`<div class="field-note" style="margin:0 0 6px;">กดเพื่อเปิดรายละเอียดงาน</div>`));
     L.oldest.forEach(w=>{
       const bad = (w.minutes || 0) >= L.threshold;
       const row = el(`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 10px;margin-bottom:6px;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;cursor:pointer;">
@@ -5798,7 +5821,7 @@ function renderLiveCard(card, ins){
         <span style="flex:none;font-size:12px;font-weight:700;color:#fff;background:${bad ? "var(--red)" : "var(--slate)"};border-radius:999px;padding:3px 10px;">รอ ${escHtml(fmtMinutes(w.minutes))}</span>
       </div>`);
       row.onclick = ()=> openTaskDetailSheet(w.id);
-      card.appendChild(row);
+      oc.appendChild(row);
     });
   }
 }
