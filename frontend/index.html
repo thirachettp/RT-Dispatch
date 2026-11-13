@@ -650,7 +650,7 @@
   .desk-tl-head{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;justify-content:space-between;margin-bottom:6px;}
   .desk-tl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;font-size:12px;}
   .desk-tl-legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px;}
-  .desk-tl-bars{display:flex;gap:6px;align-items:flex-end;height:130px;}
+  .desk-tl-bars{display:flex;gap:6px;align-items:flex-end;height:104px;}
   .desk-bar{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;border:0;background:none;padding:0;font:inherit;color:inherit;cursor:pointer;min-width:0;}
   .desk-bar .stack{width:100%;max-width:64px;display:flex;flex-direction:column;border-radius:4px 4px 0 0;overflow:hidden;}
   .desk-bar.on .stack{outline:2px solid var(--ink);outline-offset:1px;}
@@ -659,11 +659,12 @@
   .desk-bar.empty{cursor:default;}
   .ops-cols{display:grid;grid-template-columns:minmax(290px,1fr) minmax(360px,1.25fr) minmax(290px,1fr);gap:12px;align-items:start;}
   .ops-col{min-width:0;}
-  .ops-col-scroll{max-height:calc(100vh - 430px);min-height:260px;overflow:auto;padding-right:2px;}
+  .ops-col-scroll{padding-right:2px;}
   .desk-card{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:8px;}
   .desk-card.sel{border-color:var(--amber);box-shadow:0 0 0 2px rgba(37,99,235,.25);}
   .desk-card .code{font-weight:800;}
-  .desk-card .sub{font-size:12px;color:var(--ink-dim);margin-top:2px;}
+  .desk-card .sub{font-size:12px;color:var(--ink-dim);margin-top:2px;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+  .desk-card .row>div{min-width:0;}
   .desk-card .row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;}
   .desk-card .acts{display:flex;gap:6px;margin-top:8px;}
   .desk-card .acts .btn{flex:1;min-height:44px;}
@@ -6402,7 +6403,7 @@ function opsHourly(tasks, metric){
 function renderOpsDesk(main){
   if(!state.opsDesk) state.opsDesk = {metric: "job", hour: null, q: "", showDone: false, sel: null, pick: {}};
   const D = state.opsDesk;
-  const root = el(`<div></div>`);
+  const root = el(`<div style="padding-bottom:80px;"></div>`);
   main.appendChild(root);
 
   const all = state.tasks || [];
@@ -6431,7 +6432,7 @@ function renderOpsDesk(main){
     const unit = D.metric === "pallet" ? "พาเลท" : "งาน";
     const totAll = h.tot.wait + h.tot.active + h.tot.done + h.tot.cancel;
     const max = Math.max(1, ...h.hours.map(x=> { const b = h.by[x]; return b ? b.wait + b.active + b.done + b.cancel : 0; }));
-    const H = 84;
+    const H = 58;
     tlBox.innerHTML = `
       <div class="desk-tl-head">
         <div><b>${unit}ที่เปิดวันนี้ตามชั่วโมง</b> <span class="field-note">${totAll} ${unit} · ยังไม่เสร็จ ${h.tot.wait + h.tot.active}</span></div>
@@ -6456,7 +6457,7 @@ function renderOpsDesk(main){
           <div class="stack">${seg(b.cancel,"#a3b1c2")}${seg(b.wait,"var(--warn)")}${seg(b.active,"var(--amber)")}${seg(b.done,"var(--green)")}</div>
           <div class="hr">${String(x).padStart(2,"0")}:00</div></button>`;
       }).join("")}</div>
-      <div class="field-note" style="margin-top:6px;">แสดงเฉพาะช่วงที่มีงาน (ช่วงที่ว่างตรงกลางยังเว้นไว้ตามเวลาจริง) · ส่วนที่ไม่ใช่สีเขียวคืองานที่ยังค้างจากชั่วโมงนั้น · กดแท่งเพื่อดูรายการงานของชั่วโมงนั้น</div>`
+      <div class="field-note" style="margin-top:4px;">แสดงเฉพาะช่วงที่มีงาน · ส่วนที่ไม่ใช่สีเขียวคือยังค้าง · กดแท่งเพื่อดูงานของชั่วโมงนั้น</div>`
       : `<div class="empty">วันนี้ยังไม่มีงานที่เปิด</div>`}`;
     tlBox.querySelectorAll("[data-m]").forEach(b=> b.onclick = ()=>{ D.metric = b.dataset.m; drawTimeline(); });
     tlBox.querySelectorAll("[data-h]").forEach(b=> b.onclick = ()=>{
