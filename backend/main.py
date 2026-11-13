@@ -140,7 +140,7 @@ VAPID_SUBJECT, VAPID_SUBJECT_SOURCE = resolve_vapid_subject()
 # This is the single source of truth: the number is substituted into the page
 # when index.html is served, so the frontend can't drift out of step with it.
 # ---------------------------------------------------------------------------
-APP_VERSION = "TTLOD.261112.1958"
+APP_VERSION = "TTLOD.261113.1345"
 
 # Advance booking ("จองล่วงหน้า") is switched off, not deleted.
 #
@@ -7082,6 +7082,255 @@ def dashboard_overview(period: str = "today", user=Depends(require_ops())):
             },
             "trend": trend,
         }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard insights: everything OPS needs to read the situation and decide —
+# what is stuck right now, how long people wait, who carries the work, where it
+# goes, what gets cancelled or paused, and what the requesters think.
+#
+# One endpoint, so the Dashboard costs one extra round-trip rather than six, and
+# every query pulls only the few columns it aggregates (the database's transfer
+# allowance is the scarce resource, not CPU).
+# ---------------------------------------------------------------------------
+WAIT_BUCKETS = ((5, "≤5"), (10, "6–10"), (15, "11–15"), (30, "16–30"), (60, "31–60"), (None, ">60"))
+WAIT_LONG_MIN = 30      # "waited too long" for the headline share
+QUICK_CLOSE_MIN = 1     # started→finished within this is probably a premature close
+
+
+def _median(xs):
+    s = sorted(xs)
+    n = len(s)
+    if not n:
+        return None
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def _percentile(xs, p):
+    """Linear-interpolated percentile (p in 0..100); None for an empty list."""
+    s = sorted(xs)
+    if not s:
+        return None
+    k = (len(s) - 1) * p / 100
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _r1(v):
+    return None if v is None else round(v, 1)
+
+
+def _mins(a, b):
+    """Minutes from ISO string a to b, or None when either is missing/unreadable."""
+    da, db_ = _parse_iso(a), _parse_iso(b)
+    if not da or not db_:
+        return None
+    return (db_ - da).total_seconds() / 60
+
+
+@app.get("/dashboard/insights")
+def dashboard_insights(period: str = "today", user=Depends(require_ops())):
+    start_bkk = _dash_window_start_bkk(period)
+    since = (start_bkk - BKK_OFFSET).isoformat(timespec="seconds") + "Z"
+    now = datetime.utcnow()
+    now_iso = now.isoformat(timespec="seconds") + "Z"
+    by_hour = period == "today"
+
+    with get_db() as db:
+        zone_names = {z["zone_key"]: z["zone_name_th"] for z in
+                      db.execute("SELECT zone_key, zone_name_th FROM zones").fetchall()}
+
+        # ---- 1. Right now (not tied to the period) -------------------------
+        waiting = db.execute(
+            "SELECT id, task_code, created_at, from_zone, to_zone, pallet_qty, cost_center, request_type "
+            "FROM tasks WHERE status='Waiting' ORDER BY created_at LIMIT 200").fetchall()
+        # Booked-ahead jobs sit in Waiting by design; counting their age would
+        # make the board look permanently on fire.
+        waiting_now = [w for w in waiting if w["request_type"] != "Booking"]
+        wait_list = []
+        for w in waiting_now:
+            m = _mins(w["created_at"], now_iso)
+            wait_list.append({
+                "id": w["id"], "task_code": w["task_code"], "minutes": int(m) if m is not None else None,
+                "route": f"{zone_names.get(w['from_zone'], w['from_zone'])} → {zone_names.get(w['to_zone'], w['to_zone'])}",
+                "pallets": int(w["pallet_qty"] or 0), "cost_center": (w["cost_center"] or "").strip(),
+            })
+        counts = {r["status"]: int(r["n"]) for r in db.execute(
+            "SELECT status, COUNT(*) n FROM tasks WHERE status IN ('Assigned','In Progress','Pause') GROUP BY status"
+        ).fetchall()}
+        busy = db.execute(
+            "SELECT COUNT(DISTINCT a.driver_id) n FROM task_assignments a JOIN tasks t ON t.id = a.task_id "
+            "WHERE a.assignment_status='Active' AND a.is_active_for_driver=1 "
+            "AND t.status IN ('Assigned','In Progress','Pause')").fetchone()["n"]
+        present = crew_present_on(db, bkk_today())
+        live = {
+            "waiting": len(wait_list),
+            "waiting_over": sum(1 for w in wait_list if (w["minutes"] or 0) >= WAITING_TOO_LONG_MINUTES),
+            "oldest_minutes": max([w["minutes"] or 0 for w in wait_list], default=0),
+            "assigned": counts.get("Assigned", 0), "in_progress": counts.get("In Progress", 0),
+            "paused": counts.get("Pause", 0),
+            "drivers_present": int(present), "drivers_busy": int(busy),
+            "drivers_free": max(0, int(present) - int(busy)),
+            "threshold": WAITING_TOO_LONG_MINUTES,
+            "oldest": wait_list[:5],
+        }
+
+        # ---- 2. Waiting + working time -------------------------------------
+        rows = db.execute(
+            "SELECT created_at, accepted_at, started_at, completed_at, status, request_type FROM tasks "
+            "WHERE created_at >= ? AND status <> 'Cancelled'", (since,)).fetchall()
+        waits, works, slot_waits = [], [], {}
+        for r in rows:
+            if r["request_type"] == "Booking":
+                continue  # a booking's "wait" is the lead time the requester chose
+            w = _mins(r["created_at"], r["accepted_at"])
+            if w is not None and w >= 0:
+                waits.append(w)
+                at = _to_bkk(r["created_at"])
+                if at:
+                    key = at.strftime("%H") if by_hour else at.strftime("%Y-%m-%d")
+                    slot_waits.setdefault(key, []).append(w)
+            if r["status"] == "Completed":
+                d = _mins(r["started_at"], r["completed_at"])
+                if d is not None and d > 0:
+                    works.append(d)
+        # Whole minutes, so "≤5" means five minutes or less as the person sees it.
+        whole = [round(w) for w in waits]
+        dist, lo = [], -1
+        for hi, label in WAIT_BUCKETS:
+            n = sum(1 for m in whole if m > lo and (hi is None or m <= hi))
+            dist.append({"label": label, "n": n, "long": hi is None or hi > WAIT_LONG_MIN})
+            if hi is not None:
+                lo = hi
+        total_w = len(waits)
+        wait = {
+            "n": total_w,
+            "median": _r1(_median(waits)), "p90": _r1(_percentile(waits, 90)),
+            "within15_pct": round(100 * sum(1 for w in waits if w <= 15) / total_w) if total_w else None,
+            "over30_pct": round(100 * sum(1 for w in waits if w > WAIT_LONG_MIN) / total_w) if total_w else None,
+            "over30_n": sum(1 for w in waits if w > WAIT_LONG_MIN),
+            "work_median": _r1(_median(works)),
+            "quick_close_pct": round(100 * sum(1 for d in works if d <= QUICK_CLOSE_MIN) / len(works)) if works else None,
+            "dist": dist,
+            "slots": [],
+        }
+        if by_hour:
+            slot_keys = [f"{h:02d}" for h in range(24)]
+            label_of = lambda k: k
+        else:
+            n_days = 7 if period == "week" else 30
+            slot_keys = [(start_bkk + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n_days)]
+            label_of = lambda k: f"{int(k[8:])}/{int(k[5:7])}"
+        for k in slot_keys:
+            v = slot_waits.get(k)
+            wait["slots"].append({"label": label_of(k), "n": len(v) if v else 0,
+                                  "median": _r1(_median(v)) if v else None})
+
+        # ---- 3. Driver workload + popular routes ---------------------------
+        arows = db.execute(
+            "SELECT a.task_id, a.driver_id, u.full_name, t.pallet_qty, t.completed_at "
+            "FROM task_assignments a JOIN tasks t ON t.id = a.task_id JOIN users u ON u.id = a.driver_id "
+            "WHERE t.status='Completed' AND t.completed_at >= ? "
+            "AND a.assignment_status IN ('Active','Completed','Left')", (since,)).fetchall()
+        crew_of = {}
+        for r in arows:
+            crew_of.setdefault(r["task_id"], {})[r["driver_id"]] = r
+        drivers = {}
+        for tid, members in crew_of.items():
+            n = len(members)
+            for did, r in members.items():
+                d = drivers.setdefault(did, {"name": r["full_name"] or str(did), "jobs": 0.0, "pallets": 0.0, "days": set()})
+                d["jobs"] += 1 / n          # shared jobs split the credit evenly
+                d["pallets"] += int(r["pallet_qty"] or 0) / n
+                at = _to_bkk(r["completed_at"])
+                if at:
+                    d["days"].add(at.strftime("%Y-%m-%d"))
+        driver_list = []
+        for d in drivers.values():
+            jobs, pallets = d["jobs"], d["pallets"]
+            driver_list.append({
+                "name": d["name"], "jobs": round(jobs, 1), "pallets": round(pallets),
+                "days": len(d["days"]),
+                "pallets_per_job": round(pallets / jobs, 1) if jobs else 0,
+            })
+        driver_list.sort(key=lambda x: (-x["jobs"], x["name"]))
+
+        rrows = db.execute(
+            "SELECT from_zone, to_zone, COUNT(*) n, COALESCE(SUM(pallet_qty), 0) p FROM tasks "
+            "WHERE created_at >= ? AND status <> 'Cancelled' GROUP BY from_zone, to_zone "
+            "ORDER BY n DESC, p DESC LIMIT 8", (since,)).fetchall()
+        routes = [{"route": f"{zone_names.get(r['from_zone'], r['from_zone'])} → {zone_names.get(r['to_zone'], r['to_zone'])}",
+                   "jobs": int(r["n"]), "pallets": int(r["p"])} for r in rrows]
+
+        # ---- 4. Cancellations + pauses -------------------------------------
+        opened = db.execute("SELECT COUNT(*) n FROM tasks WHERE created_at >= ?", (since,)).fetchone()["n"]
+        crow = db.execute(
+            "SELECT cancel_reason FROM tasks WHERE status='Cancelled' AND created_at >= ?", (since,)).fetchall()
+        reasons = {}
+        for r in crow:
+            k = (r["cancel_reason"] or "").strip() or "ไม่ระบุเหตุผล"
+            reasons[k] = reasons.get(k, 0) + 1
+        cancel = {
+            "n": len(crow), "pct": round(100 * len(crow) / opened, 1) if opened else 0,
+            "no_reason": reasons.get("ไม่ระบุเหตุผล", 0),
+            "reasons": [{"reason": k, "n": v} for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:6]],
+        }
+        hrows = db.execute(
+            "SELECT task_id, from_status, to_status, changed_at, note FROM task_status_history "
+            "WHERE (to_status='Pause' OR from_status='Pause') AND changed_at >= ? "
+            "ORDER BY task_id, changed_at", (since,)).fetchall()
+        pause_n, pause_min, cats, preasons, open_at = 0, 0.0, {"user": 0, "vehicle": 0, "other": 0}, {}, {}
+        for h in hrows:
+            if h["to_status"] == "Pause":
+                pause_n += 1
+                open_at[h["task_id"]] = h["changed_at"]
+                m = re.match(r"\[(\w+)\]\s*(.*)", h["note"] or "")
+                cat = m.group(1) if m and m.group(1) in ("user", "vehicle") else "other"
+                cats[cat] += 1
+                txt = ((m.group(2) if m else h["note"]) or "").strip() or "ไม่ระบุเหตุผล"
+                preasons[txt] = preasons.get(txt, 0) + 1
+            elif h["from_status"] == "Pause" and h["task_id"] in open_at:
+                d = _mins(open_at.pop(h["task_id"]), h["changed_at"])
+                if d is not None and d > 0:
+                    pause_min += d
+        pause = {
+            "n": pause_n, "minutes": round(pause_min),
+            "pct": round(100 * pause_n / opened, 1) if opened else 0,
+            "user": cats["user"], "vehicle": cats["vehicle"], "other": cats["other"],
+            "reasons": [{"reason": k, "n": v} for k, v in sorted(preasons.items(), key=lambda kv: -kv[1])[:5]],
+        }
+
+        # ---- 5. Reviews -----------------------------------------------------
+        vrows = db.execute(
+            "SELECT task_code, rating, rating_comment, created_at, accepted_at, completed_at FROM tasks "
+            "WHERE status='Completed' AND completed_at >= ?", (since,)).fetchall()
+        rated = [r for r in vrows if r["rating"]]
+        stars = {i: 0 for i in range(1, 6)}
+        for r in rated:
+            stars[int(r["rating"])] = stars.get(int(r["rating"]), 0) + 1
+        low_w = [w for w in (_mins(r["created_at"], r["accepted_at"]) for r in rated if r["rating"] < 5) if w is not None and w >= 0]
+        top_w = [w for w in (_mins(r["created_at"], r["accepted_at"]) for r in rated if r["rating"] == 5) if w is not None and w >= 0]
+        commented = sorted([r for r in rated if (r["rating_comment"] or "").strip()],
+                           key=lambda r: r["completed_at"] or "", reverse=True)[:5]
+        reviews = {
+            "completed": len(vrows), "rated": len(rated),
+            "rate_pct": round(100 * len(rated) / len(vrows)) if vrows else None,
+            "avg": round(sum(r["rating"] for r in rated) / len(rated), 2) if rated else None,
+            "stars": [{"star": i, "n": stars[i]} for i in (5, 4, 3, 2, 1)],
+            "low_n": sum(1 for r in rated if r["rating"] < 5),
+            "wait_low": _r1(_median(low_w)), "wait_five": _r1(_median(top_w)),
+            "comments": [{
+                "task_code": r["task_code"], "rating": int(r["rating"]),
+                "comment": r["rating_comment"].strip()[:300],
+                "at": (_to_bkk(r["completed_at"]).strftime("%-d/%-m %H:%M") if _to_bkk(r["completed_at"]) else ""),
+            } for r in commented],
+        }
+
+    return {
+        "period": period, "by_hour": by_hour, "live": live, "wait": wait,
+        "drivers": driver_list, "routes": routes, "cancel": cancel, "pause": pause, "reviews": reviews,
+    }
 
 
 STATUS_TH = {"Waiting":"รอดำเนินการ","Assigned":"มอบหมายแล้ว","In Progress":"กำลังทำ",

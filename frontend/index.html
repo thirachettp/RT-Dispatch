@@ -5184,6 +5184,10 @@ async function renderAdminDashboard(main){
   </div>`);
   main.appendChild(refreshRow);
 
+  main.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">สถานการณ์ตอนนี้ <span class="field-note" style="font-weight:400;">(ไม่ขึ้นกับช่วงเวลาที่เลือก)</span></div>`));
+  const liveCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(liveCard);
+
   main.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">สถานะงาน</div>`));
   const jobsCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
   main.appendChild(jobsCard);
@@ -5191,6 +5195,10 @@ async function renderAdminDashboard(main){
   main.appendChild(el(`<div class="section-title" style="margin-bottom:6px;">ประสิทธิภาพ</div>`));
   const perfCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
   main.appendChild(perfCard);
+
+  main.appendChild(el(`<div class="section-title">เวลารอคอย</div>`));
+  const waitCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(waitCard);
 
   main.appendChild(el(`<div class="section-title">กำลังคน</div>`));
   const headCard = el(`<div class="card" id="headcount-card"><div class="empty">กำลังโหลด...</div></div>`);
@@ -5203,6 +5211,22 @@ async function renderAdminDashboard(main){
   main.appendChild(el(`<div class="section-title">ปริมาณงานตามเวลาที่เปิดงาน</div>`));
   const chartCard = el(`<div class="card" id="volume-chart-card"><div class="empty">กำลังโหลดกราฟ...</div></div>`);
   main.appendChild(chartCard);
+
+  main.appendChild(el(`<div class="section-title">ภาระงานรายคนขับ</div>`));
+  const drvCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(drvCard);
+
+  main.appendChild(el(`<div class="section-title">เส้นทางที่ถูกเรียกมากที่สุด</div>`));
+  const routeCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(routeCard);
+
+  main.appendChild(el(`<div class="section-title">ยกเลิกและหยุดงาน</div>`));
+  const cpCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(cpCard);
+
+  main.appendChild(el(`<div class="section-title">รีวิวและคะแนน</div>`));
+  const revCard = el(`<div class="card"><div class="empty">กำลังโหลด...</div></div>`);
+  main.appendChild(revCard);
 
   main.appendChild(el(`<div class="section-title">ส่งออกข้อมูล</div>`));
   const exportCard = el(`<div class="card">
@@ -5258,6 +5282,19 @@ async function renderAdminDashboard(main){
       chartCard.innerHTML = "";
       renderVolumeChart(chartCard, vol);
     }catch(e){ chartCard.innerHTML = ""; chartCard.appendChild(el(`<div class="empty">โหลดกราฟไม่สำเร็จ</div>`)); }
+    try{
+      const ins = await api(`/dashboard/insights?period=${state.dashPeriod}`, {background:true});
+      renderLiveCard(liveCard, ins);
+      renderWaitCard(waitCard, ins);
+      renderDriversCard(drvCard, ins);
+      renderRoutesCard(routeCard, ins);
+      renderCancelPauseCard(cpCard, ins);
+      renderReviewsCard(revCard, ins);
+    }catch(e){
+      [liveCard, waitCard, drvCard, routeCard, cpCard, revCard].forEach(c=>{
+        c.innerHTML = ""; c.appendChild(el(`<div class="empty">โหลดไม่สำเร็จ</div>`));
+      });
+    }
     state.dashLastUpdated = new Date();
     const label = document.getElementById("dash-updated-at");
     if(label) label.textContent = "อัปเดตล่าสุด " + fmtClock(state.dashLastUpdated);
@@ -5478,7 +5515,18 @@ const VOLUME_COLORS = {
   waiting: "var(--warn)", active: "var(--amber)", done: "var(--green)", cancelled: "#a3b1c2",
 };
 
+// Cut the empty slots off both ends of the timeline and keep everything between
+// them, so each bar still sits at its true hour/day with the same spacing — the
+// chart just stops spending its width on stretches where nothing happened.
+function trimVolumeBuckets(data){
+  const has = (b)=> Object.values(b.jobs).some(v=> v > 0);
+  const idx = data.buckets.map((b, i)=> has(b) ? i : -1).filter(i=> i >= 0);
+  if(!idx.length) return data;
+  return {...data, buckets: data.buckets.slice(idx[0], idx[idx.length - 1] + 1), trimmed: !!data.trimmed || idx[0] > 0 || idx[idx.length - 1] < data.buckets.length - 1};
+}
+
 function renderVolumeChart(card, data){
+  data = trimVolumeBuckets(data);
   if(!state.volumeMetric) state.volumeMetric = "jobs";
   const metric = state.volumeMetric;
   const unit = metric === "jobs" ? "งาน" : "พาเลท";
@@ -5511,7 +5559,10 @@ function renderVolumeChart(card, data){
   const W = 340, H = 150, padT = 14, padB = 20, padL = 22, padR = 2;
   const plotH = H - padT - padB, plotW = W - padL - padR;
   const gap = n > 20 ? 1.5 : 4;
-  const barW = Math.max(3, (plotW - gap * (n - 1)) / n);
+  // Capped so a short day (a few hours of work) does not turn into a few
+  // fat bars; the run is centred instead of stretched across the card.
+  const barW = Math.min(34, Math.max(3, (plotW - gap * (n - 1)) / n));
+  const x0 = padL + Math.max(0, (plotW - (n * barW + (n - 1) * gap)) / 2);
   const max = Math.max(1, ...data.buckets.map(b=> keys.reduce((t,k)=> t + (b[metric][k]||0), 0)));
   // A round number at or above the tallest bar, so the axis reads as a scale
   // rather than as "whatever the biggest bar happened to be".
@@ -5527,7 +5578,7 @@ function renderVolumeChart(card, data){
     svg += `<text x="${padL-4}" y="${y+3}" font-size="8" fill="var(--ink-dim)" text-anchor="end">${v}</text>`;
   });
   data.buckets.forEach((b, i)=>{
-    const x = padL + i * (barW + gap);
+    const x = x0 + i * (barW + gap);
     const hasJobs = keys.some(k=> (b.jobs[k]||0) > 0);
     // A transparent column behind the bar, wider than the bar itself, so a short
     // bar (or an empty hour) is still easy to point at and the hover/tap target
@@ -5604,10 +5655,270 @@ function renderVolumeChart(card, data){
     hideTip();
     openVolumeBucketSheet(data, i, t.dataset.k || "all");
   });
-  card.appendChild(el(`<div class="field-note" style="text-align:center;margin-top:2px;">${axisNote}</div>`));
+  card.appendChild(el(`<div class="field-note" style="text-align:center;margin-top:2px;">${axisNote}${data.trimmed
+    ? ` · แสดงเฉพาะช่วง ${data.buckets[0].label}${data.period === "today" ? ":00" : ""}–${data.buckets[n - 1].label}${data.period === "today" ? ":59" : ""} ที่มีงาน` : ""}</div>`));
   card.appendChild(el(`<div class="chip-row volume-legend" style="margin-top:10px;">
     ${data.groups.map(g=>`<span class="chip" style="cursor:default;"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${VOLUME_COLORS[g.key]};margin-right:5px;"></span>${g.label} ${totals[g.key]||0}</span>`).join("")}
   </div>`));
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard insights — the sections that let OPS read the situation and decide:
+// what is stuck right now, how long people wait, who carries the work and where
+// it goes, what gets cancelled or paused, and what requesters say. All of it
+// comes from one request (/dashboard/insights); each card draws from that.
+// ---------------------------------------------------------------------------
+function fmtMinutes(m){
+  if(m === null || m === undefined) return "–";
+  m = Math.round(m);
+  if(m < 60) return m + " นาที";
+  const h = Math.floor(m / 60), r = m % 60;
+  return h + " ชม." + (r ? " " + r + " น." : "");
+}
+const nf = (n)=> Number(n || 0).toLocaleString("en-US");
+
+function statTile(n, label, color, sub){
+  return `<div class="stat"><div class="n"${color ? ` style="color:${color};"` : ""}>${n}</div><div class="l">${label}</div>${sub ? `<div style="font-size:10px;color:var(--ink-dim);margin-top:2px;">${sub}</div>` : ""}</div>`;
+}
+
+// Bars for a run of equal slots (hours or days). Leading and trailing slots with
+// no data are cut; empty slots in between stay as gaps, so every bar sits where
+// it belongs on the clock/calendar and the spacing never lies about time.
+function renderSlotBars(card, slots, {unit, hotAt, titleOf}){
+  const withData = slots.map((s, i)=> s.n > 0 ? i : -1).filter(i=> i >= 0);
+  if(!withData.length){
+    card.appendChild(el(`<div class="empty">ยังไม่มีข้อมูลในช่วงนี้</div>`));
+    return;
+  }
+  const first = withData[0], last = withData[withData.length - 1];
+  const run = slots.slice(first, last + 1);
+  const n = run.length;
+  const W = 340, H = 130, padT = 16, padB = 18, padL = 4, padR = 4;
+  const plotH = H - padT - padB, plotW = W - padL - padR;
+  const gap = n > 20 ? 1.5 : 4;
+  const barW = Math.min(34, Math.max(3, (plotW - gap * (n - 1)) / n));
+  const used = n * barW + (n - 1) * gap;
+  const x0 = padL + Math.max(0, (plotW - used) / 2);
+  const top = Math.max(1, ...run.map(s=> s.value || 0));
+  const every = n <= 8 ? 1 : (n <= 24 ? 2 : 5);
+  let svg = `<line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="var(--line)"></line>`;
+  run.forEach((s, i)=>{
+    const x = x0 + i * (barW + gap);
+    if(s.n > 0){
+      const h = Math.max(1.5, s.value / top * plotH);
+      const hot = s.value >= hotAt;
+      svg += `<g><title>${escHtml(titleOf(s))}</title><rect x="${x.toFixed(1)}" y="${(padT + plotH - h).toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${hot ? "var(--warn)" : "var(--amber)"}"></rect></g>`;
+      if(n <= 14) svg += `<text x="${(x + barW/2).toFixed(1)}" y="${(padT + plotH - h - 3).toFixed(1)}" font-size="9" font-weight="700" fill="var(--ink)" text-anchor="middle">${s.value}</text>`;
+    }
+    if(i % every === 0) svg += `<text x="${(x + barW/2).toFixed(1)}" y="${H - 5}" font-size="8" fill="var(--ink-dim)" text-anchor="middle">${escHtml(s.label)}</text>`;
+  });
+  card.appendChild(el(`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;" role="img" aria-label="${escHtml(unit)}">${svg}</svg>`));
+  if(first > 0 || last < slots.length - 1){
+    card.appendChild(el(`<div class="field-note" style="margin-top:4px;">แสดงเฉพาะช่วง ${escHtml(slots[first].label)}–${escHtml(slots[last].label)} ที่มีข้อมูล</div>`));
+  }
+}
+
+function renderLiveCard(card, ins){
+  const L = ins.live;
+  const long = L.waiting_over;
+  card.innerHTML = "";
+  const tiles = el(`<div class="stat-grid">
+    ${statTile(L.waiting, "รอรับงาน", L.waiting ? "var(--warn)" : "", long ? `เกิน ${L.threshold} นาที ${long} งาน` : "")}
+    ${statTile(L.waiting ? fmtMinutes(L.oldest_minutes) : "–", "รอนานสุด", L.oldest_minutes >= L.threshold ? "var(--red)" : "")}
+    ${statTile(L.assigned + L.in_progress, "กำลังทำ")}
+    ${statTile(L.paused, "หยุดชั่วคราว", L.paused ? "var(--warn)" : "")}
+    ${statTile(`${L.drivers_busy}/${L.drivers_present}`, "คนขับมีงาน / มาวันนี้")}
+    ${statTile(L.drivers_free, "คนขับที่น่าจะว่าง", L.waiting && L.drivers_free ? "var(--green)" : "", "ประมาณ จากคนที่มา − คนที่มีงาน")}
+  </div>`);
+  card.appendChild(tiles);
+
+  let msg, tone;
+  if(!L.waiting){ msg = "ไม่มีงานรอรับ ทุกงานมีคนรับแล้ว"; tone = "var(--green)"; }
+  else if(!long){ msg = `มี ${L.waiting} งานรอรับ ยังไม่เกิน ${L.threshold} นาที`; tone = "var(--ink-dim)"; }
+  else if(L.drivers_free > 0){ msg = `${long} งานรอเกิน ${L.threshold} นาที ขณะที่ยังมีคนขับที่มาแต่ไม่มีงานราว ${L.drivers_free} คน`; tone = "var(--warn)"; }
+  else{ msg = `${long} งานรอเกิน ${L.threshold} นาที และคนขับที่มาวันนี้มีงานครบทุกคนแล้ว`; tone = "var(--red)"; }
+  card.appendChild(el(`<div style="margin:8px 0 4px;font-size:13px;font-weight:700;color:${tone};">${escHtml(msg)}</div>`));
+
+  if(L.oldest.length){
+    card.appendChild(el(`<div class="field-note" style="margin:8px 0 6px;">งานที่รอนานสุด (กดเพื่อดูรายละเอียด)</div>`));
+    L.oldest.forEach(w=>{
+      const bad = (w.minutes || 0) >= L.threshold;
+      const row = el(`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 10px;margin-bottom:6px;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;cursor:pointer;">
+        <div style="min-width:0;">
+          <div style="font-family:'JetBrains Mono',monospace;font-weight:700;font-size:13px;">${escHtml(w.task_code)}</div>
+          <div class="field-note" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(w.route)}</div>
+          <div class="field-note">${w.pallets} พาเลท${w.cost_center ? " · CC " + escHtml(w.cost_center) : ""}</div>
+        </div>
+        <span style="flex:none;font-size:12px;font-weight:700;color:#fff;background:${bad ? "var(--red)" : "var(--slate)"};border-radius:999px;padding:3px 10px;">รอ ${escHtml(fmtMinutes(w.minutes))}</span>
+      </div>`);
+      row.onclick = ()=> openTaskDetailSheet(w.id);
+      card.appendChild(row);
+    });
+  }
+}
+
+function renderWaitCard(card, ins){
+  const W = ins.wait;
+  card.innerHTML = "";
+  if(!W.n){
+    card.appendChild(el(`<div class="empty">ยังไม่มีงานที่คนขับรับในช่วงนี้</div>`));
+    return;
+  }
+  card.appendChild(el(`<div class="stat-grid">
+    ${statTile(fmtMinutes(W.median), "รอรับงาน (ค่ากลาง)", "", `90% ไม่เกิน ${fmtMinutes(W.p90)}`)}
+    ${statTile(W.over30_pct + "%", "รอเกิน 30 นาที", W.over30_pct >= 20 ? "var(--warn)" : "", `${W.over30_n} จาก ${W.n} งาน`)}
+    ${statTile(fmtMinutes(W.work_median), "ทำงานจริง (ค่ากลาง)")}
+  </div>`));
+  card.appendChild(el(`<div class="field-note" style="margin:4px 0 12px;">รับภายใน 15 นาที <b>${W.within15_pct}%</b> · ใช้ค่ากลางแทนค่าเฉลี่ย เพื่อไม่ให้งานที่ผิดปกติดึงตัวเลข · ไม่นับงานจองล่วงหน้า</div>`));
+
+  card.appendChild(el(`<div style="font-weight:700;font-size:13px;margin-bottom:6px;">การกระจายของเวลารอ (จำนวนงาน)</div>`));
+  const max = Math.max(1, ...W.dist.map(d=> d.n));
+  W.dist.forEach(d=>{
+    card.appendChild(el(`<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;font-size:12px;">
+      <span style="width:46px;flex:none;color:var(--ink-dim);text-align:right;">${escHtml(d.label)} น.</span>
+      <div style="flex:1;height:12px;background:var(--panel-2);border-radius:3px;overflow:hidden;"><div style="width:${(d.n / max * 100).toFixed(1)}%;height:100%;background:${d.long ? "var(--warn)" : "var(--amber)"};"></div></div>
+      <b style="width:34px;flex:none;">${d.n}</b></div>`));
+  });
+  card.appendChild(el(`<div class="field-note">แท่งสีส้ม = รอเกิน 30 นาที</div>`));
+
+  card.appendChild(el(`<div style="font-weight:700;font-size:13px;margin:14px 0 6px;">${ins.by_hour ? "เวลารอ (ค่ากลาง) ตามชั่วโมงที่เปิดงาน" : "เวลารอ (ค่ากลาง) รายวัน"}</div>`));
+  const slots = W.slots.map(s=> ({...s, value: s.median === null ? 0 : Math.round(s.median)}));
+  renderSlotBars(card, slots, {
+    unit: "เวลารอคอยค่ากลาง", hotAt: ins.live.threshold,
+    titleOf: (s)=> `${ins.by_hour ? s.label + ":00" : s.label}: รอ ${s.value} นาที (ค่ากลาง) · ${s.n} งาน`,
+  });
+  card.appendChild(el(`<div class="field-note" style="margin-top:4px;">แท่งสีส้ม = ค่ากลางตั้งแต่ ${ins.live.threshold} นาที · วางเมาส์/กดที่แท่งเพื่อดูจำนวนงาน</div>`));
+  if(W.quick_close_pct !== null && W.quick_close_pct >= 10){
+    card.appendChild(el(`<div class="field-note" style="margin-top:8px;padding:8px 10px;background:var(--warn-dim);border-radius:8px;">มีงาน ${W.quick_close_pct}% ที่เริ่มกับเสร็จห่างกันไม่เกิน 1 นาที อาจเป็นการกดปิดงานก่อนทำเสร็จ ควรตรวจก่อนใช้เวลาทำงานจริงตัดสินใจ</div>`));
+  }
+}
+
+function renderDriversCard(card, ins){
+  card.innerHTML = "";
+  const list = ins.drivers;
+  if(!list.length){
+    card.appendChild(el(`<div class="empty">ยังไม่มีงานที่เสร็จในช่วงนี้</div>`));
+    return;
+  }
+  if(!state.drvMetric) state.drvMetric = "jobs";
+  const metric = state.drvMetric;
+  const toggle = el(`<div class="chip-row" style="margin-bottom:10px;">
+    <button class="chip ${metric === "jobs" ? "active" : ""}" data-m="jobs">จำนวนงาน</button>
+    <button class="chip ${metric === "pallets" ? "active" : ""}" data-m="pallets">จำนวนพาเลท</button>
+  </div>`);
+  toggle.querySelectorAll("[data-m]").forEach(b=> b.onclick = ()=>{ state.drvMetric = b.dataset.m; renderDriversCard(card, ins); });
+  card.appendChild(toggle);
+  const totJobs = list.reduce((t, d)=> t + d.jobs, 0), totPal = list.reduce((t, d)=> t + d.pallets, 0);
+  card.appendChild(el(`<div class="field-note" style="margin-bottom:10px;">คนขับ <b>${list.length}</b> คน · <b>${nf(Math.round(totJobs))}</b> งาน · <b>${nf(totPal)}</b> พาเลท</div>`));
+  const sorted = list.slice().sort((a, b)=> b[metric] - a[metric] || b.jobs - a.jobs || a.name.localeCompare(b.name));
+  const max = Math.max(1, ...sorted.map(d=> d[metric]));
+  const box = el(`<div></div>`);
+  card.appendChild(box);
+  let expanded = false;
+  const TOP = 10;
+  (function draw(){
+    box.innerHTML = "";
+    (expanded ? sorted : sorted.slice(0, TOP)).forEach(d=>{
+      const val = metric === "jobs" ? Math.round(d.jobs * 10) / 10 : d.pallets;
+      box.appendChild(el(`<div style="margin-bottom:10px;">
+        <div style="display:flex;justify-content:space-between;gap:8px;font-size:13px;margin-bottom:3px;">
+          <b style="min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(d.name)}</b>
+          <span style="flex:none;"><b>${nf(val)}</b> <span style="color:var(--ink-dim);font-size:11px;">${metric === "jobs" ? "งาน" : "พาเลท"}</span></span>
+        </div>
+        <div style="height:10px;background:var(--panel-2);border-radius:3px;overflow:hidden;"><div style="width:${(d[metric] / max * 100).toFixed(1)}%;height:100%;background:var(--amber);"></div></div>
+        <div class="field-note" style="margin-top:2px;">${nf(Math.round(d.jobs))} งาน · ${nf(d.pallets)} พาเลท · ${d.pallets_per_job} พาเลทต่องาน · ทำงาน ${d.days} วัน</div>
+      </div>`));
+    });
+    if(sorted.length > TOP){
+      const more = el(`<button class="btn" style="width:100%;">${expanded ? "แสดงเฉพาะ " + TOP + " อันดับแรก" : "ดูทั้งหมด (" + sorted.length + " คน)"}</button>`);
+      more.onclick = ()=>{ expanded = !expanded; draw(); };
+      box.appendChild(more);
+    }
+  })();
+  card.appendChild(el(`<div class="field-note" style="margin-top:6px;">งานที่ทำร่วมกันแบ่งเครดิตเท่า ๆ กัน · ความต่างสะท้อนจำนวนวันที่ทำงานและขนาดงาน ไม่ใช่การจัดอันดับคุณภาพ</div>`));
+}
+
+function renderRoutesCard(card, ins){
+  card.innerHTML = "";
+  if(!ins.routes.length){
+    card.appendChild(el(`<div class="empty">ยังไม่มีงานในช่วงนี้</div>`));
+    return;
+  }
+  const max = Math.max(1, ...ins.routes.map(r=> r.jobs));
+  ins.routes.forEach(r=>{
+    card.appendChild(el(`<div style="margin-bottom:10px;">
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:13px;margin-bottom:3px;">
+        <span style="min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(r.route)}</span>
+        <span style="flex:none;"><b>${r.jobs}</b> <span style="color:var(--ink-dim);font-size:11px;">งาน · ${nf(r.pallets)} พาเลท</span></span>
+      </div>
+      <div style="height:10px;background:var(--panel-2);border-radius:3px;overflow:hidden;"><div style="width:${(r.jobs / max * 100).toFixed(1)}%;height:100%;background:var(--amber);"></div></div>
+    </div>`));
+  });
+  card.appendChild(el(`<div class="field-note">นับงานที่เปิดในช่วงนี้ ไม่รวมงานที่ยกเลิก</div>`));
+}
+
+function reasonList(items, total, emptyText){
+  if(!items.length) return `<div class="field-note">${emptyText}</div>`;
+  const max = Math.max(1, ...items.map(i=> i.n));
+  return items.map(i=> `<div style="margin-bottom:7px;">
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:12.5px;margin-bottom:2px;">
+        <span style="min-width:0;${i.reason === "ไม่ระบุเหตุผล" ? "color:var(--warn);" : ""}">${escHtml(i.reason)}</span><b style="flex:none;">${i.n}</b></div>
+      <div style="height:6px;background:var(--panel-2);border-radius:3px;overflow:hidden;"><div style="width:${(i.n / max * 100).toFixed(1)}%;height:100%;background:var(--slate);"></div></div>
+    </div>`).join("");
+}
+
+function renderCancelPauseCard(card, ins){
+  const C = ins.cancel, P = ins.pause;
+  card.innerHTML = "";
+  card.appendChild(el(`<div class="stat-grid g2">
+    ${statTile(C.n, "งานที่ยกเลิก", C.n ? "var(--red)" : "", C.pct + "% ของงานที่เปิด")}
+    ${statTile(P.n, "ครั้งที่หยุดระหว่างทำ", P.n ? "var(--warn)" : "", P.minutes ? `รวม ${fmtMinutes(P.minutes)}` : "")}
+  </div>`));
+  card.appendChild(el(`<div style="font-weight:700;font-size:13px;margin:12px 0 6px;">เหตุผลที่ยกเลิก</div>`));
+  card.appendChild(el(`<div>${reasonList(C.reasons, C.n, "ไม่มีงานที่ยกเลิกในช่วงนี้")}</div>`));
+  if(C.n && C.no_reason){
+    card.appendChild(el(`<div class="field-note" style="margin-top:2px;">ไม่ระบุเหตุผล ${C.no_reason} จาก ${C.n} งาน จึงวิเคราะห์ต้นเหตุไม่ได้</div>`));
+  }
+  card.appendChild(el(`<div style="font-weight:700;font-size:13px;margin:14px 0 6px;">เหตุผลที่หยุดงาน</div>`));
+  if(P.n){
+    card.appendChild(el(`<div class="field-note" style="margin-bottom:6px;">ฝั่งรถ <b>${P.vehicle}</b> · ฝั่งผู้ขอ <b>${P.user}</b>${P.other ? ` · อื่น ๆ <b>${P.other}</b>` : ""}</div>`));
+  }
+  card.appendChild(el(`<div>${reasonList(P.reasons, P.n, "ไม่มีงานที่หยุดในช่วงนี้")}</div>`));
+}
+
+function renderReviewsCard(card, ins){
+  const R = ins.reviews;
+  card.innerHTML = "";
+  if(!R.rated){
+    card.appendChild(el(`<div class="empty">ยังไม่มีการให้คะแนนในช่วงนี้</div>`));
+    return;
+  }
+  card.appendChild(el(`<div class="stat-grid">
+    ${statTile(R.avg.toFixed(2), "คะแนนเฉลี่ย (เต็ม 5)", R.avg < 4.5 ? "var(--warn)" : "var(--green)")}
+    ${statTile(R.rated, "ครั้งที่ให้คะแนน", "", `${R.rate_pct}% ของงานที่เสร็จ`)}
+    ${statTile(R.low_n, "ต่ำกว่า 5 ดาว", R.low_n ? "var(--warn)" : "")}
+  </div>`));
+  const max = Math.max(1, ...R.stars.map(s=> s.n));
+  R.stars.forEach(s=>{
+    card.appendChild(el(`<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;font-size:12px;">
+      <span style="width:38px;flex:none;color:var(--ink-dim);text-align:right;">${s.star} ดาว</span>
+      <div style="flex:1;height:12px;background:var(--panel-2);border-radius:3px;overflow:hidden;"><div style="width:${(s.n / max * 100).toFixed(1)}%;height:100%;background:${s.star < 5 ? "var(--warn)" : "var(--green)"};"></div></div>
+      <b style="width:30px;flex:none;">${s.n}</b></div>`));
+  });
+  if(R.wait_low !== null && R.wait_five !== null){
+    card.appendChild(el(`<div class="field-note" style="margin-top:8px;">เวลารอ (ค่ากลาง): งานที่ได้ต่ำกว่า 5 ดาว <b>${fmtMinutes(R.wait_low)}</b> เทียบกับ 5 ดาว <b>${fmtMinutes(R.wait_five)}</b></div>`));
+  }
+  card.appendChild(el(`<div style="font-weight:700;font-size:13px;margin:14px 0 6px;">คอมเมนต์ล่าสุด</div>`));
+  if(!R.comments.length){
+    card.appendChild(el(`<div class="field-note">ยังไม่มีคอมเมนต์ในช่วงนี้</div>`));
+  }
+  R.comments.forEach(c=>{
+    card.appendChild(el(`<div style="display:flex;gap:10px;align-items:flex-start;padding:9px 10px;margin-bottom:6px;border:1px solid var(--line);border-radius:8px;">
+      <span style="flex:none;font-weight:700;font-size:12px;color:${c.rating < 5 ? "var(--warn)" : "var(--green)"};">${c.rating} ดาว</span>
+      <div style="min-width:0;"><div style="font-size:13px;">${escHtml(c.comment)}</div>
+        <div class="field-note">${escHtml(c.at)} · ${escHtml(c.task_code)}</div></div>
+    </div>`));
+  });
 }
 
 // The jobs behind one bar. Opened from a tap on the chart: a tap on a coloured
