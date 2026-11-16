@@ -1691,7 +1691,21 @@ function hideLoader(){
   if(bar) bar.remove();
 }
 
+// Short-lived memory for read-only calls that a screen repeats every time it is
+// repainted (the driver's "today" tiles, for one). Any write — a POST, PUT or
+// DELETE from this device — empties it, so a driver who just finished a job
+// never sees yesterday's count; other devices' changes show up within the ttl.
+const _apiCache = new Map();
+async function cachedApi(path, ttlMs, opts={}){
+  const hit = _apiCache.get(path);
+  if(hit && Date.now() - hit.at < ttlMs) return hit.data;
+  const data = await api(path, opts);
+  _apiCache.set(path, {at: Date.now(), data});
+  return data;
+}
+
 async function api(path, opts={}){
+  if(opts.method && opts.method.toUpperCase() !== "GET") _apiCache.clear();
   const headers = opts.headers || {};
   if(state.token) headers["Authorization"] = "Bearer " + state.token;
   if(opts.body && !(opts.body instanceof FormData)) headers["Content-Type"] = "application/json";
@@ -1747,6 +1761,7 @@ function hideConnBanner(){
 }
 
 function logout(){
+  _apiCache.clear();   // never show the next person on this device the last person's numbers
   // Drop the token server-side as well. Signing out used to only forget the
   // local copy, which was harmless while one session replaced another on
   // login — now that several devices can be signed in at once, a token left
@@ -1785,7 +1800,7 @@ function logout(){
 // Job-chat polling. Self-scheduling (never stacks), skipped while the screen
 // is hidden, and paired with an immediate reload whenever a push arrives or
 // the app comes back to the foreground — see the service-worker listener.
-const CHAT_POLL_MS = 12000;
+const CHAT_POLL_MS = 20000;
 let _chatReload = null;
 function startChatPolling(fn){
   stopChatPolling();
@@ -4377,7 +4392,7 @@ function renderDriverTab(main){
     statsCard.onclick = ()=>{ setTab("history"); renderContent(); };
     (async ()=>{
       try{
-        const s = await api("/drivers/me/stats?period=day", {background:true});
+        const s = await cachedApi("/drivers/me/stats?period=day", 60000, {background:true});
         const g = statsCard.querySelector("#today-stats-grid");
         if(g) g.outerHTML = `<div class="stat-grid" id="today-stats-grid">
           <div class="stat"><div class="n">${s.task_count}</div><div class="l">งานเสร็จวันนี้</div></div>
@@ -8735,6 +8750,9 @@ async function openChatSheet(taskId){
   }
 
   let lastCount = -1;
+  // What this sheet already holds, so a background poll can ask only for lines
+  // newer than the last one instead of re-downloading the whole conversation.
+  let allMsgs = [];
   async function loadMessages(){
     // The sheet can be removed without going through closeSheet() (a tapped
     // notification clears every open sheet directly). Without this check the
@@ -8742,7 +8760,17 @@ async function openChatSheet(taskId){
     if(!overlay.isConnected){ stopChatPolling(); return; }
     if(document.activeElement === overlay.querySelector("#chat-input")) return; // don't yank focus while typing
     try{
-      const msgs = await api(`/tasks/${taskId}/messages`, {background:true});
+      // lastCount === -2 is the "something changed, redraw from scratch"
+      // signal used after a button press, so it takes the full fetch.
+      const lastId = _maxId(allMsgs);
+      if(lastId && lastCount !== -2){
+        const fresh = await api(`/tasks/${taskId}/messages?after=${lastId}`, {background:true});
+        if(fresh.length === 0) return;      // nothing new
+        allMsgs = allMsgs.concat(fresh);
+      }else{
+        allMsgs = await api(`/tasks/${taskId}/messages`, {background:true});
+      }
+      const msgs = allMsgs;
       const log = overlay.querySelector("#chat-log");
       if(!log) return;
       // A new automatic line means the job itself changed — refresh the
@@ -8935,8 +8963,14 @@ function mergeLitePayload(d){
     const gotIds = new Set(got.map(n=> n.id));
     // Every unread notification is always returned, so one we still show as
     // unread that did not come back has been read on another device.
+    // The one exception: the server no longer re-sends unread items older than
+    // a week (they cost the same bytes on every poll for someone who never
+    // opens them), so for those absence proves nothing. They stay as held until
+    // the next full refresh, which returns the latest 50 whatever their age.
+    const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
     const carried = (state.notifications || []).filter(n=> !gotIds.has(n.id))
-      .map(n=> n.is_read ? n : Object.assign({}, n, {is_read: 1}));
+      .map(n=> (n.is_read || new Date(n.created_at).getTime() < weekAgo)
+        ? n : Object.assign({}, n, {is_read: 1}));
     d.notifications = got.concat(carried).sort((a,b)=> b.id - a.id).slice(0, 50);
   }
   delete d.notifDelta;
@@ -9018,6 +9052,10 @@ async function refreshAll(opts={}){
     // gone stale enough for its elapsed-time labels to be wrong.
     const unchanged = state._payloadSig && state._payloadSig === state._renderedSig;
     const stale = !state._lastRenderAt || (Date.now() - state._lastRenderAt) > FORCE_RENDER_AFTER_MS;
+    // How many background polls in a row found nothing new. nextPollDelay()
+    // stretches the interval while the floor is quiet and snaps back the
+    // moment anything changes, a push arrives or the screen is touched.
+    state._idleStreak = (opts.lite && !opts.visible && unchanged) ? (state._idleStreak || 0) + 1 : 0;
     if(!userIsTypingInMain() && !onAdminDashboard && (opts.visible || !unchanged || stale)){
       renderContent();
       state._renderedSig = state._payloadSig;
@@ -9097,7 +9135,11 @@ async function bootstrap(){
   // Re-register this device for whoever just signed in, THEN decide whether a
   // banner is needed — in that order, so the banner never appears for a device
   // that the silent path just fixed.
-  ensurePushRegistration().then(maybeAutoPromptNotifications); // never blocks app usage
+  // A working subscription is what lets the safety-net poll run slower on
+  // non-ops devices (see nextPollDelay). Reset first: a different person may
+  // have signed in on a device that was push-registered for someone else.
+  state._pushOk = false;
+  ensurePushRegistration().then(ok=>{ state._pushOk = !!ok; return maybeAutoPromptNotifications(); }); // never blocks app usage
   // After the first render and refresh, so the sheet opens over a screen that
   // already has the job's data behind it.
   openPendingTask();
@@ -9137,10 +9179,29 @@ const POLL_INTERVAL_MS = 30000;
 // On repeated failure, back off instead of hammering a struggling server.
 const POLL_BACKOFF_MS = [30000, 60000, 120000];
 
+// How often the safety-net poll runs, by who is looking at the screen.
+//   Ops (admin / dispatcher): 30s. They hand out work and leave the screen open
+//     all day, so the safety net is what they actually rely on.
+//   Everyone else, once this device has a working push subscription: 60s. Push
+//     already refreshes the page within seconds of a change; the poll only
+//     covers a push that never arrives. A device with no push keeps 30s.
+// After IDLE_POLLS_BEFORE_SLOWING polls in a row with nothing new, the interval
+// stretches (ops 45s, others 90s). Anything that changes, a push, a manual
+// refresh or returning to the app puts it back at once.
+const POLL_INTERVAL_PUSH_MS = 60000;
+const POLL_INTERVAL_IDLE_OPS_MS = 45000;
+const POLL_INTERVAL_IDLE_MS = 90000;
+const IDLE_POLLS_BEFORE_SLOWING = 10;
+const POLL_JITTER = 0.15;   // +-15%, so a shift's worth of phones never fire together
+
 function nextPollDelay(){
   const fails = state.consecutiveFailures || 0;
-  if(!fails) return POLL_INTERVAL_MS;
-  return POLL_BACKOFF_MS[Math.min(fails - 1, POLL_BACKOFF_MS.length - 1)];
+  if(fails) return POLL_BACKOFF_MS[Math.min(fails - 1, POLL_BACKOFF_MS.length - 1)];
+  const idle = (state._idleStreak || 0) >= IDLE_POLLS_BEFORE_SLOWING;
+  let base = POLL_INTERVAL_MS;
+  if(isOps()) base = idle ? POLL_INTERVAL_IDLE_OPS_MS : POLL_INTERVAL_MS;
+  else if(state._pushOk) base = idle ? POLL_INTERVAL_IDLE_MS : POLL_INTERVAL_PUSH_MS;
+  return Math.round(base * (1 + (Math.random() * 2 - 1) * POLL_JITTER));
 }
 
 // Self-scheduling poll instead of setInterval: each cycle only schedules the
@@ -9170,7 +9231,7 @@ setInterval(updateRefreshBar, 10000);
 // visible, so always re-sync straight away rather than waiting for the timer.
 document.addEventListener("visibilitychange", ()=>{
   if(document.hidden) return;
-  if(state.token){ refreshAll({lite:true}); startPolling(); reloadOpenChat(); }
+  if(state.token){ state._idleStreak = 0; refreshAll({lite:true}); startPolling(); reloadOpenChat(); }
 });
 window.addEventListener("online", ()=>{
   if(state.token){ refreshAll(); startPolling(); }
@@ -9191,6 +9252,7 @@ if("serviceWorker" in navigator){
       refreshAll().then(openPendingTask);
       return;
     }
+    state._idleStreak = 0;
     refreshAll({lite:true});
     // A push may be a new line in the chat that is open right now; that
     // sheet is not part of refreshAll(), so reload it too.

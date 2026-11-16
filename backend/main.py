@@ -657,6 +657,12 @@ def iso_days_ago(days: int) -> str:
 # upper bound on how long an abandoned token can linger, not a precise expiry.
 SESSION_MAX_AGE_DAYS = 90
 
+# Polling payload bounds. Every ops device asks for these every ~30 seconds, so
+# anything unbounded here is paid for again on every poll.
+BREAKDOWN_HISTORY_DAYS = 30      # resolved breakdowns still listed
+NOTIF_UNREAD_RESEND_DAYS = 7     # a lite poll re-sends unread items only this recent
+NOTIF_RETENTION_DAYS = 30        # the daily cron deletes notifications older than this
+
 
 def describe_user_agent(ua: Optional[str]) -> str:
     """A short, recognisable name for a signed-in device.
@@ -1259,6 +1265,10 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_ta_task_status ON task_assignments(task_id, assignment_status)",
     "CREATE INDEX IF NOT EXISTS idx_ta_driver ON task_assignments(driver_id)",
     "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read)",
+    # The poll asks for "this person's newest 50", which the index above cannot
+    # order; this one can, and also serves the retention delete by age.
+    "CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_task_messages_task_id ON task_messages(task_id, id)",
     "CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_messages_task ON task_messages(task_id)",
     "CREATE INDEX IF NOT EXISTS idx_task_photos_task ON task_photos(task_id)",
@@ -5081,7 +5091,10 @@ class ChatMessageBody(BaseModel):
 
 
 @app.get("/tasks/{task_id}/messages")
-def get_task_messages(task_id: int, user=Depends(current_user)):
+def get_task_messages(task_id: int, user=Depends(current_user), after: Optional[int] = None):
+    """The whole conversation, oldest first. With `after`, only lines newer
+    than that id — the open chat's background poll uses it so an unchanged
+    conversation costs one tiny query instead of re-sending every line."""
     with get_db() as db:
         row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row:
@@ -5096,7 +5109,8 @@ def get_task_messages(task_id: int, user=Depends(current_user)):
             "users.role AS sender_role, users.full_name AS sender_full_name, "
             "users.first_name AS sender_first_name "
             "FROM task_messages JOIN users ON users.id = task_messages.sender_id "
-            "WHERE task_id=? ORDER BY created_at, task_messages.id", (task_id,)
+            "WHERE task_id=? AND task_messages.id > ? ORDER BY created_at, task_messages.id",
+            (task_id, after if after is not None else 0)
         ).fetchall()
         out = []
         for r in rows:
@@ -6223,8 +6237,15 @@ def report_breakdown(body: BreakdownBody, user=Depends(require_crew())):
 
 @app.get("/breakdowns")
 def list_breakdowns(user=Depends(require_ops())):
+    # Open reports plus anything resolved in the last BREAKDOWN_HISTORY_DAYS.
+    # This list rides along on every ops poll, so it must not grow with the
+    # table: every report ever filed used to be sent every 30 seconds.
     with get_db() as db:
-        rows = db.execute("SELECT * FROM breakdowns ORDER BY created_at DESC").fetchall()
+        rows = db.execute(
+            "SELECT * FROM breakdowns WHERE status <> 'Resolved' "
+            "OR COALESCE(resolved_at, created_at) >= ? ORDER BY created_at DESC",
+            (iso_days_ago(BREAKDOWN_HISTORY_DAYS),),
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -6267,13 +6288,19 @@ class BroadcastBody(BaseModel):
 @app.get("/notifications")
 def get_notifications(user=Depends(current_user), after: Optional[int] = None):
     """Latest 50. With `after`, only what is newer than that id plus anything
-    still unread — enough for a device that already holds the rest to bring
-    its list and unread badge up to date."""
+    recent that is still unread — enough for a device that already holds the
+    rest to bring its list and unread badge up to date. Unread items older
+    than NOTIF_UNREAD_RESEND_DAYS are not re-sent: someone who never opens
+    them would otherwise cost the same bytes on every poll, forever. The page
+    keeps showing them as it already holds them; a full refresh (every few
+    minutes) still returns the latest 50 regardless of age."""
     with get_db() as db:
         if after is not None:
             rows = db.execute(
-                "SELECT * FROM notifications WHERE user_id=? AND (id > ? OR is_read=0) "
-                "ORDER BY created_at DESC LIMIT 50", (user["id"], after)
+                "SELECT * FROM notifications WHERE user_id=? "
+                "AND (id > ? OR (is_read=0 AND created_at >= ?)) "
+                "ORDER BY created_at DESC LIMIT 50",
+                (user["id"], after, iso_days_ago(NOTIF_UNREAD_RESEND_DAYS))
             ).fetchall()
         else:
             rows = db.execute(
@@ -6546,7 +6573,13 @@ def app_data(scope: str = "core", task_scope: Optional[str] = None,
                 out["vehicleTypes"] = list_vehicle_types(user)
                 out["zones"] = list_zones(user)
             _add_team_chat(out, user, lite, chat_after)
-            if scope == "admin_dash":
+            if scope == "admin_dash" and not lite:
+                # Not on background polls: the dashboard tab is deliberately
+                # not repainted by a poll (it loads its own charts when opened
+                # or when the period changes), so computing the summary counts
+                # and fetching 100 audit rows every cycle was work nobody saw.
+                # Opening the tab, a manual refresh and the periodic full
+                # refresh all still send them.
                 out["dashboard"] = dashboard(user)
                 out["auditLogs"] = get_audit_logs(user)
         return out
@@ -6967,6 +7000,15 @@ def cron_headcount_summary(request: Request):
     if not secrets.compare_digest(request.headers.get("authorization", ""), f"Bearer {secret}"):
         raise HTTPException(401, "ไม่ได้รับอนุญาต")
     today = bkk_today()
+    # Daily housekeeping, on its own connection and never allowed to break the
+    # headcount push below: there is no other scheduler, and notifications
+    # otherwise only ever accumulate.
+    try:
+        with get_db() as db:
+            db.execute("DELETE FROM notifications WHERE created_at < ?",
+                       (iso_days_ago(NOTIF_RETENTION_DAYS),))
+    except Exception as e:
+        log.warning("Notification retention failed: %s", e)
     with get_db() as db:
         claimed = db.execute(
             "INSERT INTO app_config (key, value) VALUES ('headcount_push_date', ?) "
