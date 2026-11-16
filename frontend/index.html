@@ -8765,8 +8765,14 @@ async function openChatSheet(taskId){
       const lastId = _maxId(allMsgs);
       if(lastId && lastCount !== -2){
         const fresh = await api(`/tasks/${taskId}/messages?after=${lastId}`, {background:true});
-        if(fresh.length === 0) return;      // nothing new
-        allMsgs = allMsgs.concat(fresh);
+        // Several things can ask for a reload at nearly the same moment (the
+        // timer, a push, the send button, returning to the app). Each asks
+        // "after <the same id>", so all of them can come back with the same new
+        // line; keep only the ones not already held or it would show twice.
+        const have = new Set(allMsgs.map(m=> m.id));
+        const add = fresh.filter(m=> !have.has(m.id));
+        if(add.length === 0) return;        // nothing new
+        allMsgs = allMsgs.concat(add);
       }else{
         allMsgs = await api(`/tasks/${taskId}/messages`, {background:true});
       }
